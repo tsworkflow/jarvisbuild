@@ -1,7 +1,26 @@
 # PROJECT STATUS
 
-**Oppdatert:** 2026-08-18 (**UA-3 — Support/Tickets (Zendesk) FIXED_SUITE / IKKE VERIFIED → D-64**, se
-egen "UA-3 — Support/Tickets (Zendesk...)"-seksjon under. Provider valgt av Tobias etter en egen
+**Oppdatert:** 2026-08-18 (**CORE OWNERSHIP / ADAPTER BOUNDARY INVARIANT (D-65) - permanent
+styringsregel logget**, se egen "CORE OWNERSHIP / ADAPTER BOUNDARY INVARIANT"-seksjon under. Ny
+ufravikelig regel 12 i CLAUDE.md + nytt §11 i ARCHITECTURE.md: et masterplan-kapabilitetsnavn
+antyder ALDRI automatisk en tredjeparts-leverandør - utløst av at Zendesk-connectoren (D-64, draft-PR
+#13) ble bygget som om "Support/tickets" betydde "velg Zendesk og la den eie ticket-domenet". Full
+masterplan-avhengighetsaudit utført (ARCHITECTURE.md §11.9) - de fleste eksisterende connectors
+(Gmail/Calendar/Drive/GitHub/Telegram/Vercel/HA/AI-modeller/observability/secrets) er allerede korrekt
+klassifisert, INGEN endring nødvendig der. Ett HIGH-funn: Zendesk-connectoren selv er strukturelt
+EXTERNAL_CANONICAL for hele ticket-livssyklusen i stedet for en Jarvis-native Support Core med Zendesk
+som valgfri adapter - IKKE fikset i denne runden (kun dokumentert, ny Q-28), krever Tobias sin
+eksplisitte beslutning FØR PR #13 merges. Contracts/e-sign forebyggende grenseanalyse (Contract Core
+vs. Signature Execution Provider) logget som Q-29, INGEN leverandør valgt. INGEN kode endret - kun
+CLAUDE.md/ARCHITECTURE.md/DECISIONS_AND_ASSUMPTIONS.md/OPEN_QUESTIONS.md. **Branch:**
+`claude/architecture-core-adapter-invariant` (stacket på `claude/ua3-zendesk-support-connector`, siden
+D-65 direkte refererer D-64/Q-27 som ennå ikke er merget til `main`).
+
+---
+
+**Tidligere oppdatering, 2026-08-18** (UA-3 — Support/Tickets (Zendesk) FIXED_SUITE / IKKE VERIFIED →
+D-64, uendret av denne governance-runden): se egen "UA-3 — Support/Tickets (Zendesk...)"-seksjon
+under. Provider valgt av Tobias etter en egen
 research-runde (vektet D-41-matrise, Zendesk foran Intercom/Freshdesk/Chatwoot). Full D-41-kapasitet
 (20 `zendesk.*`-handlinger, klasse A/B/C/D), OAuth 2.0 med in-memory-token-rotasjon, pointer-not-payload,
 deterministisk kontaktgjenkjenning, webhook-mottaker (HMAC-SHA256/replay-vindu), periodisk
@@ -1916,6 +1935,55 @@ for sporing, fiksmønsteret er allerede designet/bevist og klart til gjenbruk p�
 `JARVIS_ZENDESK_*` konfigurert + `zendesk-reauth.ts` kjørt FØRST, deretter
 `ua3-zendesk-host-run.ts` på ekte Windows/Docker-host.
 
+## CORE OWNERSHIP / ADAPTER BOUNDARY INVARIANT (2026-08-18, branch `claude/architecture-core-adapter-invariant`) → D-65
+
+**Permanent styringsregel, IKKE en implementasjonsoppgave.** Tobias identifiserte et tilbakevendende
+feilmønster: et masterplan-kapabilitetsnavn (f.eks. "Support/tickets") ble tolket som "velg en ekstern
+SaaS-leverandør og la den eie domenet" - konkret demonstrert av D-64 sin Zendesk-connector. Denne
+runden gjør lærdommen permanent.
+
+**Bygget (dokumentasjon/styring, INGEN kode endret):**
+1. **CLAUDE.md regel 12** - CORE OWNERSHIP / ADAPTER BOUNDARY INVARIANT: et kapabilitetsnavn antyder
+   ALDRI automatisk en leverandør. Jarvis eier kanonisk domenemodell/tilstand for intrinsic
+   kapabiliteter (`JARVIS_CANONICAL`); eksterne tjenester er normalt kilder/sluk/transporter/
+   adaptere/utførelsesleverandører (`EXTERNAL_CANONICAL`). IKKE "bygg alt selv" - målet er maksimal
+   sovereign kontroll DER DET BETYR NOE.
+2. **ARCHITECTURE.md §11** (ny seksjon, 11 underpunkter) - Core-vs-Adapter-beslutningsport (11
+   spørsmål A-K), `CORE_DEPENDENCY_DECISION_REQUIRED=true`-eskaleringsmekanisme, forhold til D-41
+   klargjort (D-65 avgjør OM en leverandør bør delta og med hvilken rolle - FØRST; D-41 avgjør HVOR
+   FULLSTENDIG en akseptert connector skal være - ETTERPÅ), system-of-record-klassifisering
+   (`JARVIS_CANONICAL`/`EXTERNAL_CANONICAL`/`HYBRID_WITH_CLEAR_AUTHORITY`), portabilitets-/utfalls-/
+   dataeierskapstest, gjenbrukbar leverandørbeslutningsmal, full masterplan-avhengighetsaudit (§11.9,
+   tabell over Gmail/Calendar/Drive/GitHub/Telegram/Vercel/HA/AI-modeller/tale/Zendesk/Contracts/
+   finans/betalinger/CRM/meldingskanaler/observability/secrets), eksisterende tvilsomme grenser med
+   alvorlighet (§11.10), Contracts/e-sign forebyggende grenseanalyse (§11.11).
+3. **D-65** i DECISIONS_AND_ASSUMPTIONS.md - full beslutningstekst.
+4. **Q-28** - Zendesk-connectoren (D-64, draft-PR #13) selv klassifisert HIGH alvorlighet: ticket-
+   livssyklusen er strukturelt `EXTERNAL_CANONICAL` (Zendesk eier den) i stedet for en Jarvis-native
+   Support Core med Zendesk som valgfri adapter. IKKE fikset her (kun dokumentert) - krever Tobias sin
+   eksplisitte beslutning FØR PR #13 merges: (A) merge som eksplisitt midlertidig løsning + fremtidig
+   migrasjonsplan, eller (B) sette PR #13 på vent og bygge en Jarvis-native Support Core først.
+5. **Q-29** - Contracts/e-sign forebyggende grenseanalyse (Contract Core vs. Signature Execution
+   Provider), INGEN leverandør valgt, INGEN kode bygget.
+
+**Masterplan-avhengighetsaudit - hovedfunn:** de fleste eksisterende connectors
+(Gmail/Calendar/Drive/GitHub/Telegram/Vercel/Home Assistant/AI-modell-leverandører/observability/
+secret-håndtering/Business OS-CRM) er ALLEREDE korrekt klassifisert som adaptere bak eksisterende
+abstraksjoner (`GmailTransport`/`ModelGateway`/`SecretProvider`/osv.) - INGEN endring nødvendig.
+Business OS (D-49) er selve referanse-eksempelet på at Jarvis allerede korrekt eier sin egen
+CRM-domenekjerne uten å la et eksternt CRM eie den. **Kun ett HIGH-funn: Zendesk-connectoren selv**
+(se Q-28) - INGEN CRITICAL-grenser funnet.
+
+**Q-26 (Knowledge Verification/Truth Promotion) og Q-27 (RLS-blind tenants-spørring i tre
+produksjonsfunksjoner) UENDRET og bevart** - denne runden overlapper eller fortrenger ikke dem.
+
+**Kvalitetsgater:** kun dokumentasjonsendring (CLAUDE.md/ARCHITECTURE.md/
+DECISIONS_AND_ASSUMPTIONS.md/OPEN_QUESTIONS.md/PROJECT_STATUS.md) - ingen kode rørt, derfor ingen
+ny test/typecheck/lint-kjøring fabrikkert som "nødvendig"; eksisterende 1245/1245-testbaseline
+(D-64) er UENDRET av denne runden.
+
+**HELE UA-3 forblir uendret av denne runden** - ingen fase-fullførelsesstatus endret.
+
 ## Blokkeringer
 Q-20/UA-2 P0/Q-21/UA-2 P1A/P1A Runtime Wiring Closeout/UA-2 P1B-A/UA-3 P0/UA-3 Open-Loop Detection/
 UA-3 Business-Event-Linkage/UA-3 Profiling/Scoring har INGEN egne blokkeringer (alle
@@ -1925,10 +1993,14 @@ Ytelsesgjeld for voice-latens (Q-19) er åpen, ikke-blokkerende. Pieces har inge
 ennå (Q-22) - egen fremtidig underoppgave. Google Drive permission-mutasjon er IKKE live-host-bevist
 (Q-23) - smalt, ikke-blokkerende gjenværende verifikasjonspunkt. P1B-A sin worker-JOBB-live-kjøring er
 tilsvarende IKKE live-host-bevist (Q-24) - samme mønster, egen fremtidig test-runde. **UA-3
-Support/Tickets (Zendesk) er FIXED_SUITE, blokkert KUN på en Tobias-host-kjøring** (draft-PR, se egen
-seksjon over) - IKKE en Tobias-provider-beslutning lenger (den er tatt, D-64). **Contracts/e-sign-
-connectoren forblir blokkert på en EKSPLISITT Tobias-provider-beslutning** - IKKE kodbar før den
-foreligger, se D-57/Q-25 item 8. **Ny Q-27: tre pre-eksisterende produksjonsfunksjoner
+Support/Tickets (Zendesk, PR #13) er nå blokkert på TO SEPARATE ting, ikke bare én:** (1) en
+Tobias-host-kjøring (uendret fra D-64), OG (2) NY denne runden - en eksplisitt Tobias-beslutning per
+D-65/Q-28 om PR #13 skal merges som en midlertidig EXTERNAL_CANONICAL-løsning eller om en
+Jarvis-native Support Core skal bygges FØRST med Zendesk som adapter. **Contracts/e-sign-connectoren
+forblir blokkert på en EKSPLISITT Tobias-provider-beslutning, NÅ OGSÅ på Core-vs-Adapter-porten i
+§11.2** (D-65/Q-29 legger til krav om at kontraktskjernen designes Jarvis-native FØR noen
+signaturleverandør velges) - IKKE kodbar før dette foreligger, se D-57/Q-25 item 8 + Q-29. **Q-27:
+tre pre-eksisterende produksjonsfunksjoner
 (`runBusinessEventSyncForAllTenants`/`runOpenLoopSweepForAllTenants`/`runScoringSweepForAllTenants`)
 har samme RLS-blind-tenants-spørring-bug som ble fikset for Zendesk - IKKE fikset i disse tre ennå**,
 egen liten fremtidig BO, fiksmønsteret allerede designet. **Kriterium 2 sin gjenstående bredde
@@ -1937,12 +2009,14 @@ UA-3-kodbart gap** - disse fasene er selv IKKE startet. Connector-audit-gapene
 (GitHub/Calendar/Gmail/Telegram/Vercel/HA - se tabellen over) er dokumentert backlog, ikke blokkerende.
 
 ## Neste oppgave
-**UA-3 «Support/Tickets (Zendesk)» er FIXED_SUITE / IKKE VERIFIED → D-64.** Draft-PR opprettet, INGEN
-merge (Order F forbyr merge før Tobias-host-verifisering). **Umiddelbar neste oppgave: Tobias kjører
-`node --env-file=.env --experimental-transform-types
-modules/business/scripts/ua3-zendesk-host-run.ts`** på sin faktiske Windows/Docker-host (krever
-`JARVIS_ZENDESK_*` konfigurert i `.env` + `zendesk-reauth.ts` kjørt FØRST) - deretter samme
-host-fix-runde-mønster som ALLE tidligere UA-3-slicer hvis noe funn dukker opp.
+**Umiddelbar neste oppgave: Tobias sin eksplisitte beslutning på Q-28** (D-65 sin Core-vs-Adapter-
+grenserevurdering av PR #13/Zendesk) - dette avgjør hvordan UA-3 «Support/Tickets» faktisk skal
+lukkes. Parallelt/uavhengig av den beslutningen kan Tobias fortsatt kjøre
+`node --env-file=.env --experimental-transform-types modules/business/scripts/ua3-zendesk-host-run.ts`
+for å host-verifisere den EKSISTERENDE Zendesk-connectoren sin funksjonelle korrekthet (uansett om den
+til slutt merges som interim-løsning eller blir grunnlaget for en fremtidig adapter) - de to
+beslutningene er uavhengige av hverandre. **UA-3 «Support/Tickets (Zendesk)» forblir FIXED_SUITE /
+IKKE VERIFIED → D-64, uendret av denne governance-runden.** Draft-PR #13 fortsatt IKKE merget.
 
 **HELE UA-3 er FORTSATT IKKE komplett** - masterplanens fire akseptansekriterier: kriterium 3
 COMPLETE/VERIFIED (uendret fra D-56); kriterium 4 COMPLETE/VERIFIED (uendret fra D-63); kriterium 1

@@ -44,6 +44,26 @@ Beslutningslogg: [docs/DECISIONS_AND_ASSUMPTIONS.md](docs/DECISIONS_AND_ASSUMPTI
     dokumentasjon, aldri gjettet), risikoklasse per handling, eier- og delegert-oppførsel, idempotens og en
     trygg test-sandbox; ikke-implementert kapabilitet merkes DEFERRED/PARTIAL eksplisitt, aldri stille utelatt.
     Full begrunnelse og gjeldende connector-audit: D-41 i DECISIONS_AND_ASSUMPTIONS.md.
+12. **CORE OWNERSHIP / ADAPTER BOUNDARY INVARIANT (D-65):** et masterplan-kapabilitetsnavn (f.eks.
+    «Support/tickets», «Contracts», «CRM») antyder ALDRI automatisk en tredjeparts-leverandør. Jarvis
+    skal eie den kanoniske domenemodellen, operasjonell tilstand, orkestrering, policy, minne/
+    proveniens og tverr-domene-resonnering for kapabiliteter som er intrinsic til Jarvis
+    (`JARVIS_CANONICAL`); eksterne tjenester skal normalt være kilder/sluk/transporter/adaptere/
+    utførelsesleverandører (`EXTERNAL_CANONICAL`, Jarvis-normaliserte pekere), ALDRI stedet der
+    Jarvis sin kjerneintelligens/domenearkitektur bor. IKKE «bygg alt selv» - Jarvis skal ikke
+    gjenoppbygge infrastruktur der den eksterne grensen er intrinsic/regulert/standardisert/
+    økonomisk irrasjonell å reprodusere; målet er MAKSIMAL SOVEREIGN KONTROLL DER DET BETYR NOE, ikke
+    maksimal selv-hosting uansett kostnad. FØR enhver ny ekstern leverandør/connector/SaaS velges
+    eller implementeres kjøres en Core-vs-Adapter-beslutningsport (kapabilitet → kanonisk Jarvis-
+    tilstand → hva krever faktisk et eksternt system → portabilitets-/utfalls-/dataeierskapstest →
+    system-of-record `JARVIS_CANONICAL`/`EXTERNAL_CANONICAL`/`HYBRID_WITH_CLEAR_AUTHORITY`). Blir
+    leverandøren en CORE DEPENDENCY: STOPP, rapporter `CORE_DEPENDENCY_DECISION_REQUIRED=true` til
+    Tobias FØR noe velges - ALDRI et stille leverandørvalg av bekvemmelighet/popularitet («X løser
+    dette allerede» er IKKE tilstrekkelig grunn til å gjøre X til domenekjernen). D-41 gjelder KUN
+    ETTER at denne porten har akseptert et leverandør-/connector-grenseskille - D-41 styrer HVOR
+    FULLSTENDIG en akseptert connector skal være, ALDRI OM leverandøren skulle blitt kjernen. Full
+    begrunnelse, beslutningsmal og masterplan-avhengighetsaudit: D-65 i DECISIONS_AND_ASSUMPTIONS.md,
+    §11 i ARCHITECTURE.md.
 
 ## Samarbeids- og GitHub-protokoll
 

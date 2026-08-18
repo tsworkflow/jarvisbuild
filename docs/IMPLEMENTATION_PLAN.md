@@ -902,6 +902,30 @@ on-demand); Zendesk sin Incremental Export-API (enklere standard-listing brukt i
 **IKKE VERIFIED ennå:** draft-PR, INGEN Tobias-host-kjøring utført. Neste steg er en host-kjøring av
 `ua3-zendesk-host-run.ts` (krever `JARVIS_ZENDESK_*` konfigurert + `zendesk-reauth.ts` kjørt FØRST).
 
+**D-41 full kapasitetsinventar (Zendesk, D-64) - ingen stille utelatelse:**
+
+| Kategori | Status | Detalj |
+|---|---|---|
+| READ | IMPLEMENTED | `list_tickets`/`get_ticket`/`search_tickets` - full lese-dekning av tickets |
+| WRITE | IMPLEMENTED | `create_ticket`/`update_ticket` (konsolidert status/prioritet/assignee/tags/custom_fields)/`add_internal_note`/`reply_ticket` |
+| DELETE | IMPLEMENTED | `delete_ticket` (myk sletting, Zendesk sitt eget 30-dagers gjenopprettingsvindu - klasse D, `preflight_action`) |
+| ADMIN | IMPLEMENTED (webhook-CRUD) / DEFERRED_WITH_REASON (triggers/automations) | `create_webhook`/`update_webhook`/`delete_webhook` - klasse D. Zendesk triggers/automations-konfigurasjon IKKE bygget denne runden - Jarvis registrerer KUN sin egen webhook, endrer aldri kundens eksisterende automasjonsregler (utenfor D-41 sitt "nyttig for Jarvis"-kriterium, ingen konkret behov identifisert) |
+| WEBHOOK | IMPLEMENTED | Mottaker (`POST /webhooks/zendesk`) + registrering (`create_webhook`/`update_webhook`/`delete_webhook`) + listing (`list_webhooks`) |
+| OAUTH | IMPLEMENTED | Full OAuth 2.0-utveksling + rotasjon (in-memory, se D-64 arkitekturbegrunnelse) |
+| ERASURE | IMPLEMENTED (redaksjon) / PROVIDER_LIMITED (fullstendig sletting) | `redact_ticket_content` (Zendesk sin egen GDPR-redigerings-API, permanent overskriving av kommentarinnhold - klasse D). Zendesk garanterer IKKE fullstendig fjerning av alle interne systemspor (samme ærlige begrensning som ethvert SaaS-produkt) - dokumentert i `UA3_BUSINESS_DPIA.md`, IKKE lovet utover det leverandøren faktisk kan garantere |
+| SEARCH | IMPLEMENTED | `search_tickets`/`search_users`/`search_organizations` |
+| HISTORY | IMPLEMENTED | `get_ticket_audits` - full Zendesk-side endringshistorikk on-demand, ALDRI auto-speilet inn i Business OS |
+| ATTACHMENT | DEFERRED_WITH_REASON | Kun vedleggs-METADATA tilgjengelig via `get_ticket`/`get_ticket_audits` sine kommentar-payloads - ingen dedikert nedlastings-/ingestion-handling bygget denne runden. Begrunnelse: ordren (§29) krever eksplisitt at automatisk vedleggsingest følger EKSISTERENDE UA-2/Q-20-arkitektur (samme mønster som e-post-vedlegg, D-43) - ingen konkret Zendesk-vedleggs-ingestion-behov er identifisert ennå, og å bygge en parallell ingestion-vei uten et faktisk behov ville brutt "ikke bygg utover bestilt"-disiplinen. Fremtidig egen underoppgave når/hvis behov oppstår |
+| USER | IMPLEMENTED | `get_user`/`search_users` |
+| ORGANIZATION | IMPLEMENTED | `get_organization`/`search_organizations` |
+| FIELD | IMPLEMENTED (lesing+skriving av verdier via `update_ticket`) / NOT_RELEVANT (feltDEFINISJON-administrasjon) | `custom_fields` leses (`get_ticket`) og skrives (`update_ticket`) på tickets. Å DEFINERE/ENDRE selve feltskjemaet (Zendesk sin Ticket Fields admin-API) er IKKE bygget - dette er en engangs-kontooppsett-handling, ikke en gjentakende Jarvis-operasjon, vurdert NOT_RELEVANT for denne connectoren |
+| AUTOMATION | NOT_RELEVANT (denne runden) | Zendesk sin egen triggers/automations-motor forblir urørt - Jarvis sin EGEN periodiske rekonsiliering (`DailyScheduler`) og webhook-reaksjon dekker samme funksjonelle behov (oppdage/reagere på ticket-tilstandsendringer) uten å måtte administrere Zendesk sin interne automasjonskonfigurasjon |
+
+**Owner Controls (§35):** `OwnerControls.freezeConnector("zendesk")` blokkerer ALLE 20 `zendesk.*`-
+handlinger umiddelbart (delt `tool_id: "zendesk"` på tvers av samtlige ToolDefinitions, SAMME generiske
+`ToolGateway`-sjekk som alle andre connectors - ingen egen Zendesk-spesifikk fryse-mekanisme bygget
+eller nødvendig). Bevist i `zendesk-integrations-wiring.test.ts`.
+
 **Kjente åpne gap (ikke skjult - se OPEN_QUESTIONS.md):** Q-25 (oppdatert), ny Q-27 (RLS-blind
 tenants-katalog-spørring i tre PRE-EKSISTERENDE produksjonsfunksjoner, IKKE fikset i denne runden).
 

@@ -101,16 +101,58 @@ export class OpenLoopService {
     });
   }
 
-  /** Full sweep: begge deterministiske regler - trygt aa kalle gjentatte ganger (idempotent). */
+  /**
+   * UA-3 Support/Tickets (Zendesk, D-64): deterministisk over `zendesk_tickets`
+   * sin EGEN, Zendesk-dokumenterte statussemantikk (se
+   * `023_zendesk_support.sql` sin toppkommentar) - `status IN ('new','open')`
+   * betyr Zendesk selv anser ballen IKKE hos kunden (`'pending'` er nettopp
+   * det motsatte signalet, `'hold'/'solved'/'closed'` er ikke aktive). Ingen
+   * utledet "siste aktivitet"-tidsstempel, ingen AI Mesh-bruk - samme
+   * deterministisk-først-prinsipp som de to andre reglene.
+   */
+  async detectSupportTicketsNeedingReply(tenantId: string, memorySpace: MemorySpace): Promise<SweepResult> {
+    return withMemoryTransaction(this.pool, tenantId, [memorySpace], async (client) => {
+      const needsReply = await client.query(
+        `SELECT ticket_id, company_id, contact_id, subject, priority, canonical_uri, updated_at_provider
+         FROM zendesk_tickets WHERE tenant_id = $1 AND status IN ('new','open')`,
+        [tenantId]
+      );
+      let detected = 0;
+      let updated = 0;
+      const currentKeys: string[] = [];
+      for (const row of needsReply.rows as Array<{
+        ticket_id: string; company_id: string | null; contact_id: string | null;
+        subject: string; priority: string | null; canonical_uri: string; updated_at_provider: string | null;
+      }>) {
+        const detectionKey = `support_ticket_needs_reply:${row.ticket_id}`;
+        currentKeys.push(detectionKey);
+        const priority: OpenLoopPriority = row.priority === "urgent" || row.priority === "high" ? "high" : "normal";
+        const result = await upsertOpenLoop(client, {
+          open_loop_id: `biz-ol-${randomUUID()}`, tenant_id: tenantId, memory_space: memorySpace,
+          company_id: row.company_id, contact_id: row.contact_id, opportunity_id: null,
+          lead_id: null, followup_id: null, activity_id: null,
+          loop_type: "support_ticket_needs_reply", detection_key: detectionKey,
+          reason: `Zendesk-ticket "${row.subject}" venter på svar`, next_action: `Svar på ticketen: ${row.canonical_uri}`,
+          priority, owner_person_id: null, due_at: null
+        });
+        if (result === "inserted") detected++; else updated++;
+      }
+      const autoResolved = await autoResolveStale(client, tenantId, "support_ticket_needs_reply", currentKeys);
+      return { detected, updated, auto_resolved: autoResolved };
+    });
+  }
+
+  /** Full sweep: alle deterministiske regler - trygt aa kalle gjentatte ganger (idempotent). */
   async runSweep(tenantId: string, memorySpace: MemorySpace): Promise<SweepResult> {
-    const [followups, opportunities] = [
+    const [followups, opportunities, tickets] = [
       await this.detectOverdueFollowups(tenantId, memorySpace),
-      await this.detectStalledOpportunities(tenantId, memorySpace)
+      await this.detectStalledOpportunities(tenantId, memorySpace),
+      await this.detectSupportTicketsNeedingReply(tenantId, memorySpace)
     ];
     return {
-      detected: followups.detected + opportunities.detected,
-      updated: followups.updated + opportunities.updated,
-      auto_resolved: followups.auto_resolved + opportunities.auto_resolved
+      detected: followups.detected + opportunities.detected + tickets.detected,
+      updated: followups.updated + opportunities.updated + tickets.updated,
+      auto_resolved: followups.auto_resolved + opportunities.auto_resolved + tickets.auto_resolved
     };
   }
 

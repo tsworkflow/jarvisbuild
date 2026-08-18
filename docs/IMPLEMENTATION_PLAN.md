@@ -840,6 +840,71 @@ likevel til stede og host-bevist. Se D-63 for full evidens og oppdatert firekrit
 
 **Kjente åpne gap (ikke skjult - se OPEN_QUESTIONS.md):** Q-25 (oppdatert deferred-liste for HELE UA-3).
 
+### UA-3 — Support/Tickets (Zendesk, akseptansekriterium 1 delvis) = FIXED_SUITE / IKKE VERIFIED (2026-08-18) → D-64
+
+**Status: FIXED_SUITE / IKKE VERIFIED → D-64.** Draft-PR opprettet, INGEN host-kjøring av Tobias
+utført ennå. Provider valgt gjennom en egen research-only-runde (vektet D-41-kapasitetsmatrise:
+API 20%/D-41 15%/webhooks 15%/Business OS-fit 10%/auth 10%/GDPR 10%/kost 10%/migrasjon 5%/drift 5%) -
+Zendesk anbefalt foran Intercom/Freshdesk/Chatwoot, Tobias godkjente eksplisitt. Bygget PÅ det
+VERIFIED/COMPLETE Business-Event-Linkage-fundamentet (D-60) - samme `business_activities`/
+`business_open_loops`-modell, samme deterministisk-kontakt-gjenkjenning-prinsipp som Gmail/Calendar.
+
+**Bygget:**
+1. **Migrasjon `023_zendesk_support.sql`** - ny `zendesk_tickets`-tabell, FORCE RLS
+   tenant+memory_space-RESTRICTIVE-mønster (samme som `business_open_loops`/`business_scores`);
+   `business_open_loops_loop_type_check` utvidet med `'support_ticket_needs_reply'`; ny
+   `SECURITY DEFINER`-funksjon `jarvis_list_tenant_ids_by_kind(p_kind, p_limit)` (se D-64-funn under).
+2. **`ZendeskTransport`** (`live-transports.ts`) - 20 handlinger, OAuth 2.0-kodeutveksling +
+   in-memory-rotasjon (`refresh_token`→`access_token`), 429/Retry-After bundet retry,
+   typed/sanitiserte feil (`classifyZendeskTokenEndpointError()`).
+3. **ToolGateway** - 20 `zendesk.*`-handlinger + `business.sync_zendesk_tickets` i `integrations.ts`.
+   Full D-41-kapasitet: klasse A (11 les, inkl. `get_ticket_audits` on-demand), klasse B
+   (`update_ticket` konsolidert, `add_internal_note`), klasse C (`create_ticket`, `reply_ticket`),
+   klasse D (`delete_ticket`, `redact_ticket_content`, `create_webhook`/`update_webhook`/
+   `delete_webhook` - hver med `preflight_action`).
+4. **`ZendeskTicketService`/`ZendeskEventSyncService`** (`modules/business/src`) - pointer-not-payload
+   persistering (subjekt/status/prioritet/kontakt-lenke/`canonical_uri`, ALDRI kommentarinnhold),
+   deterministisk e-post-/domene-kontaktgjenkjenning, tvetydige/ikke-matchede tickets lagres INGEN
+   steder, `reevaluateOpenLoops()` (`support_ticket_needs_reply`, status-basert - `new`/`open`).
+5. **Webhook-mottaker** - `POST /webhooks/zendesk` (`apps/api/src/server.ts`): HMAC-SHA256-signatur,
+   5-min replay-vindu, `timingSafeEqual`, rå bytes FØR JSON.parse (256KB-tak). Webhook-kroppen
+   brukes KUN til å hente ticket-ID - normalisering skjer alltid via en FERSK `zendesk.get_ticket`
+   gjennom ToolGateway, ALDRI fra webhook-feltinnhold direkte.
+6. **Periodisk rekonsiliering** via EKSISTERENDE `DailyScheduler`
+   (`job_name="zendesk-tickets-sync"`) - INGEN ny kø.
+7. **`zendesk-reauth.ts`** (+ `zendesk-oauth-lib.ts`) - interaktivt OAuth-orkestreringsskript,
+   samme atomiske `.env`-skrivemønster som `google-drive-reauth.ts`/`google-email-reauth.ts`.
+8. **Host-akseptanseskript** `ua3-zendesk-host-run.ts` → `ua3-zendesk-live.ts` - to-delt strategi
+   (REAL CONNECTOR REACHABILITY, KUN `list_tickets`, ALDRI en mutasjon mot ekte Zendesk +
+   FakeTransport-basert deterministisk DEL 2), samme mønster som Business-Event-Linkage.
+
+**Suite-verifisert (1245/1245 tester totalt, 85 nye - se RUNTIME_GATES.md):** OAuth-utveksling/
+-rotasjon/feilklassifisering, rate-limiting/retry, webhook-signatur/replay/idempotens, deterministisk
+kontaktgjenkjenning (matched/unmatched/ambiguous), pointer-not-payload (ingen kommentarinnhold
+persistert), ticket-tilstand-idempotens, open-loop-opprettelse/-løsning, D-klasse-gating/preflight,
+tenant-/memory-space-isolasjon, Q-21-rollesikkerhet, ToolGateway-lesing/-skriving, audit-personvern,
+in-memory-token-rotasjon, cleanup.
+
+**NYTT FUNN denne runden (D-64), IKKE bestilt av byggeordren:** et FJERDE tilfelle av samme
+RLS-blind-spørring-feilklasse som D-54/D-59/D-62 - denne gangen i PRODUKSJONSKODE (ikke kun
+akseptanse-harness). Tre eksisterende `DailyScheduler`-trigget funksjoner
+(`runBusinessEventSyncForAllTenants` D-57, `runOpenLoopSweepForAllTenants` D-53,
+`runScoringSweepForAllTenants` D-61) bruker en rå, uskopet `pool.query()` mot `tenants`
+(`FORCE ROW LEVEL SECURITY`) og finner derfor STRUKTURELT 0 tenants i produksjon. Fikset KUN for den
+nye Zendesk-ekvivalenten (`jarvis_list_tenant_ids_by_kind()`, ny `SECURITY DEFINER`-funksjon,
+`GRANT EXECUTE` KUN til `jarvis_app`, Q-21-invarianten uendret) - de tre søsken-funksjonene er BEVISST
+IKKE rørt (utenfor bestilt scope). Se D-64 og ny Q-27 for full detalj og gjenstående fiks-oppgave.
+
+**Bygges IKKE i denne sliceen:** Contracts/e-sign-connector (krever fortsatt en egen
+Tobias-provider-beslutning); automatisk ingestion av Ticket Audits/kommentarhistorikk (kun
+on-demand); Zendesk sin Incremental Export-API (enklere standard-listing brukt i v1); UA-4.
+
+**IKKE VERIFIED ennå:** draft-PR, INGEN Tobias-host-kjøring utført. Neste steg er en host-kjøring av
+`ua3-zendesk-host-run.ts` (krever `JARVIS_ZENDESK_*` konfigurert + `zendesk-reauth.ts` kjørt FØRST).
+
+**Kjente åpne gap (ikke skjult - se OPEN_QUESTIONS.md):** Q-25 (oppdatert), ny Q-27 (RLS-blind
+tenants-katalog-spørring i tre PRE-EKSISTERENDE produksjonsfunksjoner, IKKE fikset i denne runden).
+
 ---
 
 ## Fase-avhengigheter (oversikt)

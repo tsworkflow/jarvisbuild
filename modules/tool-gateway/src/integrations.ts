@@ -540,6 +540,182 @@ export function firstWaveTools(transports: Partial<Record<string, ToolTransport>
       rollback_procedure: "ikke reverserbar - sett en ny manuell overstyring ved behov (set_manual_override)", idempotent_external: true,
       timeout_ms: 10_000, rate_limit_per_minute: 30, credential_ref: "JARVIS_BUSINESS_INTERNAL_TOKEN",
       output_trust: "internal", transport: transport("business")
+    },
+    // UA-3 Support/Tickets (D-64): Zendesk full read/write/delete/admin-kapabilitet
+    // (Owner Connector Capability Invariant, D-41 - IKKE read-only fordi det er
+    // enklere). Lagt til på SLUTTEN av arrayet (samme presedens som alle
+    // tidligere tillegg - eksisterende tester indekserer dette arrayet
+    // posisjonelt). OAuth refresh-token credential (§5/§7 i byggeordren).
+    {
+      tool_id: "zendesk", action: "list_tickets", description: "List nylig oppdaterte Zendesk-tickets (untrusted ingestion)",
+      input_schema: record({ max: z.number().int().min(1).max(100).optional(), updated_since: z.string().optional() }),
+      capability_class: "A", scopes: ["zendesk.tickets.read"], reversible: true,
+      rollback_procedure: "ingen (lesing)", idempotent_external: true,
+      timeout_ms: 15_000, rate_limit_per_minute: 30, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "get_ticket", description: "Les ett Zendesk-ticket med side-lastet requester/organisasjon (untrusted ingestion)",
+      input_schema: record({ ticket_id: z.string() }), capability_class: "A",
+      scopes: ["zendesk.tickets.read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, timeout_ms: 10_000, rate_limit_per_minute: 60,
+      credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN", output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "search_tickets", description: "Søk Zendesk-tickets med fritekst-/felt-spørring (untrusted ingestion)",
+      input_schema: record({ query: z.string() }), capability_class: "A",
+      scopes: ["zendesk.tickets.read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, timeout_ms: 15_000, rate_limit_per_minute: 20,
+      credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN", output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "get_ticket_audits", description: "Les full endringshistorikk (status/felt/tildeling/tagger) for ett ticket - Zendesk sin egen historikk, IKKE Jarvis sin audit_events",
+      input_schema: record({ ticket_id: z.string() }), capability_class: "A",
+      scopes: ["zendesk.tickets.read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, timeout_ms: 15_000, rate_limit_per_minute: 30,
+      credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN", output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "get_user", description: "Les én Zendesk-bruker (untrusted ingestion)",
+      input_schema: record({ user_id: z.string() }), capability_class: "A",
+      scopes: ["zendesk.users.read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, timeout_ms: 10_000, rate_limit_per_minute: 60,
+      credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN", output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "search_users", description: "Søk Zendesk-brukere (untrusted ingestion)",
+      input_schema: record({ query: z.string() }), capability_class: "A",
+      scopes: ["zendesk.users.read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, timeout_ms: 15_000, rate_limit_per_minute: 20,
+      credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN", output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "get_organization", description: "Les én Zendesk-organisasjon (untrusted ingestion)",
+      input_schema: record({ organization_id: z.string() }), capability_class: "A",
+      scopes: ["zendesk.organizations.read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, timeout_ms: 10_000, rate_limit_per_minute: 60,
+      credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN", output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "search_organizations", description: "Søk Zendesk-organisasjoner (untrusted ingestion)",
+      input_schema: record({ query: z.string() }), capability_class: "A",
+      scopes: ["zendesk.organizations.read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, timeout_ms: 15_000, rate_limit_per_minute: 20,
+      credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN", output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "list_groups", description: "List Zendesk-agentgrupper (admin-synlighet, lesing)",
+      input_schema: empty, capability_class: "A", scopes: ["zendesk.admin.read"],
+      reversible: true, rollback_procedure: "ingen (lesing)", idempotent_external: true,
+      timeout_ms: 10_000, rate_limit_per_minute: 20, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "list_agents", description: "List Zendesk-agenter/admins (admin-synlighet, lesing)",
+      input_schema: empty, capability_class: "A", scopes: ["zendesk.admin.read"],
+      reversible: true, rollback_procedure: "ingen (lesing)", idempotent_external: true,
+      timeout_ms: 10_000, rate_limit_per_minute: 20, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "list_webhooks", description: "List Zendesk-webhooks (admin-synlighet, lesing)",
+      input_schema: empty, capability_class: "A", scopes: ["zendesk.admin.read"],
+      reversible: true, rollback_procedure: "ingen (lesing)", idempotent_external: true,
+      timeout_ms: 10_000, rate_limit_per_minute: 20, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "untrusted", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "create_ticket", description: "Opprett et nytt Zendesk-ticket (kundesynlig - klasse C)",
+      input_schema: record({
+        subject: z.string(), description: z.string().optional(), requester_email: z.string().optional(),
+        priority: z.string().optional(), tags: z.array(z.string()).optional()
+      }),
+      capability_class: "C", scopes: ["zendesk.tickets.write"], reversible: true,
+      rollback_procedure: "delete_ticket (myk sletting)", idempotent_external: false,
+      timeout_ms: 15_000, rate_limit_per_minute: 15, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "update_ticket", description: "Konsolidert oppdatering av status/prioritet/tildeling/tagger/egendefinerte felt (internt/reversibelt - klasse B)",
+      input_schema: record({
+        ticket_id: z.string(), status: z.string().optional(), priority: z.string().optional(),
+        assignee_id: z.string().optional(), tags: z.array(z.string()).optional(),
+        custom_fields: z.array(z.object({ id: z.number(), value: z.union([z.string(), z.number(), z.boolean(), z.null()]) })).optional()
+      }),
+      capability_class: "B", scopes: ["zendesk.tickets.write"], reversible: true,
+      rollback_procedure: "sett feltene tilbake til forrige verdi via samme handling", idempotent_external: true,
+      timeout_ms: 15_000, rate_limit_per_minute: 30, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk"), preflight_action: "get_ticket"
+    },
+    {
+      tool_id: "zendesk", action: "add_internal_note", description: "Legg til en INTERN note (ikke kundesynlig - klasse B)",
+      input_schema: record({ ticket_id: z.string(), body: z.string() }),
+      capability_class: "B", scopes: ["zendesk.tickets.write"], reversible: false,
+      rollback_procedure: "ikke reverserbar - notatet blir en del av tickethistorikken", idempotent_external: false,
+      timeout_ms: 15_000, rate_limit_per_minute: 20, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk")
+    },
+    {
+      tool_id: "zendesk", action: "reply_ticket", description: "Send et OFFENTLIG, kundesynlig svar (krever signert godkjenning for delegerte identiteter - klasse C)",
+      input_schema: record({ ticket_id: z.string(), body: z.string() }),
+      capability_class: "C", scopes: ["zendesk.tickets.write"], reversible: false,
+      rollback_procedure: "ikke reverserbar - svaret er sendt til kunden", idempotent_external: false,
+      timeout_ms: 15_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk")
+    },
+    {
+      // Myk sletting hos Zendesk (30-dagers gjenoppretting), likevel klasse D -
+      // kundedata-sensitiv, samme forsiktighetsprinsipp som email.send.
+      tool_id: "zendesk", action: "delete_ticket", description: "Slett et Zendesk-ticket (myk sletting, 30-dagers gjenopprettingsvindu hos Zendesk - krever signert godkjenning for delegerte identiteter)",
+      input_schema: record({ ticket_id: z.string() }), capability_class: "D",
+      scopes: ["zendesk.tickets.delete"], reversible: true,
+      rollback_procedure: "gjenopprett fra Zendesk sin \"Deleted tickets\"-visning innen 30 dager", idempotent_external: true,
+      timeout_ms: 15_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk"), preflight_action: "get_ticket"
+    },
+    {
+      tool_id: "zendesk", action: "redact_ticket_content", description: "Overskriv permanent kommentarinnhold på et ticket (GDPR-redigering - IKKE reverserbar, krever signert godkjenning for delegerte identiteter)",
+      input_schema: record({ ticket_id: z.string(), comment_id: z.string(), text: z.string() }),
+      capability_class: "D", scopes: ["zendesk.tickets.redact"], reversible: false,
+      rollback_procedure: "ikke reverserbar - derfor klasse D", idempotent_external: true,
+      timeout_ms: 15_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk"), preflight_action: "get_ticket"
+    },
+    {
+      // Config-as-code (§14 i byggeordren): Jarvis sin EGEN webhook-registrering
+      // hos Zendesk - sikkerhetskritisk (styrer hvor Zendesk sender hendelser),
+      // klasse D uavhengig av teknisk reverserbarhet, samme prinsipp som Drive
+      // sin deling/tilgangsstyring.
+      tool_id: "zendesk", action: "create_webhook", description: "Registrer en ny Zendesk-webhook (krever signert godkjenning for delegerte identiteter)",
+      input_schema: record({ name: z.string(), endpoint: z.string(), subscriptions: z.array(z.string()).optional() }),
+      capability_class: "D", scopes: ["zendesk.admin.write"], reversible: true,
+      rollback_procedure: "delete_webhook (fjern den opprettede webhooken)", idempotent_external: false,
+      timeout_ms: 10_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk"), preflight_action: "list_webhooks"
+    },
+    {
+      tool_id: "zendesk", action: "update_webhook", description: "Oppdater status/endepunkt for en eksisterende Zendesk-webhook (krever signert godkjenning for delegerte identiteter)",
+      input_schema: record({ webhook_id: z.string(), status: z.string().optional(), endpoint: z.string().optional() }),
+      capability_class: "D", scopes: ["zendesk.admin.write"], reversible: true,
+      rollback_procedure: "sett feltene tilbake til forrige verdi via samme handling", idempotent_external: true,
+      timeout_ms: 10_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk"), preflight_action: "list_webhooks"
+    },
+    {
+      tool_id: "zendesk", action: "delete_webhook", description: "Fjern en eksisterende Zendesk-webhook (krever signert godkjenning for delegerte identiteter)",
+      input_schema: record({ webhook_id: z.string() }), capability_class: "D",
+      scopes: ["zendesk.admin.write"], reversible: true,
+      rollback_procedure: "gjenopprett webhooken manuelt (ikke automatisk reverserbar)", idempotent_external: true,
+      timeout_ms: 10_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_ZENDESK_REFRESH_TOKEN",
+      output_trust: "internal", transport: transport("zendesk"), preflight_action: "list_webhooks"
+    },
+    {
+      tool_id: "business", action: "sync_zendesk_tickets", description: "Synkroniser nylige Zendesk-tickets inn i forretningstidslinjen + open-loop-reevaluering (deterministisk kontakt-/selskaps-gjenkjenning, aldri gjettet)",
+      input_schema: record({ tenant_id: z.string(), memory_space: z.string().optional(), max: z.number().int().min(1).max(100).optional() }),
+      capability_class: "B", scopes: ["business.write"], reversible: true,
+      rollback_procedure: "ingen automatisk angring - append-only tidslinje, re-sync er trygt (idempotent)",
+      idempotent_external: true, timeout_ms: 30_000, rate_limit_per_minute: 30,
+      credential_ref: "JARVIS_BUSINESS_INTERNAL_TOKEN", output_trust: "internal", transport: transport("business")
     }
   ];
 }

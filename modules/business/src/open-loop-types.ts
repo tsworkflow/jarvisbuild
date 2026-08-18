@@ -5,7 +5,7 @@
  * types.ts - ingen eksisterende entitet endret.
  */
 
-export type OpenLoopType = "overdue_followup" | "stalled_opportunity";
+export type OpenLoopType = "overdue_followup" | "stalled_opportunity" | "support_ticket_needs_reply";
 export type OpenLoopDetectionMethod = "deterministic" | "ai_assisted";
 export type OpenLoopPriority = "low" | "normal" | "high";
 export type OpenLoopStatus = "open" | "resolved";

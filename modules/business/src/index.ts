@@ -11,3 +11,6 @@ export * from "./scoring-types.ts";
 export * from "./scoring-rules.ts";
 export * from "./scoring-service.ts";
 export * from "./scoring-sweep.ts";
+export * from "./zendesk-types.ts";
+export * from "./zendesk-ticket-service.ts";
+export * from "./zendesk-event-sync.ts";

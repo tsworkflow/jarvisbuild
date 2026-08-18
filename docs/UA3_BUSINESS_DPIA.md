@@ -78,6 +78,7 @@ eksterne kilden; Business OS lagrer kun strukturert state + en peker.
 | **OPERATIONAL METADATA** (relasjonens tilstand, ikke selve kildeinnholdet) | `business_companies`/`business_leads`/`business_opportunities`/`business_activities`/`business_followups`/`business_open_loops` (NY, D-53 - automatisk derivert, ikke en ny inntaksvei) | Retained ved Q-20-sletting av et REFERERT Knowledge-dokument (ingen FK - se under). Slettes/anonymiseres KUN sammen med hele tenanten (samme mønster som øvrige tenant-scopede tabeller) |
 | **DERIVED / OPERATIONAL METADATA** (systemberegnet prioriteringsverdi, ikke en ny persondata-kilde) | `business_scores` (NY, D-61 - automatisk derivert fra EKSISTERENDE lead-/opportunity-/aktivitets-/oppfoelgings-/open-loop-data) | Samme retensjon som `business_open_loops`. `evidence`-feltet er en løs referanse (ingen FK) - overlever en referert kildes fjerning uten cascade-feil |
 | **AUDIT-EVENT** | `audit_events`-rader for `tool_id='business'` | Append-only (uendret fra eksisterende audit-arkitektur), inneholder ALDRI navn/e-post/telefon (kun `credential_ref`/`external_id`/`scopes`/`rollback` - verifisert i `business-transport-wiring.test.ts` §N) |
+| **DERIVED / OPERATIONAL METADATA** (Zendesk-ticket current-state, ikke en kopi av kundekommunikasjon) | `zendesk_tickets` (NY, D-64 - subject/status/priority/kontakt-/selskaps-lenke, ALDRI kommentarinnhold) | Samme retensjon som `business_open_loops`/`business_scores`. Slettes/anonymiseres KUN sammen med hele tenanten |
 
 ## Q-20-interaksjon (§26 i byggeordren)
 
@@ -185,3 +186,69 @@ lav-konsekvens bruken - Appendiks D-gaten er dermed oppfylt både i bokstav (kon
 **Ikke i scope denne runden (se Q-25):** kontakt-/person-nivå-scoring (arkitektonisk umulig); AI Mesh-
 basert scoring-forbedring; finere per-tenant/policy-nivå av/på-bryter utover deployment-wiring;
 kontrakt-/faktura-verdi-baserte faktorer.
+
+## Support/Tickets (Zendesk, NY, UA-3 D-64) - akseptansekriterium 1 (delvis)
+
+Zendesk er UA-3 sin FØRSTE ekte kundekontakt-connector med en ekstern leverandør-credential (i
+motsetning til Gmail/Calendar, som allerede var provider-besluttede UA-0/UA-7-P0-connectorer, og
+profiling/scoring, som ikke hadde noen ekstern credential i det hele tatt). Provider-valget selv
+(Zendesk fremfor Intercom/Freshdesk/Chatwoot) er dokumentert som en EGEN, separat beslutning (se
+DECISIONS_AND_ASSUMPTIONS.md D-64-forgjengeren - forskningsrapporten levert FØR denne
+implementasjonsordren) - denne seksjonen dekker KUN selve implementasjonens data-governance.
+
+**Hva leses (transient), hva lagres (persistent):** Zendesk-ticket-felt (emne, status, prioritet,
+tildelt agent, requester-e-post, organisasjon) leses via `ZendeskTransport` PER SYNK-KJØRING - KUN
+emne/status/prioritet/tildeling/kontakt-/selskaps-lenke/kilde-URL lagres i `zendesk_tickets`
+(current-state) og en tilsvarende, kort `business_activities`-rad (`source_type='zendesk'`). Selve
+kommentarinnholdet/samtalen mellom kunde og agent leses ALDRI inn i noen Jarvis-tabell - Zendesk
+sin egen Ticket Audits-API forblir den autoritative historikken, hentet on-demand
+(`zendesk.get_ticket_audits`, klasse A) når eksplisitt etterspurt, ALDRI automatisk speilet inn i
+`business_activities.summary` (strukturelt bevist: testene AE/§summary.length<200 i
+`zendesk-event-sync.test.ts` og host-akseptansen `ua3-zendesk-live.ts`).
+
+**Deterministisk kontakt-gjenkjenning (§9/§18 i byggeordren):** requester-e-postadressen er den
+ENESTE identiteten brukt for å lenke et ticket til en `business_contact` - SAMME
+`findContactsByEmail()`-mekanisme som Gmail/Calendar (D-57), ALDRI en AI Mesh-gjettet kobling. 0
+treff eller >1 distinkt selskap blant treffene betyr ticketet IKKE persisteres i det hele tatt
+(verken `zendesk_tickets` eller `business_activities`) - unngår at samme fysiske ticket dupliseres
+på tvers av flere bedrifts-tenants som deler samme Zendesk-konto (samme delt-konto-forbehold som
+Gmail/Calendar, se Q-25 item 10 - dokumentert der, ingen egen Q-postering nødvendig for dette
+spesifikke forbeholdet).
+
+**Rettslig grunnlag (legal basis, Appendiks D-gate):** behandlingsgrunnlaget for `zendesk_tickets`/
+de Zendesk-avledede `business_activities`-radene er berettiget interesse (GDPR art. 6(1)(f)) - intern
+kundeoppfølging av allerede-eksisterende kundekontaktdata (samme prinsipp som Gmail/Calendar-
+lenkingen, D-57/D-60). **GDPR art. 22 er IKKE relevant** - hverken det å lenke et ticket til Business
+OS-tidslinjen eller `support_ticket_needs_reply`-open-loop-regelen "produces legal effects" eller
+"similarly significantly affects" en person: det er utelukkende operasjonell synlighet/prioritering
+for Tobias/teamet, aldri en automatisert avgjørelse OM kunden (avviser aldri en tjeneste, fatter
+aldri en kreditt-/ansettelses-/forsikringsbeslutning).
+
+**Full useful capability (D-41) og databehandleravtale:** i motsetning til profiling/scoring har
+Zendesk-connectoren FULL les/skriv/slett/admin-kapabilitet (D-41 Owner Connector Capability
+Invariant - se D-64-kapabilitetsmatrisen i sluttrapporten) - inkludert permanent sletting
+(`delete_ticket`) og GDPR-redigering (`redact_ticket_content`, direkte mot Zendesk sin egen
+redigeringsfunksjon for kommentarinnhold). Zendesk selv er en databehandler for kundekommunikasjonen
+som fortsatt ligger i Zendesk (Jarvis kopierer den aldri inn) - en formell databehandleravtale
+(DPA) med Zendesk er Tobias sitt eget ansvar å inngå ved reell produksjonsbruk (utenfor denne
+kodebasens scope å dokumentere/signere), men er IKKE en forutsetning for at Jarvis sin egen
+tekniske arkitektur (pointer-not-payload, deterministisk lenking, RLS-isolasjon) skal være korrekt
+utformet.
+
+**Q-20-interaksjon:** SAMME mønster som Gmail/Calendar/open-loops - `zendesk_tickets.canonical_uri`
+og `business_activities.canonical_uri` er LØSE pekere uten FK til noe Knowledge-dokument. En
+fremtidig Q-20-sletting av en referert kilde gjør pekeren ustabil/ikke-oppløsbar, ALDRI en
+cascade-feil eller en vei til å gjenopplive slettet innhold.
+
+**Webhook-mottak (§22/§23 i byggeordren) - sikkerhetsprinsipp:** `POST /webhooks/zendesk` er den
+FØRSTE innkommende webhook-mottakeren i kodebasen. Selve webhook-KROPPEN brukes ALDRI direkte til å
+skrive Business OS-data - kun ticket-ID-en trekkes ut (`parseZendeskWebhookEvent()`), og
+normalisering skjer UTELUKKENDE via en FERSK `zendesk.get_ticket`-henting gjennom ToolGateway. Selv
+om signaturverifiseringen (HMAC-SHA256, Zendesk sin dokumenterte mekanisme) skulle svikte et sted,
+kan INGEN utro/uautentisert feltinnhold noensinne nå Business OS.
+
+**Ikke i scope denne runden (se D-64 sluttrapport/Q-25/Q-27):** automatisk ingestion av Zendesk
+Ticket Audits/kommentarhistorikk inn i `business_activities` (kun on-demand-lesing via
+`zendesk.get_ticket_audits`, aldri auto-speilet); Zendesk sin cursor-baserte Incremental Export-API
+(enklere standard-listing brukt i v1, se D-64 kapabilitetsaudit); trigger-/automation-konfigurasjon
+utover Jarvis sin egen webhook-registrering; flere Zendesk-instanser per tenant.

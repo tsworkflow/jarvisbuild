@@ -8,6 +8,8 @@ import type { OpenLoopService } from "./open-loop-service.ts";
 import { BusinessEventSyncService } from "./business-event-sync.ts";
 import type { ScoringService } from "./scoring-service.ts";
 import type { ScoreEntityType } from "./scoring-types.ts";
+import { ZendeskEventSyncService } from "./zendesk-event-sync.ts";
+import type { ZendeskTicketService } from "./zendesk-ticket-service.ts";
 
 /**
  * D-49: `ToolTransport.invoke(action, parameters, credential)` gir - som for
@@ -24,13 +26,15 @@ import type { ScoreEntityType } from "./scoring-types.ts";
  */
 export class BusinessTransport implements ToolTransport {
   private eventSync?: BusinessEventSyncService;
+  private zendeskSync?: ZendeskEventSyncService;
 
   constructor(
     private readonly service: BusinessService,
     private readonly openLoops?: OpenLoopService,
     private readonly pool?: pg.Pool,
     private readonly gateway?: ToolGateway,
-    private readonly scoring?: ScoringService
+    private readonly scoring?: ScoringService,
+    private readonly zendeskTickets?: ZendeskTicketService
   ) {}
 
   async invoke(action: string, parameters: Record<string, JsonValue>): Promise<{ external_id?: string; data?: JsonValue }> {
@@ -263,6 +267,16 @@ export class BusinessTransport implements ToolTransport {
         const row = await this.requireScoring().clearManualOverride(tenantId, memorySpace, entityType, entityId);
         return { ...(row ? { external_id: row.score_id } : {}), data: row as unknown as JsonValue };
       }
+      case "sync_zendesk_tickets": {
+        const identity: IdentityContext = {
+          person_id: "system", tenant_id: tenantId, memory_space_id: memorySpace,
+          session_id: `zendesk-tickets-sync-${tenantId}`, device_id: "jarvis-core",
+          channel: "api", auth_strength: "active"
+        };
+        const max = parameters["max"] !== undefined ? Number(parameters["max"]) : undefined;
+        const result = await this.requireZendeskSync().syncTenant(tenantId, memorySpace, identity, { ...(max !== undefined ? { max } : {}) });
+        return { data: result as unknown as JsonValue };
+      }
       default:
         throw new Error(`business_action_not_implemented:${action}`);
     }
@@ -287,6 +301,12 @@ export class BusinessTransport implements ToolTransport {
   private requireScoring(): ScoringService {
     if (!this.scoring) throw new Error("business_scoring_not_configured");
     return this.scoring;
+  }
+
+  private requireZendeskSync(): ZendeskEventSyncService {
+    if (!this.gateway || !this.zendeskTickets) throw new Error("business_zendesk_sync_not_configured");
+    this.zendeskSync ??= new ZendeskEventSyncService(this.gateway, this.service, this.zendeskTickets, this.requireOpenLoops());
+    return this.zendeskSync;
   }
 }
 

@@ -837,6 +837,435 @@ export class GithubTransport implements ToolTransport {
 }
 
 /**
+ * UA-3 Support/Tickets (D-64): Zendesk-connector - full les/skriv/slett/admin-
+ * kapabilitet der Zendesk faktisk tilbyr det (Owner Connector Capability
+ * Invariant, D-41) - IKKE read-only fordi det er enklere. OAuth 2.0 (autorisasjons-
+ * kode-flyt) er PRIMÆR autentiseringsmekanisme fra dag én (§5 i byggeordren) -
+ * `credential` (fra SecretProvider via `JARVIS_ZENDESK_REFRESH_TOKEN`) er en
+ * OAuth refresh-token, SAMME rolle som Google sin `credential`-parameter
+ * (`googleAccessToken()` over).
+ *
+ * TOKEN-ROTASJON (§7 i byggeordren - genuin arkitekturbegrensning, IKKE en
+ * uteglemt detalj): `docker-compose.yml` sin `env_file: [".env"]` seeder KUN
+ * `process.env` ved container-OPPSTART - api/worker-containere har INGEN
+ * skrivbar tilgang til vertens `.env`-fil (ingen bind-mount), og selv om de
+ * hadde det ville en fil-omskriving IKKE hot-reloadet en allerede kjørende
+ * prosess sin `process.env`. Denne transporten holder derfor rotert
+ * access/refresh-token-tilstand KUN i minnet, på selve instansen (satt fra
+ * `credential`-parameteren FØRSTE gang, deretter selvstyrt) - korrekt og trygt
+ * for prosessens levetid (ALDRI et ugyldig gjenbrukt refresh-token, §7), men
+ * en rotasjon overlever IKKE en prosess-restart. Dette er en eksplisitt
+ * DEFERRED arkitekturbegrensning (D-41: dokumentert, aldri stille utelatt) -
+ * gjenoppretting skjer identisk til Google sin `EMAIL_REAUTH_REQUIRED`-UX: en
+ * `zendesk_oauth_refresh_required`-feil ber Tobias kjøre
+ * `zendesk-reauth.ts` på nytt, som skriver et FERSKT par til `.env` på verten.
+ *
+ * Sikkerhetsdesign for webhook-mottak (§23/§29): selve webhook-KROPPEN
+ * brukes ALDRI direkte til å skrive Business OS-data - kun som en
+ * "våkne opp og hent på nytt"-utløser (ticket-ID). Normalisering skjer
+ * UTELUKKENDE via denne transportens EGNE `get_ticket()`-kall gjennom
+ * ToolGateway (samme mønster som periodisk synk) - selv om signatur-
+ * verifiseringen skulle svikte, når aldri utro/utenforstående webhook-
+ * feltinnhold frem til `business_activities`/`zendesk_tickets`.
+ */
+export interface ZendeskAuthErrorDetails {
+  httpStatus: number;
+  zendeskError: string | undefined;
+  zendeskErrorDescription: string | undefined;
+  errorClass: "ZENDESK_OAUTH_REFRESH_REQUIRED" | "ZENDESK_OAUTH_CLIENT_INVALID" | "ZENDESK_OAUTH_UNKNOWN";
+}
+
+interface ZendeskTokenErrorBody {
+  error?: string;
+  error_description?: string;
+}
+
+/** Samme presedens som `classifyGoogleTokenEndpointError()` - KUN for selve token-endepunktet, aldri kaster. */
+export function classifyZendeskTokenEndpointError(httpStatus: number, rawBody: string): ZendeskAuthErrorDetails {
+  let parsed: ZendeskTokenErrorBody = {};
+  try {
+    parsed = JSON.parse(rawBody) as ZendeskTokenErrorBody;
+  } catch {
+    // Ikke-JSON-kropp - fortsett med tomt objekt, fortsatt en trygg klassifisering under.
+  }
+  const zendeskError = parsed.error;
+  const zendeskErrorDescription = parsed.error_description?.slice(0, 300);
+  let errorClass: ZendeskAuthErrorDetails["errorClass"];
+  if (zendeskError === "invalid_grant") errorClass = "ZENDESK_OAUTH_REFRESH_REQUIRED";
+  else if (zendeskError === "invalid_client" || zendeskError === "unauthorized_client") errorClass = "ZENDESK_OAUTH_CLIENT_INVALID";
+  else errorClass = "ZENDESK_OAUTH_UNKNOWN";
+  return { httpStatus, zendeskError, zendeskErrorDescription, errorClass };
+}
+
+interface ZendeskTokenState {
+  accessToken: string;
+  accessTokenExpiresAt: number;
+  refreshToken: string;
+}
+
+const ZENDESK_D_CLASS_ACTIONS = new Set(["delete_ticket", "redact_ticket_content", "create_webhook", "update_webhook", "delete_webhook"]);
+
+export class ZendeskTransport implements ToolTransport {
+  /** §7: rotert token-tilstand - KUN i minnet, se toppkommentaren for hvorfor. */
+  private tokenState: ZendeskTokenState | undefined;
+
+  constructor(
+    private readonly subdomain: string = process.env["JARVIS_ZENDESK_SUBDOMAIN"] ?? "",
+    private readonly agentEmail: string = process.env["JARVIS_ZENDESK_AGENT_EMAIL"] ?? ""
+  ) {}
+
+  private baseUrl(): string {
+    return `https://${this.subdomain}.zendesk.com/api/v2`;
+  }
+
+  /** §26: Zendesk sin `Retry-After`-header respekteres med ETT bounded retry-forsøk - aldri en ukontrollert løkke. */
+  private async fetchWithRetry(url: string, init: RequestInit): Promise<Response> {
+    const response = await fetch(url, init);
+    if (response.status !== 429) return response;
+    const retryAfterHeader = response.headers.get("retry-after");
+    const retryAfterMs = Math.min(Number(retryAfterHeader ?? "1") * 1000 || 1000, 10_000);
+    await new Promise((resolve) => setTimeout(resolve, retryAfterMs));
+    return fetch(url, init);
+  }
+
+  /** §7: bytter refresh-token mot et ferskt access-token. Oppdaterer `this.tokenState` atomisk (i minnet) hvis Zendesk roterer refresh-tokenet i samme svar. */
+  private async accessToken(seedRefreshToken: string): Promise<string> {
+    this.tokenState ??= { accessToken: "", accessTokenExpiresAt: 0, refreshToken: seedRefreshToken };
+    if (this.tokenState.accessToken && Date.now() < this.tokenState.accessTokenExpiresAt) {
+      return this.tokenState.accessToken;
+    }
+    const clientId = process.env["JARVIS_ZENDESK_CLIENT_ID"];
+    const clientSecret = process.env["JARVIS_ZENDESK_CLIENT_SECRET"];
+    if (!clientId || !clientSecret || !this.subdomain) throw new Error("zendesk_oauth_client_not_configured");
+    const response = await fetch(`https://${this.subdomain}.zendesk.com/oauth/tokens`, {
+      method: "POST",
+      headers: { "content-type": "application/x-www-form-urlencoded" },
+      body: new URLSearchParams({
+        grant_type: "refresh_token", refresh_token: this.tokenState.refreshToken,
+        client_id: clientId, client_secret: clientSecret
+      })
+    });
+    if (!response.ok) {
+      const rawBody = await response.text().catch(() => "");
+      const details = classifyZendeskTokenEndpointError(response.status, rawBody);
+      // §7/§27 i byggeordren: `oauth_refresh_required` er et distinkt, gjenkjennbart
+      // marker-navn (Tobias skal kjøre `zendesk-reauth.ts` på nytt) - de øvrige
+      // klassene forblir detaljerte (status+klasse) for feilsøking, samme presedens
+      // som `google_auth_failed_<status>:<class>`.
+      throw new Error(
+        details.errorClass === "ZENDESK_OAUTH_REFRESH_REQUIRED"
+          ? "zendesk_oauth_refresh_required"
+          : `zendesk_oauth_failed_${response.status}:${details.errorClass}`
+      );
+    }
+    const body = (await response.json()) as { access_token: string; expires_in?: number; refresh_token?: string };
+    // §7: atomisk oppdatering - hvis Zendesk sendte et NYTT refresh-token (rotasjon), bruk
+    // det for ALLE fremtidige kall i denne prosessens levetid; ellers behold det gjeldende.
+    this.tokenState = {
+      accessToken: body.access_token,
+      accessTokenExpiresAt: Date.now() + Math.max((body.expires_in ?? 1_800) - 60, 60) * 1000,
+      refreshToken: body.refresh_token ?? this.tokenState.refreshToken
+    };
+    return this.tokenState.accessToken;
+  }
+
+  /** Felles status->typet-feil-mapping - samme presedens som Drive sin `assertOk()`. */
+  private async assertOk(response: Response, notFoundId?: string): Promise<void> {
+    if (response.status === 404) throw new Error(`zendesk_not_found_${notFoundId ?? "unknown"}`);
+    if (response.status === 401) throw new Error("zendesk_unauthorized");
+    if (response.status === 403) throw new Error("zendesk_forbidden");
+    if (response.status === 429) throw new Error("zendesk_rate_limited");
+    if (!response.ok) throw new Error(`zendesk_error_${response.status}`);
+  }
+
+  ticketUrl(ticketId: string): string {
+    return `https://${this.subdomain}.zendesk.com/agent/tickets/${ticketId}`;
+  }
+
+  async invoke(action: string, parameters: Record<string, JsonValue>, credential: string): Promise<{ external_id?: string; data?: JsonValue }> {
+    if (!this.subdomain) throw new Error("zendesk_subdomain_not_configured");
+    const token = await this.accessToken(credential);
+    const auth = { authorization: `Bearer ${token}`, "content-type": "application/json" };
+    switch (action) {
+      case "list_tickets": return this.listTickets(parameters, auth);
+      case "get_ticket": return this.getTicket(parameters, auth);
+      case "search_tickets": return this.search(parameters, auth, "ticket");
+      case "get_ticket_audits": return this.getTicketAudits(parameters, auth);
+      case "get_user": return this.getUser(parameters, auth);
+      case "search_users": return this.search(parameters, auth, "user");
+      case "get_organization": return this.getOrganization(parameters, auth);
+      case "search_organizations": return this.search(parameters, auth, "organization");
+      case "list_groups": return this.listSimple("/groups.json", "groups", auth);
+      case "list_agents": return this.listAgents(auth);
+      case "list_webhooks": return this.listWebhooks(auth);
+      case "create_ticket": return this.createTicket(parameters, auth);
+      case "update_ticket": return this.updateTicket(parameters, auth);
+      case "add_internal_note": return this.addComment(parameters, auth, false);
+      case "reply_ticket": return this.addComment(parameters, auth, true);
+      case "delete_ticket": return this.deleteTicket(parameters, auth);
+      case "redact_ticket_content": return this.redactContent(parameters, auth);
+      case "create_webhook": return this.createWebhook(parameters, auth);
+      case "update_webhook": return this.updateWebhook(parameters, auth);
+      case "delete_webhook": return this.deleteWebhook(parameters, auth);
+      default:
+        throw new Error(`zendesk_unsupported_action_${action}`);
+    }
+  }
+
+  /**
+   * Forenklet v1-synk (dokumentert avgrensning, IKKE stille utelatt - se D-64
+   * kapabilitetsaudit): standard listing + side-lastede requester-e-poster
+   * (`include=users,organizations`) i stedet for Zendesk sitt eget
+   * cursor-baserte Incremental Export-endepunkt (som krever persistert
+   * per-tenant cursor-state - en fremtidig optimalisering hvis volum krever
+   * det, se Q-25). `updated_since` er en enkel klient-side ISO-tidsfiltrering
+   * via `sort_by=updated_at`.
+   */
+  private async listTickets(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const max = Math.min(Number(parameters["max"] ?? 25), 100);
+    const url = new URL(`${this.baseUrl()}/tickets.json`);
+    url.searchParams.set("sort_by", "updated_at");
+    url.searchParams.set("sort_order", "desc");
+    url.searchParams.set("include", "users,organizations");
+    url.searchParams.set("per_page", String(max));
+    const response = await this.fetchWithRetry(url.toString(), { headers: auth });
+    await this.assertOk(response);
+    const body = (await response.json()) as {
+      tickets?: Array<{ id: number; subject: string; status: string; priority: string | null; assignee_id: number | null; requester_id: number; organization_id: number | null; created_at: string; updated_at: string }>;
+      users?: Array<{ id: number; email: string | null }>;
+      organizations?: Array<{ id: number; name: string }>;
+    };
+    const updatedSince = parameters["updated_since"] ? new Date(String(parameters["updated_since"])) : undefined;
+    const userEmailById = new Map((body.users ?? []).map((u) => [u.id, u.email ?? null] as const));
+    const tickets = (body.tickets ?? [])
+      .filter((t) => !updatedSince || new Date(t.updated_at) > updatedSince)
+      .map((t) => ({
+        id: String(t.id), subject: t.subject, status: t.status, priority: t.priority ?? "",
+        assignee_id: t.assignee_id !== null ? String(t.assignee_id) : "",
+        requester_id: String(t.requester_id),
+        requester_email: userEmailById.get(t.requester_id) ?? "",
+        organization_id: t.organization_id !== null ? String(t.organization_id) : "",
+        created_at: t.created_at, updated_at: t.updated_at,
+        url: this.ticketUrl(String(t.id))
+      }));
+    return { data: { tickets: tickets as unknown as JsonValue } };
+  }
+
+  private async getTicket(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const ticketId = String(parameters["ticket_id"]);
+    const url = new URL(`${this.baseUrl()}/tickets/${ticketId}.json`);
+    url.searchParams.set("include", "users,organizations");
+    const response = await this.fetchWithRetry(url.toString(), { headers: auth });
+    await this.assertOk(response, ticketId);
+    const body = (await response.json()) as {
+      ticket: { id: number; subject: string; status: string; priority: string | null; assignee_id: number | null; requester_id: number; organization_id: number | null; created_at: string; updated_at: string; tags: string[] };
+      users?: Array<{ id: number; email: string | null; name: string }>;
+      organizations?: Array<{ id: number; name: string }>;
+    };
+    const t = body.ticket;
+    const requester = (body.users ?? []).find((u) => u.id === t.requester_id);
+    const organization = t.organization_id !== null ? (body.organizations ?? []).find((o) => o.id === t.organization_id) : undefined;
+    return {
+      external_id: String(t.id),
+      data: {
+        id: String(t.id), subject: t.subject, status: t.status, priority: t.priority ?? "",
+        assignee_id: t.assignee_id !== null ? String(t.assignee_id) : "",
+        requester_id: String(t.requester_id), requester_email: requester?.email ?? "",
+        organization_id: t.organization_id !== null ? String(t.organization_id) : "", organization_name: organization?.name ?? "",
+        tags: t.tags as unknown as JsonValue, created_at: t.created_at, updated_at: t.updated_at,
+        url: this.ticketUrl(String(t.id))
+      }
+    };
+  }
+
+  private async getTicketAudits(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const ticketId = String(parameters["ticket_id"]);
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/tickets/${ticketId}/audits.json`, { headers: auth });
+    await this.assertOk(response, ticketId);
+    const body = (await response.json()) as { audits?: Array<{ id: number; created_at: string; author_id: number; events: Array<{ type: string; field_name?: string; value?: unknown }> }> };
+    const audits = (body.audits ?? []).map((a) => ({
+      id: String(a.id), created_at: a.created_at, author_id: String(a.author_id),
+      event_types: a.events.map((e) => e.field_name ? `${e.type}:${e.field_name}` : e.type) as unknown as JsonValue
+    }));
+    return { data: { audits: audits as unknown as JsonValue } };
+  }
+
+  private async getUser(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const userId = String(parameters["user_id"]);
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/users/${userId}.json`, { headers: auth });
+    await this.assertOk(response, userId);
+    const body = (await response.json()) as { user: { id: number; name: string; email: string | null; role: string; organization_id: number | null } };
+    return {
+      external_id: String(body.user.id),
+      data: {
+        id: String(body.user.id), name: body.user.name, email: body.user.email ?? "",
+        role: body.user.role, organization_id: body.user.organization_id !== null ? String(body.user.organization_id) : ""
+      }
+    };
+  }
+
+  private async getOrganization(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const orgId = String(parameters["organization_id"]);
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/organizations/${orgId}.json`, { headers: auth });
+    await this.assertOk(response, orgId);
+    const body = (await response.json()) as { organization: { id: number; name: string; domain_names?: string[] } };
+    return {
+      external_id: String(body.organization.id),
+      data: { id: String(body.organization.id), name: body.organization.name, domain_names: (body.organization.domain_names ?? []) as unknown as JsonValue }
+    };
+  }
+
+  private async search(parameters: Record<string, JsonValue>, auth: Record<string, string>, type: "ticket" | "user" | "organization") {
+    const query = String(parameters["query"] ?? "");
+    const url = new URL(`${this.baseUrl()}/search.json`);
+    url.searchParams.set("query", `type:${type} ${query}`.trim());
+    const response = await this.fetchWithRetry(url.toString(), { headers: auth });
+    await this.assertOk(response);
+    const body = (await response.json()) as { results?: Array<Record<string, JsonValue>> };
+    return { data: { results: (body.results ?? []) as unknown as JsonValue } };
+  }
+
+  private async listSimple(path: string, key: string, auth: Record<string, string>) {
+    const response = await this.fetchWithRetry(`${this.baseUrl()}${path}`, { headers: auth });
+    await this.assertOk(response);
+    const body = (await response.json()) as Record<string, unknown>;
+    return { data: { [key]: (body[key] ?? []) as unknown as JsonValue } };
+  }
+
+  /** Zendesk har ingen dedikert "agents"-liste - agenter er `users` med `role IN (agent, admin)`. */
+  private async listAgents(auth: Record<string, string>) {
+    const url = new URL(`${this.baseUrl()}/users.json`);
+    url.searchParams.set("role[]", "agent");
+    const response = await this.fetchWithRetry(url.toString(), { headers: auth });
+    await this.assertOk(response);
+    const body = (await response.json()) as { users?: Array<{ id: number; name: string; email: string | null }> };
+    return { data: { agents: (body.users ?? []).map((u) => ({ id: String(u.id), name: u.name, email: u.email ?? "" })) as unknown as JsonValue } };
+  }
+
+  private async listWebhooks(auth: Record<string, string>) {
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/webhooks`, { headers: auth });
+    await this.assertOk(response);
+    const body = (await response.json()) as { webhooks?: Array<{ id: string; name: string; endpoint: string; status: string }> };
+    return { data: { webhooks: (body.webhooks ?? []) as unknown as JsonValue } };
+  }
+
+  /**
+   * §12/§21: aldri kopier fullt kundekommunikasjonsinnhold inn i Business OS -
+   * `description` sendes videre til Zendesk (nødvendig for selve ticket-
+   * opprettelsen), men returverdien til kalleren inneholder KUN metadata
+   * (§9 i byggeordren: Business OS lagrer aldri fritekst fra denne verdien).
+   */
+  private async createTicket(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const payload: Record<string, JsonValue> = {
+      ticket: {
+        subject: String(parameters["subject"]),
+        comment: { body: String(parameters["description"] ?? parameters["subject"]) },
+        ...(parameters["requester_email"] !== undefined ? { requester: { email: String(parameters["requester_email"]) } } : {}),
+        ...(parameters["priority"] !== undefined ? { priority: String(parameters["priority"]) } : {}),
+        ...(parameters["tags"] !== undefined ? { tags: parameters["tags"] } : {})
+      }
+    };
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/tickets.json`, { method: "POST", headers: auth, body: JSON.stringify(payload) });
+    await this.assertOk(response);
+    const body = (await response.json()) as { ticket: { id: number; subject: string; status: string } };
+    return { external_id: String(body.ticket.id), data: { id: String(body.ticket.id), subject: body.ticket.subject, status: body.ticket.status, url: this.ticketUrl(String(body.ticket.id)) } };
+  }
+
+  /** Konsolidert typet oppdatering (status/priority/assignee/tags/custom_fields) - IKKE separate mikro-handlinger (§15 i byggeordren). */
+  private async updateTicket(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const ticketId = String(parameters["ticket_id"]);
+    const ticket: Record<string, JsonValue> = {};
+    if (parameters["status"] !== undefined) ticket["status"] = parameters["status"];
+    if (parameters["priority"] !== undefined) ticket["priority"] = parameters["priority"];
+    if (parameters["assignee_id"] !== undefined) ticket["assignee_id"] = Number(parameters["assignee_id"]);
+    if (parameters["tags"] !== undefined) ticket["tags"] = parameters["tags"];
+    if (parameters["custom_fields"] !== undefined) ticket["custom_fields"] = parameters["custom_fields"];
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/tickets/${ticketId}.json`, {
+      method: "PUT", headers: auth, body: JSON.stringify({ ticket })
+    });
+    await this.assertOk(response, ticketId);
+    const body = (await response.json()) as { ticket: { id: number; status: string; priority: string | null; updated_at: string } };
+    return { external_id: String(body.ticket.id), data: { id: String(body.ticket.id), status: body.ticket.status, priority: body.ticket.priority ?? "", updated_at: body.ticket.updated_at } };
+  }
+
+  /** `public: true` = kundesynlig svar (klasse C); `public: false` = intern note (klasse B) - se `ZENDESK_D_CLASS_ACTIONS`/integrations.ts for risikoklassifisering. */
+  private async addComment(parameters: Record<string, JsonValue>, auth: Record<string, string>, isPublic: boolean) {
+    const ticketId = String(parameters["ticket_id"]);
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/tickets/${ticketId}.json`, {
+      method: "PUT", headers: auth,
+      body: JSON.stringify({ ticket: { comment: { body: String(parameters["body"]), public: isPublic } } })
+    });
+    await this.assertOk(response, ticketId);
+    const body = (await response.json()) as { ticket: { id: number; updated_at: string } };
+    return { external_id: String(body.ticket.id), data: { id: String(body.ticket.id), updated_at: body.ticket.updated_at, public: String(isPublic) } };
+  }
+
+  /** Myk sletting (30-dagers gjenopprettingsvindu hos Zendesk selv) - likevel klasse D (§13 i byggeordren: kundedata-sensitiv). */
+  private async deleteTicket(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const ticketId = String(parameters["ticket_id"]);
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/tickets/${ticketId}.json`, { method: "DELETE", headers: auth });
+    if (response.status === 404) return { external_id: ticketId, data: { id: ticketId, already_deleted: "true" } };
+    await this.assertOk(response, ticketId);
+    return { external_id: ticketId, data: { id: ticketId, already_deleted: "false" } };
+  }
+
+  /** Permanent, ugjenkallelig overskriving av kommentarinnhold - bekreftet mot Zendesk sin dokumentasjon (§13). */
+  private async redactContent(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const ticketId = String(parameters["ticket_id"]);
+    const commentId = String(parameters["comment_id"]);
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/tickets/${ticketId}/comments/${commentId}/redact.json`, {
+      method: "PUT", headers: auth, body: JSON.stringify({ text: String(parameters["text"] ?? "") })
+    });
+    await this.assertOk(response, `${ticketId}:${commentId}`);
+    return { external_id: `${ticketId}:${commentId}`, data: { ticket_id: ticketId, comment_id: commentId, redacted: "true" } };
+  }
+
+  /** Config-as-code (§14 i byggeordren): Jarvis sin EGEN webhook-registrering hos Zendesk - den ene admin-kapabiliteten med et konkret bruksbehov denne sliceen. */
+  private async createWebhook(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const payload = {
+      webhook: {
+        name: String(parameters["name"]), endpoint: String(parameters["endpoint"]),
+        http_method: "POST", request_format: "json", status: "active",
+        subscriptions: (parameters["subscriptions"] as string[] | undefined) ?? ["conditional_ticket_events"]
+      }
+    };
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/webhooks`, { method: "POST", headers: auth, body: JSON.stringify(payload) });
+    await this.assertOk(response);
+    const body = (await response.json()) as { webhook: { id: string; name: string; endpoint: string } };
+    return { external_id: body.webhook.id, data: { id: body.webhook.id, name: body.webhook.name, endpoint: body.webhook.endpoint } };
+  }
+
+  private async updateWebhook(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const webhookId = String(parameters["webhook_id"]);
+    const webhook: Record<string, JsonValue> = {};
+    if (parameters["status"] !== undefined) webhook["status"] = parameters["status"];
+    if (parameters["endpoint"] !== undefined) webhook["endpoint"] = parameters["endpoint"];
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/webhooks/${webhookId}`, { method: "PATCH", headers: auth, body: JSON.stringify({ webhook }) });
+    await this.assertOk(response, webhookId);
+    const body = (await response.json()) as { webhook: { id: string; status: string } };
+    return { external_id: body.webhook.id, data: { id: body.webhook.id, status: body.webhook.status } };
+  }
+
+  private async deleteWebhook(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
+    const webhookId = String(parameters["webhook_id"]);
+    const response = await this.fetchWithRetry(`${this.baseUrl()}/webhooks/${webhookId}`, { method: "DELETE", headers: auth });
+    if (response.status === 404) return { external_id: webhookId, data: { id: webhookId, already_deleted: "true" } };
+    await this.assertOk(response, webhookId);
+    return { external_id: webhookId, data: { id: webhookId, already_deleted: "false" } };
+  }
+}
+
+/** §40 i byggeordren: hvorvidt Zendesk-connectoren har det den trenger for et ekte kall (subdomain + OAuth-klient + refresh-token) - ALDRI selve verdiene. */
+export function zendeskCredentialsConfigured(): boolean {
+  return Boolean(
+    process.env["JARVIS_ZENDESK_SUBDOMAIN"] && process.env["JARVIS_ZENDESK_CLIENT_ID"] &&
+    process.env["JARVIS_ZENDESK_CLIENT_SECRET"] && process.env["JARVIS_ZENDESK_REFRESH_TOKEN"]
+  );
+}
+
+export { ZENDESK_D_CLASS_ACTIONS };
+
+/**
  * Telegram-kommandopolling: /brief og /status via getUpdates (long-poll).
  * Svar leveres via Tool Gateway (policy/audit) - aldri direkte fetch tilbake.
  */

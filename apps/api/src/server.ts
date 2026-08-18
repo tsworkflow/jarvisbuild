@@ -4,6 +4,7 @@ import { fileURLToPath } from "node:url";
 import type { DeviceService, IdentityService, SessionService } from "@jarvis/core";
 import type { PolicyGateway } from "@jarvis/policy";
 import type { InProcessWorker } from "@jarvis/tasks";
+import { parseZendeskWebhookEvent, verifyZendeskWebhookSignature } from "@jarvis/tool-gateway";
 import type { ConversationEngine } from "./conversation.ts";
 import type { AuthStrength, Channel, MemorySpace } from "@jarvis/contracts";
 
@@ -25,6 +26,15 @@ export interface ApiDeps {
   devices?: DeviceService;
   /** v4.0 BO-02: Daily Executive Brief on demand. */
   brief?: { generate(identity: unknown): Promise<unknown>; render(artifact: unknown): string };
+  /**
+   * UA-3 Support/Tickets (Zendesk, D-64): FØRSTE innkommende webhook-mottaker
+   * i kodebasen. `secret` er `JARVIS_ZENDESK_WEBHOOK_SIGNING_SECRET` (kan
+   * være `undefined` = ikke konfigurert, fail-closed under). `onTicketEvent`
+   * er en løst typet callback (samme mønster som `brief` over - server.ts
+   * skal ALDRI importere `@jarvis/business` direkte) som gjør den FAKTISKE
+   * re-synkroniseringen (§23: alltid via ToolGateway, aldri webhook-kroppen).
+   */
+  zendeskWebhook?: { secret: string | undefined; onTicketEvent(ticketId: string): Promise<void> };
 }
 
 export interface HealthStatus {
@@ -60,6 +70,27 @@ async function readBody(req: IncomingMessage): Promise<unknown> {
   return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
 }
 
+/**
+ * §23/§26 i Zendesk-byggeordren: RÅ bytes (HMAC-signaturen beregnes over de
+ * eksakte bytene - `readBody()` sin JSON.parse->reserialisering ville gitt
+ * en annen signatur). 256 KB-tak (et Zendesk-ticket-varsel er alltid lite -
+ * ingen kommentarinnhold sendes i webhook-kroppen, se
+ * `parseZendeskWebhookEvent()`) - beskytter mot en ukontrollert/ondsinnet
+ * avsender som strømmer et enormt body.
+ */
+const MAX_WEBHOOK_BODY_BYTES = 256 * 1024;
+
+async function readRawBody(req: IncomingMessage): Promise<string> {
+  const chunks: Buffer[] = [];
+  let total = 0;
+  for await (const chunk of req) {
+    total += (chunk as Buffer).length;
+    if (total > MAX_WEBHOOK_BODY_BYTES) throw new Error("webhook_payload_too_large");
+    chunks.push(chunk as Buffer);
+  }
+  return Buffer.concat(chunks).toString("utf8");
+}
+
 function json(res: ServerResponse, status: number, body: unknown): void {
   res.writeHead(status, { "content-type": "application/json" });
   res.end(JSON.stringify(body));
@@ -91,7 +122,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     return;
   }
 
-  const depRoutes = ["/chat", "/worker/tick", "/tools/critical-demo"];
+  const depRoutes = ["/chat", "/worker/tick", "/tools/critical-demo", "/webhooks/zendesk"];
   if (!deps) {
     if (depRoutes.includes(url.pathname)) {
       return json(res, 503, { error: "not_configured", message: "API kjører uten database-avhengigheter" });
@@ -215,6 +246,48 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // Dev-hjelper: kjør køen én runde (produksjonsworker kjører på intervall i main).
     const ran = await deps.worker.drain();
     return json(res, 200, { ran });
+  }
+
+  /**
+   * UA-3 Support/Tickets (Zendesk, D-64) §22/§23/§24/§26 i byggeordren: FØRSTE
+   * innkommende webhook-mottaker i kodebasen. Rekkefølge (aldri byttet om):
+   * (1) RÅ bytes (§23 - HMAC over eksakte bytes), (2) signatur+tidsstempel-
+   * verifisering FØR noe annet skjer, (3) en SMAL, eksplisitt-parset
+   * hendelse (KUN ticket-ID - se `parseZendeskWebhookEvent()`), (4) 200
+   * returneres UMIDDELBART etter validering (§25: webhook er fast path, ikke
+   * eneste sannhetskilde - periodisk synk er sikkerhetsnettet, derfor
+   * trenger Jarvis IKKE Zendesk sin egen retry-mekanisme), (5) selve
+   * normaliseringen skjer asynkront I BAKGRUNNEN via `onTicketEvent()`, som
+   * ALLTID henter ticketen på nytt gjennom ToolGateway - aldri direkte fra
+   * denne kroppen.
+   */
+  if (req.method === "POST" && url.pathname === "/webhooks/zendesk") {
+    if (!deps.zendeskWebhook) {
+      return json(res, 503, { error: "zendesk_webhook_not_configured" });
+    }
+    let rawBody: string;
+    try {
+      rawBody = await readRawBody(req);
+    } catch {
+      return json(res, 413, { error: "webhook_payload_too_large" });
+    }
+    const verification = verifyZendeskWebhookSignature({
+      secret: deps.zendeskWebhook.secret,
+      signatureHeader: req.headers["x-zendesk-webhook-signature"] as string | undefined,
+      timestampHeader: req.headers["x-zendesk-webhook-signature-timestamp"] as string | undefined,
+      rawBody
+    });
+    if (!verification.valid) {
+      return json(res, 401, { error: verification.reason });
+    }
+    const event = parseZendeskWebhookEvent(rawBody);
+    if (!event) {
+      return json(res, 400, { error: "webhook_unparsable_event" });
+    }
+    // §25: svar UMIDDELBART - selve resynken kjører i bakgrunnen, en feil der
+    // krasjer ALDRI HTTP-responsen (periodisk synk fanger opp neste runde).
+    void deps.zendeskWebhook.onTicketEvent(event.ticketId).catch(() => undefined);
+    return json(res, 200, { received: true, event_type: event.eventType });
   }
 
   if (req.method === "POST" && url.pathname === "/tools/critical-demo") {

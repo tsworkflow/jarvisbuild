@@ -36,6 +36,10 @@ describe("A: apps/api/src/main.ts sprer driveTransportsIfConfigured() inn i firs
     expect(callBlock).toContain("calendar: new GoogleCalendarTransport()");
     expect(callBlock).toContain("github: new GithubTransport()");
     expect(callBlock).toContain("telegram: new TelegramTransport()");
+    // UA-3 Support/Tickets (Zendesk, D-64): sjette ubetingede transport - samme
+    // mønster som de fire over (ingen "konfigurert"-betingelse, credential_unavailable
+    // håndteres av ToolGateway.execute() selv når JARVIS_ZENDESK_REFRESH_TOKEN mangler).
+    expect(callBlock).toContain("zendesk: new ZendeskTransport()");
     // UA-3 P0 (D-49): femte ubetingede transport - Business OS har ingen ekstern credential
     // aa vaere "konfigurert" av, saa den registreres alltid, samme mønster som de fire over.
     // UA-3 next slice (D-53): BusinessTransport tar naa ogsaa OpenLoopService + pool.
@@ -43,7 +47,9 @@ describe("A: apps/api/src/main.ts sprer driveTransportsIfConfigured() inn i firs
     // (sync_business_events maa kunne kalle email/calendar via SAMME gateway-instans).
     // UA-3 profiling/scoring-slice (D-61): BusinessTransport tar naa ogsaa ScoringService
     // (score-handlingene, sjette konstruktørparameter).
-    expect(callBlock).toContain("business: new BusinessTransport(businessService, openLoopService, pool, toolGateway, scoringService)");
+    // UA-3 Support/Tickets (Zendesk, D-64): BusinessTransport tar naa ogsaa
+    // ZendeskTicketService (sync_zendesk_tickets, syvende konstruktørparameter).
+    expect(callBlock).toContain("business: new BusinessTransport(businessService, openLoopService, pool, toolGateway, scoringService, zendeskTicketService)");
   });
 });
 
@@ -60,10 +66,12 @@ describe("B: apps/api/src/worker-main.ts speiler NØYAKTIG samme wiring som main
     expect(callBlock).toContain("calendar: new GoogleCalendarTransport()");
     expect(callBlock).toContain("github: new GithubTransport()");
     expect(callBlock).toContain("telegram: new TelegramTransport()");
+    expect(callBlock).toContain("zendesk: new ZendeskTransport()");
     // UA-3 business-event-linkage (D-57): BusinessTransport tar naa ogsaa toolGateway
     // (sync_business_events maa kunne kalle email/calendar via SAMME gateway-instans).
     // UA-3 profiling/scoring-slice (D-61): BusinessTransport tar naa ogsaa ScoringService.
-    expect(callBlock).toContain("business: new BusinessTransport(businessService, openLoopService, pool, toolGateway, scoringService)");
+    // UA-3 Support/Tickets (Zendesk, D-64): BusinessTransport tar naa ogsaa ZendeskTicketService.
+    expect(callBlock).toContain("business: new BusinessTransport(businessService, openLoopService, pool, toolGateway, scoringService, zendeskTicketService)");
   });
 });
 
@@ -86,14 +94,16 @@ describe("I: eksisterende Google Calendar/Gmail (+ GitHub/Telegram) wiring er UE
   it("main.ts sin firstWaveTools()-blokk inneholder fortsatt NØYAKTIG de samme fire ubetingede transport-konstruksjonene som før", () => {
     const callIdx = mainSource.indexOf("firstWaveTools({");
     const callBlock = mainSource.slice(callIdx, mainSource.indexOf("})) toolGateway.register(tool);", callIdx));
+    // UA-3 Support/Tickets (Zendesk, D-64): femte -> naa SEKS ubetingede transport-
+    // konstruksjoner etter ZendeskTransport-tillegget (email/calendar/github/telegram/zendesk).
     const unconditionalConstructions = [...callBlock.matchAll(/:\s*new \w+Transport\(\)/g)];
-    expect(unconditionalConstructions).toHaveLength(4);
+    expect(unconditionalConstructions).toHaveLength(5);
   });
   it("worker-main.ts sin firstWaveTools()-blokk inneholder fortsatt NØYAKTIG de samme fire ubetingede transport-konstruksjonene som før", () => {
     const callIdx = workerSource.indexOf("firstWaveTools({");
     const callBlock = workerSource.slice(callIdx, workerSource.indexOf("})) toolGateway.register(tool);", callIdx));
     const unconditionalConstructions = [...callBlock.matchAll(/:\s*new \w+Transport\(\)/g)];
-    expect(unconditionalConstructions).toHaveLength(4);
+    expect(unconditionalConstructions).toHaveLength(5);
   });
 });
 

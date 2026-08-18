@@ -20,13 +20,15 @@ import { InProcessWorker, PgTaskQueue, TaskService } from "@jarvis/tasks";
 import { LocalHashEmbedding, MemoryRetriever } from "@jarvis/memory";
 import {
   DailyBrief, EnvSecretProvider, FallbackSecretProvider, GithubTransport, GmailTransport, GoogleCalendarTransport,
-  MeshToolExecutor, meshToolDefinitions, TelegramCommandPoller, TelegramTransport, ToolGateway,
+  MeshToolExecutor, meshToolDefinitions, TelegramCommandPoller, TelegramTransport, ToolGateway, ZendeskTransport,
   buildStatusSource, calendarSource, driveTransportsIfConfigured, emailSource, firstWaveTools,
   tasksSource, DailyScheduler
 } from "@jarvis/tool-gateway";
 import {
   BusinessEventSyncService, BusinessInternalSecretProvider, BusinessService, BusinessTransport, OpenLoopService,
-  ScoringService, runBusinessEventSyncForAllTenants, runOpenLoopSweepForAllTenants, runScoringSweepForAllTenants
+  ScoringService, ZendeskEventSyncService, ZendeskTicketService,
+  runBusinessEventSyncForAllTenants, runOpenLoopSweepForAllTenants, runScoringSweepForAllTenants,
+  runZendeskEventSyncForAllTenants, syncZendeskTicketAcrossTenants
 } from "@jarvis/business";
 import { OwnerControls } from "@jarvis/policy";
 import { ConversationEngine } from "./conversation.ts";
@@ -106,15 +108,22 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
   // UA-3 profiling/scoring-slice (D-61): egen tjeneste over samme runtime-pool,
   // ingen ny kø/motor (§14/§23 i byggeordren) - gjenbruker Business Graph uendret.
   const scoringService = new ScoringService(pool);
+  // UA-3 Support/Tickets (Zendesk, D-64): egen tjeneste over samme runtime-pool,
+  // eier KUN zendesk_tickets (current state for OpenLoopService).
+  const zendeskTicketService = new ZendeskTicketService(pool);
   for (const tool of firstWaveTools({
     email: new GmailTransport(), calendar: new GoogleCalendarTransport(),
     github: new GithubTransport(), telegram: new TelegramTransport(),
-    business: new BusinessTransport(businessService, openLoopService, pool, toolGateway, scoringService),
+    zendesk: new ZendeskTransport(),
+    business: new BusinessTransport(businessService, openLoopService, pool, toolGateway, scoringService, zendeskTicketService),
     ...driveTransportsIfConfigured()
   })) toolGateway.register(tool);
   // UA-3 business-event-linkage (D-57): SAMME toolGateway-instans (allerede
   // registrert med Gmail/Calendar over) - ingen ny transport-vei.
   const businessEventSyncService = new BusinessEventSyncService(toolGateway, businessService, openLoopService);
+  // UA-3 Support/Tickets (Zendesk, D-64): SAMME toolGateway-instans (allerede
+  // registrert med Zendesk over) - ingen ny transport-vei.
+  const zendeskEventSyncService = new ZendeskEventSyncService(toolGateway, businessService, zendeskTicketService, openLoopService);
   const ownerIdentity = {
     person_id: "person-tobias", tenant_id: process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
     memory_space_id: "personal", session_id: "sess-brief", device_id: "jarvis-core",
@@ -136,6 +145,14 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     brief: {
       generate: (identity) => dailyBrief.generate(identity as never),
       render: (artifact) => DailyBrief.render(artifact as never)
+    },
+    // UA-3 Support/Tickets (Zendesk, D-64) §22/§25: webhook er fast path,
+    // periodisk synk (under) er sikkerhetsnettet - `onTicketEvent()` går
+    // ALLTID via `syncZendeskTicketAcrossTenants()` (ny ToolGateway-henting
+    // per tenant, ALDRI webhook-kroppens felter direkte).
+    zendeskWebhook: {
+      secret: process.env["JARVIS_ZENDESK_WEBHOOK_SIGNING_SECRET"],
+      onTicketEvent: (ticketId) => syncZendeskTicketAcrossTenants(pool, zendeskEventSyncService, ticketId).then(() => undefined)
     },
     sessions: new SessionService(pool),
     policy,
@@ -245,6 +262,14 @@ porter: se docs/RUNTIME_GATES.md`;
   new DailyScheduler(
     pool, "business-scoring-recalc", Number(process.env["JARVIS_BUSINESS_SCORING_HOUR"] ?? 7)
   ).start(() => runScoringSweepForAllTenants(pool, scoringService).then(() => undefined));
+  // UA-3 Support/Tickets (Zendesk, D-64) §25: periodisk sikkerhetsnett (SAMME
+  // reboot-durable DailyScheduler-mekanisme) - webhook er fast path, dette
+  // fanger opp forbikoblet/tapt/aldri-konfigurert webhook-levering.
+  // Uavhengig klokkeslett fra business-events-sync (default samme time, 05) -
+  // ingen rekkefølge-avhengighet mellom Gmail/Calendar og Zendesk.
+  new DailyScheduler(
+    pool, "zendesk-tickets-sync", Number(process.env["JARVIS_ZENDESK_SYNC_HOUR"] ?? 5)
+  ).start(() => runZendeskEventSyncForAllTenants(pool, zendeskEventSyncService).then(() => undefined));
   return deps;
 }
 

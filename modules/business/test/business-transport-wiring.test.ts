@@ -95,7 +95,8 @@ describe("registrering: alle business-handlinger er registrert med riktig risiko
     const defs = firstWaveTools({});
     const business = new Map(defs.filter((d) => d.tool_id === "business").map((d) => [d.action, d.capability_class]));
     // UA-3 profiling/scoring-slice (D-61): 8 nye score-handlinger lagt til på SLUTTEN (22 -> 30).
-    expect(business.size).toBe(30);
+    // UA-3 Support/Tickets (Zendesk, D-64): 1 ny synk-handling lagt til på SLUTTEN (30 -> 31).
+    expect(business.size).toBe(31);
     expect(business.get("create_company")).toBe("B");
     expect(business.get("create_contact")).toBe("B");
     expect(business.get("create_lead")).toBe("B");
@@ -132,6 +133,9 @@ describe("registrering: alle business-handlinger er registrert med riktig risiko
     expect(business.get("recalculate_score")).toBe("B");
     expect(business.get("set_manual_override")).toBe("B");
     expect(business.get("clear_manual_override")).toBe("B");
+    // UA-3 Support/Tickets (Zendesk, D-64): synk avledet fra allerede-autoriserte
+    // lese-handlinger - samme klasse som sync_business_events selv.
+    expect(business.get("sync_zendesk_tickets")).toBe("B");
     expect([...business.values()]).not.toContain("D");
   });
 });

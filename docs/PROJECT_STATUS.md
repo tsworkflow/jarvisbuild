@@ -1,29 +1,28 @@
 # PROJECT STATUS
 
-**Oppdatert:** 2026-08-17 (**UA-3 — Profiling/Scoring VERIFIED/COMPLETE → D-63**, se egen
-"UA-3 FINAL CLOSURE"-seksjon under. Tobias sin ANDRE host-kjøring (`run_id 61b5cf63`, `hard_fail=false`)
-kom HELE VEIEN gjennom UTEN nye funn - alle 17 markører PASS inkl. `ua3_scoring_idempotent=PASS`
-(`score_rows_for_same_identity=1`), etter HOST FIX #1 (D-62, RLS-blind idempotens-spørring). Transparent,
-100% deterministisk BUSINESS-OPERASJONELL prioritering (`lead_priority_v1`)/risiko-scoring
-(`opportunity_risk_v1`) - ALDRI generalisert personprofilering (entitetsscope strukturelt begrenset til
-lead/opportunity). **Akseptansekriterium 4 ("Profiling/scoring used with documented legal/human controls
-where required") er re-evaluert til COMPLETE/VERIFIED** - rettslig grunnlag (GDPR art. 6(1)(f)) lagt til
-`UA3_BUSINESS_DPIA.md`, GDPR art. 22 eksplisitt vurdert og funnet ikke relevant, menneskelig/juridisk
-kontroll likevel til stede og host-bevist. **Fire-kriterie UA-3-matrise (D-63):** kriterium 1 PARTIAL
-(uendret fra D-60), kriterium 2 PARTIAL (uendret, kun sales), kriterium 3 COMPLETE/VERIFIED (uendret fra
-D-56), kriterium 4 NÅ COMPLETE/VERIFIED (D-63, ny). 1160/1160 tester. **UA-3 P0 + open-loop-sliceen +
-Business-Event-Linkage + denne sliceen er VERIFIED/COMPLETE - HELE UA-3 er FORTSATT IKKE komplett**
-(2 av 4 kriterier fortsatt PARTIAL, se Q-25), og masterplan v4.0 som helhet er IKKE komplett. Neste
-UA-3-steg krever `NEEDS_TOBIAS_DECISION` for Support/tickets+Contracts/e-sign; kriterium 2 sin
-gjenstående bredde avhenger av UA-4/UA-5/UA-6-fasene (ikke startet), IKKE et internt UA-3-gap. Ny Q-26
-logget: fremtidig Knowledge Verification/Truth Promotion-invariant, EKSPLISITT sporet som fremtidig
-egen slice - IKKE bygget her. **Branch:** `claude/ua3-profiling-scoring-controls` (fra `origin/main`
-`4a19396`) · UA-2 forblir VERIFIED/COMPLETE i sin helhet → D-48, uendret · P1A Runtime Wiring Closeout
-forblir VERIFIED/COMPLETE (host-smoke-bevist, PR #6 merget) · UA-2 P1A selv forblir VERIFIED/COMPLETE
-(D-42, uendret, host-bevist run_id `2703299e`, PR #5 merget) · UA-2 P1B-A merget til `main` (PR #7) ·
-UA-2 masterplan-closeout merget til `main` (PR #8) · UA-3 P0 merget til `main` (PR #9) · UA-3 Open-Loop
+**Oppdatert:** 2026-08-18 (**UA-3 — Support/Tickets (Zendesk) FIXED_SUITE / IKKE VERIFIED → D-64**, se
+egen "UA-3 — Support/Tickets (Zendesk...)"-seksjon under. Provider valgt av Tobias etter en egen
+research-runde (vektet D-41-matrise, Zendesk foran Intercom/Freshdesk/Chatwoot). Full D-41-kapasitet
+(20 `zendesk.*`-handlinger, klasse A/B/C/D), OAuth 2.0 med in-memory-token-rotasjon, pointer-not-payload,
+deterministisk kontaktgjenkjenning, webhook-mottaker (HMAC-SHA256/replay-vindu), periodisk
+rekonsiliering via eksisterende `DailyScheduler`. 1245/1245 tester, typecheck/lint rene - INGEN
+Tobias-host-kjøring utført ennå (draft-PR, IKKE merget). **NYTT FUNN denne runden:** et FJERDE tilfelle
+av samme RLS-blind-spørring-feilklasse som D-54/D-59/D-62 oppdaget i TRE PRE-EKSISTERENDE
+PRODUKSJONSFUNKSJONER (`runBusinessEventSyncForAllTenants`/`runOpenLoopSweepForAllTenants`/
+`runScoringSweepForAllTenants` - alle `DailyScheduler`-trigget, sannsynligvis ALDRI har funnet en
+tenant i produksjon) - fikset KUN for den nye Zendesk-ekvivalenten, de tre søsknene BEVISST IKKE rørt
+(utenfor bestilt scope), ny Q-27 logget for sporing. **Fire-kriterie UA-3-matrise (uendret fra D-63):**
+kriterium 1 FORTSATT PARTIAL (Support/tickets nå FIXED_SUITE men IKKE VERIFIED, Contracts/e-sign
+fortsatt IKKE bygget), kriterium 2 PARTIAL (uendret, kun sales), kriterium 3 COMPLETE/VERIFIED,
+kriterium 4 COMPLETE/VERIFIED (D-63). **HELE UA-3 er FORTSATT IKKE komplett**, og masterplan v4.0 som
+helhet er IKKE komplett. **Branch:** `claude/ua3-zendesk-support-connector` (fra `origin/main`) ·
+UA-2 forblir VERIFIED/COMPLETE i sin helhet → D-48, uendret · P1A Runtime Wiring Closeout forblir
+VERIFIED/COMPLETE (host-smoke-bevist, PR #6 merget) · UA-2 P1A selv forblir VERIFIED/COMPLETE (D-42,
+uendret, host-bevist run_id `2703299e`, PR #5 merget) · UA-2 P1B-A merget til `main` (PR #7) · UA-2
+masterplan-closeout merget til `main` (PR #8) · UA-3 P0 merget til `main` (PR #9) · UA-3 Open-Loop
 Detection + Business Brief merget til `main` (PR #10) · UA-3 Business-Event-Linkage merget til `main`
-(PR #11) · UA-3 Profiling/Scoring merget til `main` (PR #12)
+(PR #11) · UA-3 Profiling/Scoring merget til `main` (PR #12) · UA-3 Support/Tickets (Zendesk) draft-PR
+åpen, IKKE merget (venter Tobias-host-verifisering)
 
 ## Aktiv fase
 Masterplan v4.0 «Sovereign Autonomy» — **UA-0 CORE RUNTIME = CLOSED** (formelt, BO-08).
@@ -1870,6 +1869,53 @@ denne sliceen er VERIFIED/COMPLETE - HELE UA-3 er IKKE komplett** (kriterium 1/2
 oppdatert Q-25). **Masterplan v4.0 «Sovereign Autonomy» forblir IKKE komplett.** PR #12 merget til
 `main` (normal merge-commit, samme konvensjon som PR #1-#11 - historikk bevart, ikke squashet).
 
+## UA-3 — Support/Tickets (Zendesk, akseptansekriterium 1 delvis) = FIXED_SUITE / IKKE VERIFIED (2026-08-18, branch `claude/ua3-zendesk-support-connector`) → D-64
+
+**Status: FIXED_SUITE / IKKE VERIFIED → D-64.** Bygget etter en egen research-only-runde som anbefalte
+Zendesk (vektet D-41-matrise: API 20%/D-41 15%/webhooks 15%/Business OS-fit 10%/auth 10%/GDPR 10%/
+kost 10%/migrasjon 5%/drift 5%, Zendesk foran Intercom/Freshdesk/Chatwoot) - Tobias godkjente Zendesk
+eksplisitt. Bygget PÅ det VERIFIED/COMPLETE Business-Event-Linkage-fundamentet (D-60).
+
+**Bygget:** migrasjon `023_zendesk_support.sql` (`zendesk_tickets`, FORCE RLS tenant+memory_space,
+`support_ticket_needs_reply` lagt til open-loop-typene); `ZendeskTransport` (20 handlinger, OAuth 2.0
+med in-memory-token-rotasjon - `docker-compose.yml` sin `env_file:`-only design gjør persistert
+rotasjon strukturelt umulig fra kjørende container, samme `EMAIL_REAUTH_REQUIRED`-mønster som Google
+brukt for restart-gjenoppretting); 20 `zendesk.*` ToolDefinitions (full D-41-kapasitet: klasse A 11
+read, klasse B `update_ticket`/`add_internal_note`, klasse C `create_ticket`/`reply_ticket`, klasse D
+`delete_ticket`/`redact_ticket_content`/webhook-CRUD - hver med `preflight_action`);
+`ZendeskTicketService`/`ZendeskEventSyncService` (pointer-not-payload, deterministisk
+e-post-kontaktgjenkjenning, tvetydige/ikke-matchede tickets lagres INGEN steder for å hindre
+tenant-duplisering på delt Zendesk-konto); webhook-mottaker `POST /webhooks/zendesk`
+(HMAC-SHA256/5-min replay-vindu/`timingSafeEqual`/rå-bytes-FØR-parse, kroppen brukes KUN til
+ticket-ID, normalisering alltid via en FERSK `zendesk.get_ticket`); periodisk sync via EKSISTERENDE
+`DailyScheduler`; `zendesk-reauth.ts`-orkestreringsskript; host-akseptanseskript
+`ua3-zendesk-host-run.ts`→`ua3-zendesk-live.ts` (to-delt REACHABILITY (kun `list_tickets`, ALDRI ekte
+mutasjon)/FakeTransport-strategi). 85 nye tester (1160→1245), typecheck 14/14 og lint rene.
+
+**NYTT FUNN denne runden, IKKE bestilt av byggeordren:** under bygging av
+`runZendeskEventSyncForAllTenants` ble et FJERDE tilfelle av samme RLS-blind-spørring-feilklasse som
+D-54/D-59/D-62 oppdaget - denne gangen i PRODUKSJONSKODE, ikke bare i akseptanse-harnesser. `tenants`
+har `FORCE ROW LEVEL SECURITY`; en rå, uskopet `pool.query("SELECT tenant_id FROM tenants WHERE
+kind=...")` returnerer STRUKTURELT 0 rader i produksjon. Tre EKSISTERENDE, allerede-i-produksjon
+`DailyScheduler`-funksjoner bruker nøyaktig dette mønsteret:
+`runBusinessEventSyncForAllTenants()` (D-57), `runOpenLoopSweepForAllTenants()` (D-53),
+`runScoringSweepForAllTenants()` (D-61) - alle tre har derfor sannsynligvis ALDRI oppdaget en eneste
+tenant når de faktisk har kjørt periodisk. Bekreftet mekanisk mot ekte embedded Postgres; bekreftet at
+INGEN av de tre har en test mot ekte Postgres (kun `runOpenLoopSweepForAllTenants` har noen test i det
+hele tatt, og den bruker en `fakePool()`-mock som fullstendig omgår RLS - skjuler bugen, avdekker den
+aldri). **Fikset KUN for den nye Zendesk-ekvivalenten** - ny, minimal `SECURITY DEFINER`-funksjon
+`jarvis_list_tenant_ids_by_kind(p_kind, p_limit)` i `023_zendesk_support.sql` (eksponerer KUN
+ikke-sensitiv `tenant_id`/`kind`, `GRANT EXECUTE` KUN til `jarvis_app`, Q-21-invarianten uendret). De
+tre SØSKEN-funksjonene er BEVISST IKKE rørt i denne runden - byggeordren omfattet KUN
+Zendesk-connectoren, en usanksjonert endring av tre andre allerede-i-produksjon funksjoner utenfor
+bestilt scope ville brutt CLAUDE.md §10-disiplinen. **Dette er et potensielt alvorlig, foreløpig
+IKKE-bekreftet produksjonsfunn** (ingen produksjonslogg gjennomgått i denne runden) - ny Q-27 logget
+for sporing, fiksmønsteret er allerede designet/bevist og klart til gjenbruk på de tre.
+
+**IKKE VERIFIED:** draft-PR opprettet, INGEN Tobias-host-kjøring utført ennå. Krever
+`JARVIS_ZENDESK_*` konfigurert + `zendesk-reauth.ts` kjørt FØRST, deretter
+`ua3-zendesk-host-run.ts` på ekte Windows/Docker-host.
+
 ## Blokkeringer
 Q-20/UA-2 P0/Q-21/UA-2 P1A/P1A Runtime Wiring Closeout/UA-2 P1B-A/UA-3 P0/UA-3 Open-Loop Detection/
 UA-3 Business-Event-Linkage/UA-3 Profiling/Scoring har INGEN egne blokkeringer (alle
@@ -1878,37 +1924,43 @@ Manglende provider-nøkler er eneste gap for LIVE multi-provider-evidens (Gemini
 Ytelsesgjeld for voice-latens (Q-19) er åpen, ikke-blokkerende. Pieces har ingen kjent integrasjonsflate
 ennå (Q-22) - egen fremtidig underoppgave. Google Drive permission-mutasjon er IKKE live-host-bevist
 (Q-23) - smalt, ikke-blokkerende gjenværende verifikasjonspunkt. P1B-A sin worker-JOBB-live-kjøring er
-tilsvarende IKKE live-host-bevist (Q-24) - samme mønster, egen fremtidig test-runde. **Support/tickets-
-og Contracts/e-sign-connectorene forblir blokkert på en EKSPLISITT Tobias-provider-beslutning** - IKKE
-kodbare før den foreligger, se D-57/Q-25 item 8. **Kriterium 2 sin gjenstående bredde (product/finance/
-marketing/operations) er en FASE-AVHENGIGHET av UA-4/UA-5/UA-6, ikke et internt UA-3-kodbart gap** -
-disse fasene er selv IKKE startet. Connector-audit-gapene (GitHub/Calendar/Gmail/Telegram/Vercel/HA -
-se tabellen over) er dokumentert backlog, ikke blokkerende.
+tilsvarende IKKE live-host-bevist (Q-24) - samme mønster, egen fremtidig test-runde. **UA-3
+Support/Tickets (Zendesk) er FIXED_SUITE, blokkert KUN på en Tobias-host-kjøring** (draft-PR, se egen
+seksjon over) - IKKE en Tobias-provider-beslutning lenger (den er tatt, D-64). **Contracts/e-sign-
+connectoren forblir blokkert på en EKSPLISITT Tobias-provider-beslutning** - IKKE kodbar før den
+foreligger, se D-57/Q-25 item 8. **Ny Q-27: tre pre-eksisterende produksjonsfunksjoner
+(`runBusinessEventSyncForAllTenants`/`runOpenLoopSweepForAllTenants`/`runScoringSweepForAllTenants`)
+har samme RLS-blind-tenants-spørring-bug som ble fikset for Zendesk - IKKE fikset i disse tre ennå**,
+egen liten fremtidig BO, fiksmønsteret allerede designet. **Kriterium 2 sin gjenstående bredde
+(product/finance/marketing/operations) er en FASE-AVHENGIGHET av UA-4/UA-5/UA-6, ikke et internt
+UA-3-kodbart gap** - disse fasene er selv IKKE startet. Connector-audit-gapene
+(GitHub/Calendar/Gmail/Telegram/Vercel/HA - se tabellen over) er dokumentert backlog, ikke blokkerende.
 
 ## Neste oppgave
-**UA-3 «Profiling/Scoring» er VERIFIED/COMPLETE → D-63.** PR #12 merget. **HELE UA-3 er FORTSATT IKKE
-komplett** - masterplanens fire akseptansekriterier: kriterium 3 COMPLETE/VERIFIED (uendret fra D-56);
-kriterium 4 NÅ COMPLETE/VERIFIED (D-63, ny); kriterium 1 PARTIAL (uendret fra D-60); kriterium 2
-PARTIAL (uendret, kun sales, avhenger av UA-4/UA-5/UA-6) (se oppdatert Q-25).
-**`NEEDS_TOBIAS_DECISION` for neste canonical UA-3-slice** - to gjenværende kandidater, BEGGE krever
-en uavklart Tobias-beslutning FØR de kan bygges:
-1. **Support/tickets-connector** (UA-3 P1, masterplan linje 1070) - krever leverandørvalg (f.eks.
-   Zendesk/Freshdesk/Intercom - kun eksempler, IKKE forhåndsvalgt).
-2. **Contracts/e-sign-connector** (UA-3 P1, masterplan linje 1071) - krever leverandørvalg (f.eks.
-   DocuSign/Dropbox Sign - kun eksempler, IKKE forhåndsvalgt).
+**UA-3 «Support/Tickets (Zendesk)» er FIXED_SUITE / IKKE VERIFIED → D-64.** Draft-PR opprettet, INGEN
+merge (Order F forbyr merge før Tobias-host-verifisering). **Umiddelbar neste oppgave: Tobias kjører
+`node --env-file=.env --experimental-transform-types
+modules/business/scripts/ua3-zendesk-host-run.ts`** på sin faktiske Windows/Docker-host (krever
+`JARVIS_ZENDESK_*` konfigurert i `.env` + `zendesk-reauth.ts` kjørt FØRST) - deretter samme
+host-fix-runde-mønster som ALLE tidligere UA-3-slicer hvis noe funn dukker opp.
+
+**HELE UA-3 er FORTSATT IKKE komplett** - masterplanens fire akseptansekriterier: kriterium 3
+COMPLETE/VERIFIED (uendret fra D-56); kriterium 4 COMPLETE/VERIFIED (uendret fra D-63); kriterium 1
+FORTSATT PARTIAL (Support/tickets nå FIXED_SUITE men IKKE VERIFIED, Contracts/e-sign fortsatt IKKE
+bygget); kriterium 2 PARTIAL (uendret, kun sales, avhenger av UA-4/UA-5/UA-6) (se oppdatert Q-25).
+
+**Gjenstående for kriterium 1:** **Contracts/e-sign-connector** (UA-3 P1, masterplan linje 1071) -
+krever fortsatt en EKSPLISITT Tobias-provider-beslutning (f.eks. DocuSign/Dropbox Sign - kun
+eksempler, IKKE forhåndsvalgt) FØR noe kan bygges - `NEEDS_TOBIAS_DECISION`, uendret.
 **Kriterium 2 sin gjenstående bredde ligger UTENFOR "neste UA-3-slice"-scopet** inntil UA-4/UA-5/UA-6
 faktisk starter - ingen duplisert domenesystem skal bygges internt i UA-3 bare for å lukke kriterium 2
-tidlig. **IKKE valgt eller startet i denne runden.** Ny Q-26 logget (Knowledge Verification/Truth
-Promotion-invariant) - EKSPLISITT sporet som en fremtidig, egen slice for CLAUDE.md/kanonisk arkitektur,
-IKKE bygget/blandet inn her. **IKKE startet:** UA-3 P1/P2 utover de to kandidatene over, UA-4, noen
-annen UA-fase. Faseporten gjelder fortsatt strengt (CLAUDE.md-regel 10) - venter på en egen, eksplisitt
-byggeordre/-beslutning fra Tobias/arkitekten før noe av det ovennevnte begynner.
-**Eksplisitt IKKE bygget i denne sliceen:** kontakt-/person-nivå-scoring (arkitektonisk umulig);
-AI Mesh-basert scoring; finere per-tenant/policy-nivå av/på-bryter; event-drevet rekalkulering;
-kontrakt-/faktura-verdi-baserte faktorer; Support/tickets- og Contracts/e-sign-connectorer (krever
-fortsatt en Tobias-provider-beslutning - se D-57/Q-25 item 8). **IKKE startet:** UA-3 P1/P2 utover
-denne sliceen, UA-4, noen annen UA-fase. Faseporten gjelder fortsatt strengt (CLAUDE.md-regel 10) -
-venter på en egen, eksplisitt byggeordre fra Tobias/arkitekten før noe av det ovennevnte begynner.
+tidlig. **IKKE startet:** UA-4, noen annen UA-fase. Faseporten gjelder fortsatt strengt
+(CLAUDE.md-regel 10) - venter på en egen, eksplisitt byggeordre/-beslutning fra Tobias/arkitekten før
+noe av det ovennevnte begynner.
+**Eksplisitt IKKE bygget i Zendesk-sliceen:** automatisk ingestion av Ticket Audits/kommentarhistorikk
+(kun on-demand); Zendesk Incremental Export-API (enklere standard-listing brukt i v1); trigger-/
+automation-konfigurasjon utover Jarvis sin egen webhook-registrering; flere Zendesk-instanser per
+tenant; Contracts/e-sign; UA-4. Faseporten gjelder fortsatt strengt (CLAUDE.md-regel 10).
 
 Gjenstående, eksplisitt IKKE-blokkerende UA-2-relatert backlog (se D-48/OPEN_QUESTIONS.md for full
 klassifisering - ingen av disse hindrer UA-2-lukkingen eller krever noe FØR UA-3 kan startes, men

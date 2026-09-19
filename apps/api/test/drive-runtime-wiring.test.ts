@@ -19,6 +19,28 @@ function readSource(relativePath: string): string {
   return readFileSync(fileURLToPath(new URL(relativePath, import.meta.url)), "utf8");
 }
 
+/**
+ * W1 (D-180): `telegram` konstrueres nå på MODULNIVÅ i worker-main.ts (hoistet
+ * ut av `firstWaveTools({...})`-blokken) slik at watchdogens
+ * `TelegramAlertSink` kan dele NØYAKTIG SAMME instans som den kanoniske
+ * `telegram.notify` - ingen andre Telegram-klient i prosessen.
+ *
+ * Denne hjelperen bevarer den ENESTE garantien flyttingen kunne ha svekket:
+ * at Telegram-transporten fortsatt konstrueres UBETINGET (i motsetning til den
+ * credential-gatede Drive, som er HELE poenget med denne testfilen). Den
+ * krever derfor at konstruksjonen står på egen linje som en ren
+ * `const ... = new TelegramTransport();`-setning uten noen betingelse på
+ * linjen (ingen `if`, `?`, `&&`, `||`, `??`) - en fremtidig
+ * `const telegramTransport = X ? new TelegramTransport() : undefined;` ville
+ * altså FORTSATT bli fanget av denne vakten, ikke stille passere.
+ */
+function expectUnconditionalHoistedTelegram(source: string): void {
+  const match = source.match(/^const telegramTransport = new TelegramTransport\(\);$/m);
+  expect(match).not.toBeNull();
+  expect([...source.matchAll(/new TelegramTransport\(/g)]).toHaveLength(1);
+  expect(source).toContain("new TelegramAlertSink(telegramTransport,");
+}
+
 const mainSource = readSource("../src/main.ts");
 const workerSource = readSource("../src/worker-main.ts");
 
@@ -61,7 +83,14 @@ describe("B: apps/api/src/worker-main.ts speiler NØYAKTIG samme wiring som main
     expect(callBlock).toContain("calendar: new GoogleCalendarTransport()");
     // D-97: GithubTransport tar naa en wired GithubRateLimitController - ikke lenger tom konstruktør.
     expect(callBlock).toContain("github: new GithubTransport(githubRateLimitController)");
-    expect(callBlock).toContain("telegram: new TelegramTransport()");
+    // W1 (D-180): `telegram` konstrueres NÅ på modulnivå rett OVER dette kallet
+    // (`const telegramTransport = new TelegramTransport();`) og sendes inn som
+    // referanse, fordi watchdogens `TelegramAlertSink` skal dele NØYAKTIG SAMME
+    // instans som den kanoniske `telegram.notify`. Garantien denne testen
+    // faktisk beskytter - at Telegram registreres UBETINGET, i motsetning til
+    // den credential-gatede Drive - er UENDRET og verifiseres eksplisitt under.
+    expect(callBlock).toContain("telegram: telegramTransport");
+    expectUnconditionalHoistedTelegram(workerSource);
     // UA-3 business-event-linkage (D-57): BusinessTransport tar naa ogsaa toolGateway
     // (sync_business_events maa kunne kalle email/calendar via SAMME gateway-instans).
     // UA-3 profiling/scoring-slice (D-61): BusinessTransport tar naa ogsaa ScoringService.
@@ -97,13 +126,23 @@ describe("I: eksisterende Google Calendar/Gmail (+ GitHub/Telegram/Docker) wirin
     expect(callBlock).toContain("github: new GithubTransport(githubRateLimitController)");
     expect(callBlock).toContain("docker: new DockerTransport()");
   });
-  it("worker-main.ts sin firstWaveTools()-blokk inneholder fortsatt NØYAKTIG de samme fire ubetingede tomme-konstruktør-transportene som før (+docker, D-105)", () => {
+  // W1 (D-180): i worker-main.ts er `telegram` FLYTTET ut av kall-blokken til en
+  // modulnivå-konstant rett over kallet, slik at watchdogens `TelegramAlertSink`
+  // kan dele NØYAKTIG SAMME instans som den kanoniske `telegram.notify` (ingen
+  // andre Telegram-klient i prosessen). Antallet TOMME konstruktører INNI selve
+  // blokken er derfor 3, ikke 4 - men antall UBETINGEDE transporter er FORTSATT
+  // 4: den fjerde (`telegramTransport`) verifiseres eksplisitt som ubetinget
+  // under, så denne testens faktiske garanti er ikke svekket, kun flyttet.
+  it("worker-main.ts har FORTSATT de samme fire ubetingede transportene (+docker, D-105) - tre tomme konstruktører i blokken + den hoistede, ubetingede telegramTransport", () => {
     const callIdx = workerSource.indexOf("firstWaveTools({");
     const callBlock = workerSource.slice(callIdx, workerSource.indexOf("})) toolGateway.register(tool);", callIdx));
     const unconditionalConstructions = [...callBlock.matchAll(/:\s*new \w+Transport\(\)/g)];
-    expect(unconditionalConstructions).toHaveLength(4);
+    expect(unconditionalConstructions).toHaveLength(3);
     expect(callBlock).toContain("github: new GithubTransport(githubRateLimitController)");
     expect(callBlock).toContain("docker: new DockerTransport()");
+    // Den fjerde: ubetinget, men hoistet - og fortsatt sendt inn i SAMME blokk.
+    expectUnconditionalHoistedTelegram(workerSource);
+    expect(callBlock).toContain("telegram: telegramTransport");
   });
 });
 

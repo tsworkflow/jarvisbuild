@@ -62,7 +62,9 @@ describe("Akseptanse 1: watchdog oppdager simulert feil og varsler med runbook",
     const killSwitch = new KillSwitch();
     const watchdog = new Watchdog(sink, killSwitch);
     watchdog.register(databaseCheck(appPool));
-    watchdog.register(stuckTasksCheck(adminPool));
+    // W1 (D-180): `appPool` (RLS-underlagt rolle) + eksplisitt tenant - var
+    // `adminPool` (superuser), som maskerte at `tasks` er FORCE RLS-beskyttet.
+    watchdog.register(stuckTasksCheck(appPool, ["tenant-a"]));
     let restarts = 0;
     watchdog.registerAction("stuck_tasks", async () => { restarts += 1; }, 2);
 
@@ -87,14 +89,27 @@ describe("Akseptanse 1: watchdog oppdager simulert feil og varsler med runbook",
 });
 
 describe("Kill switch-kriterium: kostnadseksplosjon", () => {
-  it("over hardgrense → kill switch aktiveres → Policy Gateway nekter alt", async () => {
+  // W1 (D-180): DENNE testen var selve MASKERINGEN D182 fant. Den brukte en
+  // pool-LØS `new KillSwitch()` (ren in-memory) OG en superuser-`adminPool`
+  // (RLS omgått), og kunne derfor ikke se NOEN av de to
+  // produksjonsdefektene: at nødstoppen aldri ble skrevet durabelt, og at
+  // `cost_events`-summen alltid ville vært 0 under den ekte runtime-rollen.
+  // Den er nå bundet til den POOL-BASERTE, durable stien via den
+  // RLS-underlagte `appPool`. Full durabilitets-/kryss-instans-/omstarts-/
+  // varslingsfeil-dekning ligger i `w1-watchdog-durability.test.ts`.
+  it("over hardgrense → durabel kill switch aktiveres → Policy Gateway nekter alt", async () => {
     await adminPool.query("INSERT INTO cost_events (tenant_id, kind, amount_ore) VALUES ('tenant-a','model:x', 400000)");
     const sink = new MemoryAlertSink();
-    const killSwitch = new KillSwitch();
+    const authority = { owner_person_id: "person-tobias" };
+    const killSwitch = new KillSwitch(appPool, authority);
     const watchdog = new Watchdog(sink, killSwitch);
-    watchdog.register(costExplosionCheck(adminPool, killSwitch, 300_000));
+    watchdog.register(
+      costExplosionCheck(appPool, killSwitch, {
+        hardLimitOre: 300_000, tenantIds: ["tenant-a"], actorPersonId: "person-tobias"
+      })
+    );
     await watchdog.tick();
-    expect(killSwitch.isActive()).toBe(true);
+    expect(await killSwitch.isActiveDurable()).toBe(true);
     expect(sink.alerts[0]?.severity).toBe("critical");
 
     const policy = new PolicyGateway({
@@ -107,7 +122,7 @@ describe("Kill switch-kriterium: kostnadseksplosjon", () => {
     });
     expect(denied.reason).toBe("kill_switch_active");
     // Reversibelt: manuell deaktivering gjenoppretter - ingen automatisk gjenåpning.
-    killSwitch.deactivate();
+    await killSwitch.deactivateDurable("person-tobias");
     await adminPool.query("DELETE FROM cost_events WHERE amount_ore = 400000");
   });
 });

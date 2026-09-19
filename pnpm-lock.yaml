@@ -104,6 +104,9 @@ importers:
       '@jarvis/vision':
         specifier: workspace:*
         version: link:../../modules/vision
+      '@jarvis/watchdog':
+        specifier: workspace:*
+        version: link:../../modules/watchdog
       pg:
         specifier: ^8.16.3
         version: 8.23.0
@@ -942,6 +945,15 @@ importers:
         specifier: ^8.16.3
         version: 8.23.0
     devDependencies:
+      '@jarvis/business':
+        specifier: workspace:*
+        version: link:../business
+      '@jarvis/contracts':
+        specifier: workspace:*
+        version: link:../../packages/contracts
+      '@jarvis/tool-gateway':
+        specifier: workspace:*
+        version: link:../tool-gateway
       '@types/pg':
         specifier: ^8.15.6
         version: 8.21.0

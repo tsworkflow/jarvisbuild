@@ -46,6 +46,10 @@ import {
 } from "@jarvis/tasks";
 import { KnowledgeSourceRegistry, emailIngestHandler } from "@jarvis/knowledge";
 import { LocalHashEmbedding } from "@jarvis/memory";
+import {
+  TelegramAlertSink, Watchdog, consoleWatchdogObserver, costExplosionCheck, databaseCheck,
+  resolveWatchdogIntervalMs, resolveWatchdogTenantIds, startWatchdog, stuckTasksCheck
+} from "@jarvis/watchdog";
 
 // Q-21 (2026-08-15): fail-closed - en manglende/feilkonfigurert JARVIS_DB_USER, eller
 // en superuser/BYPASSRLS-tilkobling, skal ALDRI la workeren starte videre stille.
@@ -260,9 +264,14 @@ const githubRateLimitController = new GithubRateLimitController(
   new PgGithubRateLimitStore(pool), "JARVIS_GITHUB_TOKEN",
   (event) => console.warn(`[github-rate-limit] ${event.transition} -> ${event.state}${event.retryAt ? ` retry_at=${event.retryAt.toISOString()} source=${event.source}` : ""}`)
 );
+// W1 (D-180): ÉN delt `TelegramTransport`-instans - den SAMME som
+// `firstWaveTools()` sin kanoniske `telegram.notify` bruker, gjenbrukt av
+// watchdogens `TelegramAlertSink` nederst i filen. Hoistet hit KUN for at de
+// to skal dele instans; INGEN ny Telegram-klient, INGEN ny credential-vei.
+const telegramTransport = new TelegramTransport();
 for (const tool of firstWaveTools({
   email: new GmailTransport(), calendar: new GoogleCalendarTransport(),
-  github: new GithubTransport(githubRateLimitController), telegram: new TelegramTransport(),
+  github: new GithubTransport(githubRateLimitController), telegram: telegramTransport,
   // UA-3 business-event-linkage (D-57): SAMME toolGateway-instans gis til
   // BusinessTransport slik at sync_business_events kan kalle Gmail/Calendar
   // - identisk wiring-mønster som apps/api/src/main.ts.
@@ -403,7 +412,68 @@ worker.register(
   })
 );
 
-console.log(JSON.stringify({ msg: "jarvis-worker started", worker_id: worker.workerId, sandbox: runner.name }));
+// W1 (D-180, ordrepunkt A): PRODUKSJONS-WIRING AV @jarvis/watchdog.
+//
+// D182 sitt REAL_INTERNAL_GAP var at watchdog-modulen ALDRI var koblet inn i
+// noen kjørende prosess - den fantes kun i sine egne tester. Denne
+// worker-prosessen er det riktige stedet fordi den allerede eier NØYAKTIG de
+// avhengighetene watchdogen trenger: runtime-`pool`-en, den pool-baserte
+// durable `killSwitch`-en, `TelegramTransport`, og et etablert langtkjørende
+// `setInterval`-mønster (drain-løkka rett under).
+//
+// PLASSERING ER SIKKERHETSKRITISK - watchdogen startes her, HELT NEDERST,
+// altså garantert ETTER at (1) `assertRuntimeCredentialsConfigured()` og
+// `assertRuntimeRoleSafe(pool)` har kjørt (Q-21 fail-closed, ellers har
+// prosessen allerede avsluttet), og (2) `killSwitch.restore()`/
+// `ownerControls.restore()` har gjenopprettet durable tilstand. En watchdog
+// startet FØR `restore()` kunne sett en tom in-memory-cache og trukket feil
+// konklusjon om allerede-aktiv nødstopp.
+//
+// ÉN instans, ÉN intervall-løkke (`startWatchdog`), ingen duplikat andre
+// steder: `apps/api/src/main.ts` (api-prosessen) registrerer BEVISST INGEN
+// watchdog - to prosesser som begge kjører `costExplosionCheck` mot SAMME
+// `owner_control_state` ville vært to konkurrerende nødstopp-skrivere uten at
+// det gir noen ekstra dekning. Dette speiler den eksisterende `owner_controls.*`-
+// presedensen i denne filen (kontrollen deles, verktøyet registreres ett sted).
+const watchdogTenantIds = resolveWatchdogTenantIds(
+  process.env["JARVIS_WATCHDOG_TENANT_IDS"],
+  process.env["JARVIS_TENANT_ID"] ?? "tenant-personal"
+);
+const watchdogObserver = consoleWatchdogObserver();
+const watchdog = new Watchdog(
+  // Ordrepunkt C: EKTE varsling gjennom den DELTE `telegramTransport`-instansen
+  // og den EKSISTERENDE `EnvSecretProvider`/`JARVIS_TELEGRAM_TOKEN`-kjeden.
+  // Mangler tokenet, kaster sinken en typet `AlertDeliveryError` som
+  // observatøren logger - den durable nødstoppen er da ALLEREDE skrevet og
+  // påvirkes ikke (se `Watchdog.tick()` sin rekkefølge-kommentar).
+  new TelegramAlertSink(telegramTransport, new EnvSecretProvider()),
+  killSwitch,
+  watchdogObserver
+);
+watchdog.register(databaseCheck(pool));
+watchdog.register(stuckTasksCheck(pool, watchdogTenantIds));
+watchdog.register(
+  costExplosionCheck(pool, killSwitch, {
+    hardLimitOre: Number(process.env["JARVIS_COST_HARD_LIMIT_ORE"] ?? 300_000),
+    tenantIds: watchdogTenantIds,
+    // Ordrepunkt B: EKSPLISITT, deterministisk aktør - SAMME
+    // `ownerControlAuthority.owner_person_id` som `killSwitch` selv er
+    // konstruert med. Enhver annen verdi ville blitt fail-closed avvist av
+    // `assertOwnerControlAuthorized()` (D-164), altså en nødstopp som aldri
+    // ble skrevet. Watchdog-proveniensen ligger i `reason`-teksten.
+    actorPersonId: ownerControlAuthority.owner_person_id
+  })
+);
+const watchdogHandle = startWatchdog(
+  watchdog,
+  resolveWatchdogIntervalMs(process.env["JARVIS_WATCHDOG_INTERVAL_MS"]),
+  watchdogObserver
+);
+
+console.log(JSON.stringify({
+  msg: "jarvis-worker started", worker_id: worker.workerId, sandbox: runner.name,
+  watchdog_interval_ms: watchdogHandle.intervalMs, watchdog_tenants: watchdogTenantIds.join(",")
+}));
 setInterval(
   () =>
     void worker

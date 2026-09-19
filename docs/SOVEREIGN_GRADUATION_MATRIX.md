@@ -134,6 +134,32 @@ FORTSATT ikke fullført, kun DENNE interne B2+B3-slicen. `MERGE_AUTHORIZED` krev
 eksplisitt `ARCHITECT_TASK`-merge-ordre i issue #68 (D-120-protokollen), IKKE noe en PR-review alene
 gir. Se D-179 i DECISIONS_AND_ASSUMPTIONS.md for full begrunnelse/testevidens.
 
+**D-180 (2026-09-19, W1 IMPLEMENTERT - arkitekt-ordre `D183-W1-WATCHDOG-RUNTIME-DURABILITY-20260919-A`,
+base `main=9ede3ac1d2e32e708d38104e7a6869772774d628`):** D182 sin rekognosering beviste et
+`REAL_INTERNAL_GAP`: `@jarvis/watchdog` var fullt implementert OG fullt testet, men ALDRI koblet inn i
+noen kjørende prosess, og `costExplosionCheck()` kalte den PROSESS-LOKALE `killSwitch.activate()` mens
+produksjonens `PolicyGateway` sjekker `isActiveDurable()` mot `owner_control_state` - en
+kostnadseksplosjon ville satt et flagg ingen håndhevende kode leser. `TelegramAlertSink.send()` var et
+skall som ubetinget kastet. **En ANDRE, dypere defekt ble funnet under implementasjonen:** `cost_events`
+OG `tasks` er `FORCE ROW LEVEL SECURITY`-beskyttet (migrasjon 005), så de rå, tenant-løse
+aggregeringene i `costExplosionCheck`/`stuckTasksCheck` ser NULL rader under den ekte
+`jarvis_runtime`-rollen - hardgrensen kunne strukturelt ALDRI utløses i produksjon. Begge defektene var
+maskert av at den eneste eksisterende testen brukte BÅDE en pool-løs `KillSwitch` OG en
+superuser-`adminPool` (samme bug-klasse som D-178/B7, denne gangen i produksjonskode). RETTET:
+`activateDurable(reason, actorPersonId)` med eksplisitt, påkrevd eier-aktør og watchdog-proveniens i
+`reason`; tenant-skopet summering via `withTenantTransaction()`; produksjons-wiring av ÉN
+watchdog-instans i `apps/api/src/worker-main.ts` (etter Q-21-sjekken OG `killSwitch.restore()`, med
+avgrenset konfigurerbart intervall, ingen duplikat i `main.ts`); reell varsling via den EKSISTERENDE,
+delte `TelegramTransport`+`JARVIS_TELEGRAM_TOKEN`-kjeden; observerbar feilisolasjon og
+overlappingsvern i `tick()`. 53 nye tester grønne (17 durabilitet mot en ekte
+`NOSUPERUSER NOBYPASSRLS`-rolle + 36 strukturell wiring); typecheck/lint rene.
+**`INTERNAL_BUILD_COMPLETE=false` (RETTET fra D-179 sin `true`), `INTERNAL_BUILD_BLOCKERS=
+W1_HOST_ACCEPTANCE_PENDING`, `HOST_ACCEPTANCE_STATUS=NOT_RUN`** - harnesset
+(`modules/watchdog/scripts/w1-watchdog-durability-{live,host-run}.ts`) er bygget, men IKKE kjørt mot
+ekte Docker/Postgres. `SOVEREIGN_COMPLETE=false` FORBLIR UENDRET. Ingen Value Track-arbeid, ingen
+berøring av PR #87, ingen UGREEN-migrering, ingen nye eksterne credentials. Se D-180 i
+DECISIONS_AND_ASSUMPTIONS.md og «W1» i RUNTIME_GATES.md.
+
 ## 16-områders graduation-matrise
 
 | Område | Status | Evidens (kort) |
@@ -154,6 +180,7 @@ gir. Se D-179 i DECISIONS_AND_ASSUMPTIONS.md for full begrunnelse/testevidens.
 | Erasure / retention | LIVE-PROVEN (teknisk fundament) | Q-20 PRODUCTION_VERIFIED (2026-08-16) - teknisk fundament, IKKE juridisk GDPR-sertifisering |
 | Audit / provenance | TESTED, live-datastrøm gjenstår | UA0-PRIVACY PARTIAL_RUNTIME - RLS/karantene/injection-vern suite-bevist |
 | Restart / restore / recovery | LIVE-PROVEN (lokalt) / BLOCKED (off-site) | OPS-RUNTIME VERIFIED lokalt; ekstern uptime/off-site backup gjenstår |
+| Watchdog / automatisk nødstopp (W1) | IMPLEMENTERT + PRODUKSJONS-WIRET, host-akseptanse IKKE kjørt | **D-180 (2026-09-19):** D182 fant at `@jarvis/watchdog` ALDRI var koblet inn i noen kjørende prosess, og at `costExplosionCheck` brukte den prosess-lokale `killSwitch.activate()` mens `PolicyGateway` håndhever på `isActiveDurable()`. En ANDRE, dypere defekt ble funnet under implementasjonen: `cost_events`/`tasks` er FORCE RLS-beskyttet, så de tenant-løse aggregeringene så NULL rader under den ekte runtime-rollen - hardgrensen kunne strukturelt aldri utløses. Begge rettet (`activateDurable()` + `withTenantTransaction()`), watchdogen er wiret inn i `apps/api/src/worker-main.ts`, og `TelegramAlertSink` bruker nå den ekte, eksisterende `TelegramTransport`. 53 nye tester grønne. `HOST_ACCEPTANCE_STATUS=NOT_RUN` - se RUNTIME_GATES.md «W1» og D-180 |
 
 ## UA-9/UA-10/UA-11 deferred-punkter - IMPLEMENTATION_STATUS / LIVE_EVIDENCE_STATUS
 

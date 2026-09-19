@@ -332,6 +332,18 @@ kill switch-øvelse; kostnadsgrense-øvelse.
 
 **Bygges IKKE:** Autonom selvreparasjon utover signerte runbooks; store maskinvarekjøp uten måldata.
 
+**Status-korreksjon (W1, D-180, 2026-09-19):** akseptansekriterium 1 og 3 var tidligere ansett dekket
+av fase 10 sine testresultater. D182 sin rekognosering, og en dypere defekt funnet under
+implementasjonen, viser at de IKKE var det i drift: `@jarvis/watchdog` var aldri koblet inn i noen
+kjørende prosess (kriterium 1 kunne derfor ikke utløses i produksjon i det hele tatt), varslingsstien
+var et skall som ubetinget kastet, kostnadsnødstoppen skrev kun prosess-lokal in-memory-tilstand som
+ingen håndhevende kode leser, og de tenant-løse `cost_events`/`tasks`-aggregeringene så NULL rader
+under den ekte, RLS-underlagte runtime-rollen (kriterium 3 sin «grensene håndheves og er testet» var
+altså kun sann i en test som omgikk både autorisasjons- og isolasjonslaget). Alt dette er rettet og
+suite-bevist i W1; kriterium 1 og 3 forblir likevel IKKE host-bevist til
+`modules/watchdog/scripts/w1-watchdog-durability-host-run.ts` er kjørt på den ekte hosten
+(`HOST_ACCEPTANCE_STATUS=NOT_RUN`). Se D-180 og «W1» i RUNTIME_GATES.md.
+
 ---
 
 ## Overgang til masterplan v4.0 «Sovereign Autonomy» (UA-N)

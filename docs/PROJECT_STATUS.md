@@ -64,9 +64,9 @@ Full begrunnelse: D-180 i `DECISIONS_AND_ASSUMPTIONS.md`, «W1» i `RUNTIME_GATE
 
 ## Testevidens
 
-- `modules/watchdog/test/` **59/59 grønne**, hvorav 53 nye:
-  `w1-watchdog-durability.test.ts` (17, ekte embedded Postgres på en EKTE `NOSUPERUSER NOBYPASSRLS`-rolle)
-  og `w1-watchdog-production-wiring.test.ts` (36, strukturell wiring).
+- `modules/watchdog/test/` **61/61 grønne**, hvorav 55 nye:
+  `w1-watchdog-durability.test.ts` (18, ekte embedded Postgres på en EKTE `NOSUPERUSER NOBYPASSRLS`-rolle)
+  og `w1-watchdog-production-wiring.test.ts` (37, strukturell wiring).
 - `fase10-ops.test.ts` sin kostnadseksplosjons-test - SELVE maskeringen (pool-løs `KillSwitch` +
   superuser-`adminPool`) - er bundet om til den durable stien via den RLS-underlagte `appPool`.
 - `pnpm -r run typecheck` og `pnpm run lint`: rene på hele workspacet.

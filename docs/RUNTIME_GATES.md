@@ -18,7 +18,7 @@ filen til tross for at de er kode-implementert - registrert som dokumentasjonshu
 | D-36 Apple runtime | BLOCKED_EXTERNAL | Swift-kilde klar; krever Mac/Xcode/Developer-konto (sjekkliste: APPLE_PHASE8_CHECKLIST.md) |
 | HA-RUNTIME | BLOCKED_EXTERNAL | HA-verktøy m/D-pipeline testet mot fake; krever HA-instans + token |
 | OPS-RUNTIME | PARTIAL_RUNTIME | Watchdog/kill-switch-kriterier/backup+restore målt i test (fase 10); ekstern uptime/off-site backup gjenstår |
-| W1-WATCHDOG-RUNTIME (D-180) | IMPLEMENTED_NOT_VERIFIED | Watchdogen er NÅ produksjons-wiret (`apps/api/src/worker-main.ts`), nødstoppen går via den durable `activateDurable()`-stien, og varslingen bruker den ekte `TelegramTransport`. 53 nye tester grønne (17 durabilitet mot ekte NOSUPERUSER/NOBYPASSRLS-rolle + 36 strukturell wiring). `HOST_ACCEPTANCE_STATUS=NOT_RUN` - harnesset (`modules/watchdog/scripts/w1-watchdog-durability-{live,host-run}.ts`) er bygget, men IKKE kjørt mot ekte Docker/Postgres. Se «W1» under og D-180. |
+| W1-WATCHDOG-RUNTIME (D-180) | IMPLEMENTED_NOT_VERIFIED | Watchdogen er NÅ produksjons-wiret (`apps/api/src/worker-main.ts`), nødstoppen går via den durable `activateDurable()`-stien, og varslingen bruker den ekte `TelegramTransport`. 55 nye tester grønne (18 durabilitet mot ekte NOSUPERUSER/NOBYPASSRLS-rolle + 37 strukturell wiring). `HOST_ACCEPTANCE_STATUS=NOT_RUN` - harnesset (`modules/watchdog/scripts/w1-watchdog-durability-{live,host-run}.ts`) er bygget, men IKKE kjørt mot ekte Docker/Postgres. Se «W1» under og D-180. |
 | UA0-AUTHORITY | PARTIAL_RUNTIME | **Implementert 2026-08-13:** `resolveAuthorityMode` (SOVEREIGN for owner-tenant, delegat arver aldri), sovereign klasse C/D uten approval, D-pipeline (preflight→state readback→before/after→recovery-snapshot→audit), OwnerControls (pause/freeze/revoke) håndhevet i policy+gateway. Evidens: `modules/tool-gateway/test/ua0-sovereign.test.ts` (pnpm test → 128/128). Live-verifikasjon mot ekte connectors gjenstår |
 | UA0-PRIVACY | PARTIAL_RUNTIME | Tenant+space-RLS, karantene, injection-vern bevist i suiten; live-datastrøm gjenstår |
 | UA0-RUNRATE | **PARTIAL_RUNTIME m/LIVE PROVIDER-EVIDENS** | 2026-08-13: ekte OpenAI-kall (gpt-4o-mini) gjennom ModelGateway mot ekte Postgres: cost_events={provider:openai, model:gpt-4o-mini, in:30, out:9, 3 øre, task-live-runrate/sess-live-1}, trace-span 2067 ms. Kommando: `node --experimental-transform-types modules/tool-gateway/scripts/live-runrate.ts`. Brief-generering skriver egen cost-rad (kind=brief:generation) → cost_per_daily_brief beregnes reelt. Sky-/connector-kost mangler live kilder |
@@ -97,15 +97,21 @@ hardgrensen kunne strukturelt aldri utløses i produksjon. Maskert av at den ene
 testen brukte BÅDE en pool-løs `KillSwitch` OG en superuser-`adminPool`. Samme bug-klasse som
 D-178/B7, denne gangen i produksjonskode. Begge sjekkene bruker nå `withTenantTransaction()`.
 
-**Suite-evidens (empirisk kjørt, ikke bare typecheck):** `modules/watchdog/test/` 59/59 grønne, hvorav
-53 nye - `w1-watchdog-durability.test.ts` (17, ekte embedded Postgres på en EKTE
+**Suite-evidens (empirisk kjørt, ikke bare typecheck):** `modules/watchdog/test/` 61/61 grønne, hvorav
+55 nye - `w1-watchdog-durability.test.ts` (18, ekte embedded Postgres på en EKTE
 `NOSUPERUSER NOBYPASSRLS`-rolle: RLS-regresjonsvakt som beviser at den gamle spørringen ser 0 øre,
 under/over terskel, kryss-tenant-summering, uavhengig andre pool ser aktiv tilstand, `PolicyGateway`
 på den uavhengige instansen håndhever, omstart-rekonstruksjon, varslingsfeil opphever ikke nødstoppen,
-idempotente gjentatte sykluser, overlappingsvern, feilisolasjon) og
-`w1-watchdog-production-wiring.test.ts` (36, strukturell: watchdogen er FAKTISK konsumert av
-`worker-main.ts`, ingen legacy `activate()`, ingen rå `pool.query` mot RLS-tabellene, ingen watchdog i
-`main.ts`). `pnpm -r run typecheck` og `pnpm run lint` rene på hele workspacet.
+idempotente gjentatte sykluser, overlappingsvern, feilisolasjon, fail-safe konfigurasjonsparsing) og
+`w1-watchdog-production-wiring.test.ts` (37, strukturell: watchdogen er FAKTISK konsumert av
+`worker-main.ts`, ingen legacy `activate()`, ingen rå `pool.query` mot RLS-tabellene, ingen rå
+`Number(process.env[...])` for hardgrensen, ingen watchdog i `main.ts`).
+`pnpm -r run typecheck` og `pnpm run lint` rene på hele workspacet.
+
+**Fail-safe konfigurasjon (egen-review av wiringen):** hardgrensen leses med
+`resolveCostHardLimitOre()`, ikke en rå `Number(process.env["JARVIS_COST_HARD_LIMIT_ORE"])` - en
+skrivefeil i `.env` ville ellers gitt `NaN`, og `spent >= NaN` er ALLTID `false`, altså en stille
+avslått kostnadsnødstopp. Samme disiplin som den avgrensede `resolveWatchdogIntervalMs()`.
 
 **Host-akseptanse (bygget, IKKE kjørt):**
 

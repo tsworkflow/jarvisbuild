@@ -151,8 +151,8 @@ superuser-`adminPool` (samme bug-klasse som D-178/B7, denne gangen i produksjons
 watchdog-instans i `apps/api/src/worker-main.ts` (etter Q-21-sjekken OG `killSwitch.restore()`, med
 avgrenset konfigurerbart intervall, ingen duplikat i `main.ts`); reell varsling via den EKSISTERENDE,
 delte `TelegramTransport`+`JARVIS_TELEGRAM_TOKEN`-kjeden; observerbar feilisolasjon og
-overlappingsvern i `tick()`. 53 nye tester grønne (17 durabilitet mot en ekte
-`NOSUPERUSER NOBYPASSRLS`-rolle + 36 strukturell wiring); typecheck/lint rene.
+overlappingsvern i `tick()`. 55 nye tester grønne (18 durabilitet mot en ekte
+`NOSUPERUSER NOBYPASSRLS`-rolle + 37 strukturell wiring); typecheck/lint rene.
 **`INTERNAL_BUILD_COMPLETE=false` (RETTET fra D-179 sin `true`), `INTERNAL_BUILD_BLOCKERS=
 W1_HOST_ACCEPTANCE_PENDING`, `HOST_ACCEPTANCE_STATUS=NOT_RUN`** - harnesset
 (`modules/watchdog/scripts/w1-watchdog-durability-{live,host-run}.ts`) er bygget, men IKKE kjørt mot
@@ -180,7 +180,7 @@ DECISIONS_AND_ASSUMPTIONS.md og «W1» i RUNTIME_GATES.md.
 | Erasure / retention | LIVE-PROVEN (teknisk fundament) | Q-20 PRODUCTION_VERIFIED (2026-08-16) - teknisk fundament, IKKE juridisk GDPR-sertifisering |
 | Audit / provenance | TESTED, live-datastrøm gjenstår | UA0-PRIVACY PARTIAL_RUNTIME - RLS/karantene/injection-vern suite-bevist |
 | Restart / restore / recovery | LIVE-PROVEN (lokalt) / BLOCKED (off-site) | OPS-RUNTIME VERIFIED lokalt; ekstern uptime/off-site backup gjenstår |
-| Watchdog / automatisk nødstopp (W1) | IMPLEMENTERT + PRODUKSJONS-WIRET, host-akseptanse IKKE kjørt | **D-180 (2026-09-19):** D182 fant at `@jarvis/watchdog` ALDRI var koblet inn i noen kjørende prosess, og at `costExplosionCheck` brukte den prosess-lokale `killSwitch.activate()` mens `PolicyGateway` håndhever på `isActiveDurable()`. En ANDRE, dypere defekt ble funnet under implementasjonen: `cost_events`/`tasks` er FORCE RLS-beskyttet, så de tenant-løse aggregeringene så NULL rader under den ekte runtime-rollen - hardgrensen kunne strukturelt aldri utløses. Begge rettet (`activateDurable()` + `withTenantTransaction()`), watchdogen er wiret inn i `apps/api/src/worker-main.ts`, og `TelegramAlertSink` bruker nå den ekte, eksisterende `TelegramTransport`. 53 nye tester grønne. `HOST_ACCEPTANCE_STATUS=NOT_RUN` - se RUNTIME_GATES.md «W1» og D-180 |
+| Watchdog / automatisk nødstopp (W1) | IMPLEMENTERT + PRODUKSJONS-WIRET, host-akseptanse IKKE kjørt | **D-180 (2026-09-19):** D182 fant at `@jarvis/watchdog` ALDRI var koblet inn i noen kjørende prosess, og at `costExplosionCheck` brukte den prosess-lokale `killSwitch.activate()` mens `PolicyGateway` håndhever på `isActiveDurable()`. En ANDRE, dypere defekt ble funnet under implementasjonen: `cost_events`/`tasks` er FORCE RLS-beskyttet, så de tenant-løse aggregeringene så NULL rader under den ekte runtime-rollen - hardgrensen kunne strukturelt aldri utløses. Begge rettet (`activateDurable()` + `withTenantTransaction()`), watchdogen er wiret inn i `apps/api/src/worker-main.ts`, og `TelegramAlertSink` bruker nå den ekte, eksisterende `TelegramTransport`. 55 nye tester grønne. `HOST_ACCEPTANCE_STATUS=NOT_RUN` - se RUNTIME_GATES.md «W1» og D-180 |
 
 ## UA-9/UA-10/UA-11 deferred-punkter - IMPLEMENTATION_STATUS / LIVE_EVIDENCE_STATUS
 

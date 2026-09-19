@@ -70,12 +70,25 @@ Full begrunnelse: D-180 i `DECISIONS_AND_ASSUMPTIONS.md`, «W1» i `RUNTIME_GATE
 - `fase10-ops.test.ts` sin kostnadseksplosjons-test - SELVE maskeringen (pool-løs `KillSwitch` +
   superuser-`adminPool`) - er bundet om til den durable stien via den RLS-underlagte `appPool`.
 - `pnpm -r run typecheck` og `pnpm run lint`: rene på hele workspacet.
-- **Kjent, PRE-EKSISTERENDE miljøbegrensning i denne sandkassen (IKKE en W1-regresjon, IKKE skjult):**
-  `modules/tool-gateway/test/docker-transport.test.ts` feiler 12 tester med
-  `docker_spawn_failed:...EFTYPE` - `spawnSync` klarer ikke kjøre testens fake `docker.cjs` på denne
-  Windows-verten. `modules/tool-gateway` er BYTE-IDENTISK med `main` på denne branchen
-  (`git diff --name-only origin/main -- modules/tool-gateway` = tomt), så feilen kan ikke komme fra
-  W1. Eksakt-HEAD CI (Linux) er autoritet for denne suiten.
+- **EKTE REGRESJON fanget av eksakt-HEAD CI, RETTET (ikke bortforklart):** første CI-kjøring (run
+  `35409347618`) feilet med NØYAKTIG to feil, begge i `apps/api/test/drive-runtime-wiring.test.ts`.
+  W1 sin hoisting av `telegram: new TelegramTransport()` ut av worker-main sin
+  `firstWaveTools({...})`-blokk (for å dele instansen med watchdogens alert sink) brøt to
+  strukturelle assertions. Vakten er OPPDATERT, IKKE SVEKKET: ny
+  `expectUnconditionalHoistedTelegram()` krever en ren, UBETINGET
+  `const telegramTransport = new TelegramTransport();` på egen linje, NØYAKTIG ÉN
+  `new TelegramTransport(` i filen, og at samme instans gis til `TelegramAlertSink` - altså strengere
+  på det som betyr noe (ubetingethet + én delt instans) enn strengsjekken den erstatter. 13/13 grønne.
+- **Kjente, PRE-EKSISTERENDE Windows-sandkasse-artefakter (IKKE W1-regresjoner, IKKE skjult) - de
+  SAMME testene er grønne i Linux-CI på eksakt denne branchen:**
+  - `modules/tool-gateway/test/docker-transport.test.ts` (12) og
+    `modules/tasks/test/sandbox-docker-extra-env.test.ts`: `spawnSync` klarer ikke kjøre testenes
+    fake `docker.cjs` på denne verten (`EFTYPE`). `modules/tool-gateway` er dessuten BYTE-IDENTISK
+    med `main` (`git diff --name-only origin/main -- modules/tool-gateway` = tomt).
+  - `apps/api/test/worker-coding-wiring.test.ts` (8): repoet har INGEN `.gitattributes` og
+    `core.autocrlf=true`, så hele arbeidstreet er CRLF på Windows; tester som gjør
+    `indexOf('...\n  ...')` mot kildetekst kan strukturelt ikke matche her, uavhengig av innhold.
+  - Eksakt-HEAD CI (Linux) er autoritet for disse suitene.
 
 ## Blokkeringer
 

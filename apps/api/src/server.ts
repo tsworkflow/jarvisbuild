@@ -21,7 +21,7 @@ import {
   type CardService, type FinanceService
 } from "@jarvis/finance";
 import type { ConversationEngine } from "./conversation.ts";
-import type { IdentityContext, MemorySpace } from "@jarvis/contracts";
+import type { IdentityContext, JsonValue, MemorySpace } from "@jarvis/contracts";
 
 /**
  * Fase 3: minimalt API uten rammeverk (rammeverksvalg utsatt til behovet
@@ -73,6 +73,20 @@ export interface ApiDeps {
   enrollment?: DeviceEnrollmentService;
   /** v4.0 BO-02: Daily Executive Brief on demand. */
   brief?: { generate(identity: unknown): Promise<unknown>; render(artifact: unknown): string };
+  /**
+   * D-199 (UA-11 Executive dashboard-UI, LESE-DELEN): SAMME allerede-
+   * konstruerte `toolGateway`-instans som resten av appen (`incidents.gateway`
+   * over, `situations`-sveipet, osv.) - INGEN ny autorisasjonsmekanisme,
+   * INGEN ny ToolGateway-instans. Valgfritt, samme mønster som `brief`/
+   * `tasks`/`incidents`: uten database-avhengigheter kjører API-et i
+   * helse-modus. Route-en under (`/executive/query`) begrenser SEG SELV til
+   * et hardkodet, LESE-KUN allowlist av `executive.*`-handlinger (se
+   * `EXECUTIVE_QUERY_ACTIONS`) - mutasjoner (pause/revoke/kill switch osv.)
+   * er BEVISST IKKE eksponert her ennå, egen fremtidig slice (samme
+   * "P0 lese/komposisjon FØR P1 mutasjon/autonomi"-rekkefølge som UA-9/
+   * UA-10/UA-11 selv allerede fulgte).
+   */
+  executive?: { gateway: ToolGateway };
   /**
    * D-102 (UA-5 Production Real Coding Agent / Tested-Fix Pipeline Wiring v1):
    * SAMME `TaskService`-instans som allerede konstrueres for `ConversationEngine`
@@ -161,6 +175,18 @@ const CHAT_BODY_KEYS = ["grant_token", "message", "provider"] as const;
 const BRIEF_BODY_KEYS = ["grant_token"] as const;
 
 /**
+ * D-199: `/executive/query` sin egen, EKSPLISITTE hvitelilste - kun de to
+ * LESE-handlingene (klasse A) `executive.*` selv definerer i dag. Enhver
+ * fremtidig mutasjonshandling (pause_domain/activate_kill_switch/
+ * revoke_device/osv.) MÅ IKKE kunne nås via denne ruten uten en bevisst,
+ * separat kodeendring her - en hardkodet allowlist, ALDRI "alt executive.*
+ * tilbyr", er nettopp poenget: ruten skal forbli lese-kun helt til en egen,
+ * separat gjennomgått slice bevisst utvider den.
+ */
+const EXECUTIVE_QUERY_ACTIONS = ["get_attention_queue", "get_control_surface_status"] as const;
+const EXECUTIVE_QUERY_BODY_KEYS = ["grant_token", "action", "parameters"] as const;
+
+/**
  * Fail-closed parsing, speilbildet av `.strict()`: et forsøk på å sende f.eks.
  * `session_id`, `tenant_id`, `person_id`, `memory_space`, `channel` eller
  * `auth_strength` gir `malformed_request` i stedet for å bli stille ignorert.
@@ -226,6 +252,8 @@ async function resolveFromGrant(
 }
 
 const WEB_INDEX = fileURLToPath(new URL("../../web/index.html", import.meta.url));
+/** D-199: samme statiske servering som WEB_INDEX over, egen side for dashboard.html. */
+const WEB_DASHBOARD = fileURLToPath(new URL("../../web/dashboard.html", import.meta.url));
 
 async function readBody(req: IncomingMessage): Promise<unknown> {
   const chunks: Buffer[] = [];
@@ -274,6 +302,13 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
 
   if (req.method === "GET" && url.pathname === "/") {
     const html = await readFile(WEB_INDEX, "utf8");
+    res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
+    res.end(html);
+    return;
+  }
+
+  if (req.method === "GET" && url.pathname === "/dashboard") {
+    const html = await readFile(WEB_DASHBOARD, "utf8");
     res.writeHead(200, { "content-type": "text/html; charset=utf-8" });
     res.end(html);
     return;
@@ -417,6 +452,44 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       rendered: deps.brief.render(artifact),
       session_id: resolved.identity.session_id
     });
+  }
+
+  if (deps.executive && req.method === "POST" && url.pathname === "/executive/query") {
+    // D-199 (UA-11 Executive dashboard-UI, lese-delen): SAMME grant-baserte
+    // autoritetsmodell som `/chat`/`/brief` - INGEN egen autentisering
+    // oppfunnet her. `action` valideres FØR grantet løses (billigere avslag
+    // for en åpenbart ugyldig forespørsel), men et ugyldig grant avslås
+    // UANSETT FØR selve `toolGateway.execute()`-kallet - identisk rekkefølge
+    // som `/chat`.
+    let raw: unknown;
+    try {
+      raw = await readBody(req);
+    } catch {
+      raw = undefined;
+    }
+    const parsedBody = parseGrantBody(raw, EXECUTIVE_QUERY_BODY_KEYS);
+    if (!parsedBody || typeof parsedBody["action"] !== "string") {
+      return json(res, 400, { error: "malformed_request", reason: "grant_malformed" });
+    }
+    const action = parsedBody["action"];
+    if (!(EXECUTIVE_QUERY_ACTIONS as readonly string[]).includes(action)) {
+      return json(res, 400, { error: "malformed_request", reason: "action_not_allowed" });
+    }
+    const parameters =
+      typeof parsedBody["parameters"] === "object" && parsedBody["parameters"] !== null && !Array.isArray(parsedBody["parameters"])
+        ? (parsedBody["parameters"] as Record<string, JsonValue>)
+        : {};
+    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string);
+    if (!resolved.ok) {
+      return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+    }
+    const result = await deps.executive.gateway.execute({
+      identity: resolved.identity, tool_id: "executive", action, parameters
+    });
+    if (!result.ok) {
+      return json(res, 403, { error: "tool_denied", reason: result.reason });
+    }
+    return json(res, 200, { ok: true, data: result.data, session_id: resolved.identity.session_id });
   }
 
   if (deps.enrollment && req.method === "POST" && url.pathname === "/devices/register") {

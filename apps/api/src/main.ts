@@ -640,7 +640,12 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     // og skjer derfor UTENFOR den generiske `readBody()`-JSON-parseren, se
     // server.ts sin nye rute-gren.
     finance: { service: financeService, cards: cardService },
-    conversation: conversationEngine
+    conversation: conversationEngine,
+    // D-199 (UA-11 Executive dashboard-UI, lese-delen): SAMME toolGateway-
+    // instans som resten av deps over (incidents.gateway osv.) - `/executive/
+    // query` i server.ts begrenser seg selv til et hardkodet lese-kun
+    // allowlist, ingen ny autorisasjonsmekanisme her.
+    executive: { gateway: toolGateway }
   };
   // D-196: samme drain-løkke som worker-main.ts (linje ~486) - MEN den
   // logget ALDRI en `tick()`-feil her (feil under selve claim/complete/fail-

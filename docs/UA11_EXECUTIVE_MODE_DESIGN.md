@@ -137,9 +137,15 @@ sin EGEN, allerede-registrerte erasure-plikt er uendret og fullt tilstrekkelig),
 
 ## §7. Bygges IKKE i denne sliceen (DEFERRED, eksplisitt - ikke glemt)
 
-- **Executive dashboard/UI.** Kontrollflaten (ToolGateway-kapabiliteten) er bygget og testet; en
-  eier-vendt visuell flate (HTTP-rute i `server.ts`, eller en klient) er en SENERE UA-11-slice - samme
-  reifiseringsnivå `situations.*` selv har i dag (ingen dedikert HTTP-rute finnes for den heller).
+- **Executive dashboard/UI, MUTASJONS-DELEN.** D-199 leverte den LESE-KUN delen: `POST /executive/query`
+  (hardkodet allowlist `get_attention_queue`/`get_control_surface_status`) + `GET /dashboard`
+  (`apps/web/dashboard.html`, samme Ed25519-enhetsnøkkel-/grant-autentisering som `apps/web/index.html`)
+  - viser attention-køen og kontrolloverflaten, INGEN handlingsknapper. De 15 mutasjonshandlingene
+  (`pause_domain`/`resume_domain`/`resolve_situation`/`activate_kill_switch`/`deactivate_kill_switch`/
+  `freeze_connector`/`unfreeze_connector`/`revoke_credential`/`restore_credential`/`revoke_device`/
+  `enable_finance_kill_switch`/`disable_finance_kill_switch` m.fl.) forblir BEVISST utenfor
+  `EXECUTIVE_QUERY_ACTIONS`-allowlistet - egen, senere, separat gjennomgått slice (bekreftelsesdialoger,
+  klasse D-preflight-visning for eieren) som denne sliceen ikke forsøker å løse stille.
 - **Business health / personal-domenekilder** (cash/revenue/pipeline/churn/marketing/schedule/travel/
   home/health-signaler). `situations` har ingen slik kilde koblet til ennå (kun `business_open_loops`-
   broen fra UA-10 P1) - når/hvis en slik kilde kobles til `situations` (D-64-disiplinen: KOMPOSISJON),

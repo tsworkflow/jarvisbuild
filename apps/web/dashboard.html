@@ -1,0 +1,287 @@
+<!doctype html>
+<html lang="no">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Jarvis · Executive</title>
+<style>
+  :root { color-scheme: dark; }
+  body { font-family: system-ui, sans-serif; background:#0d1117; color:#e6edf3; margin:0;
+         display:flex; flex-direction:column; min-height:100vh; }
+  header { padding:10px 16px; background:#161b22; font-weight:600; display:flex; align-items:center;
+           justify-content:space-between; gap:12px; }
+  header small { color:#8b949e; font-weight:400; margin-left:8px; }
+  #refresh { background:#238636; color:#fff; border:0; border-radius:8px; padding:6px 14px; cursor:pointer; }
+  #refresh:disabled { background:#30363d; cursor:default; }
+  main { flex:1; padding:16px; display:flex; flex-direction:column; gap:24px; max-width:900px; width:100%;
+         margin:0 auto; box-sizing:border-box; }
+  section h2 { font-size:15px; color:#8b949e; text-transform:uppercase; letter-spacing:0.05em; margin:0 0 10px; }
+  .card { background:#161b22; border:1px solid #30363d; border-radius:10px; padding:12px 14px; margin-bottom:8px; }
+  .card .title { font-weight:600; }
+  .card .meta { color:#8b949e; font-size:12px; margin-top:4px; }
+  .pill { display:inline-block; padding:2px 8px; border-radius:999px; font-size:12px; margin-right:6px; }
+  .pill.priority-high { background:#5c1e1e; color:#ffb4b4; }
+  .pill.priority-normal { background:#1f2d3d; color:#9cc4ff; }
+  .pill.priority-low { background:#21262d; color:#8b949e; }
+  .pill.state-active { background:#3d2c00; color:#ffd580; }
+  .pill.state-frozen { background:#5c1e1e; color:#ffb4b4; }
+  .pill.state-inactive { background:#132d1f; color:#7ee2a8; }
+  .empty { color:#8b949e; font-style:italic; }
+  #status { padding:12px 16px; background:#161b22; border-top:1px solid #30363d; color:#8b949e; font-size:13px; }
+  #enroll { display:none; padding:12px 16px; background:#161b22; border-top:1px solid #30363d; }
+  #enroll p { margin:0 0 8px; color:#8b949e; font-size:13px; }
+  #enroll code { color:#e6edf3; background:#0d1117; padding:2px 5px; border-radius:4px; }
+  #enroll form { display:flex; gap:8px; padding:0; }
+  #enroll input { flex:1; background:#0d1117; color:#e6edf3; border:1px solid #30363d; border-radius:8px;
+                  padding:10px; font-size:15px; }
+  #enroll button { background:#238636; color:#fff; border:0; border-radius:8px; padding:0 18px; cursor:pointer; }
+</style>
+</head>
+<body>
+<header>
+  <span>Jarvis <small>executive-dashboard · lese-kun (UA-11)</small></span>
+  <button id="refresh">Oppdater</button>
+</header>
+<main>
+  <section>
+    <h2>Attention queue</h2>
+    <div id="attention-queue"><p class="empty">Laster …</p></div>
+  </section>
+  <section>
+    <h2>Control surface</h2>
+    <div id="control-surface"><p class="empty">Laster …</p></div>
+  </section>
+</main>
+<div id="status"></div>
+<div id="enroll">
+  <p>Denne enheten er ikke innrullert ennå. Kjør på maskinen som eier Jarvis:
+     <code>pnpm --filter @jarvis/api enroll-ticket</code> og lim inn billetten under.</p>
+  <form id="enroll-form">
+    <input id="enroll-ticket" placeholder="Innrullerings-billett …" autocomplete="off">
+    <button>Innrullér</button>
+  </form>
+</div>
+<script>
+  const attentionQueueEl = document.getElementById("attention-queue");
+  const controlSurfaceEl = document.getElementById("control-surface");
+  const statusEl = document.getElementById("status");
+  const refreshBtn = document.getElementById("refresh");
+  const enrollPanel = document.getElementById("enroll");
+  const enrollForm = document.getElementById("enroll-form");
+  const enrollTicket = document.getElementById("enroll-ticket");
+
+  // Samme dev-identitet/enhetsautentisering som apps/web/index.html - se
+  // D-131-kommentarene der for hvorfor feltene under kun er PÅSTANDER som
+  // følger med et ekte enhetsbevis, og aldri sendes videre til /executive/query.
+  const identity = {
+    person_id: "person-tobias", tenant_id: "tenant-personal", device_id: "dev-web",
+    memory_space: "personal", channel: "web"
+  };
+
+  let grant = null;
+  let deviceKey = null;
+
+  function base64FromBuffer(buffer) {
+    const bytes = new Uint8Array(buffer);
+    let binary = "";
+    for (let i = 0; i < bytes.length; i++) binary += String.fromCharCode(bytes[i]);
+    return btoa(binary);
+  }
+
+  function pemFromSpki(spkiBuffer) {
+    const b64 = base64FromBuffer(spkiBuffer);
+    const lines = b64.match(/.{1,64}/g) || [];
+    return "-----BEGIN PUBLIC KEY-----\n" + lines.join("\n") + "\n-----END PUBLIC KEY-----\n";
+  }
+
+  async function loadOrCreateDeviceKey() {
+    const stored = localStorage.getItem("jarvis.devicekey");
+    if (stored) {
+      const jwk = JSON.parse(stored);
+      const privateKey = await crypto.subtle.importKey("jwk", jwk, { name: "Ed25519" }, true, ["sign"]);
+      const publicKey = await crypto.subtle.importKey(
+        "jwk", { kty: "OKP", crv: "Ed25519", x: jwk.x }, { name: "Ed25519" }, true, ["verify"]
+      );
+      return { privateKey, publicKey };
+    }
+    const pair = await crypto.subtle.generateKey({ name: "Ed25519" }, true, ["sign", "verify"]);
+    const jwk = await crypto.subtle.exportKey("jwk", pair.privateKey);
+    localStorage.setItem("jarvis.devicekey", JSON.stringify(jwk));
+    return { privateKey: pair.privateKey, publicKey: pair.publicKey };
+  }
+
+  async function signChallenge(privateKey, deviceId) {
+    const res = await fetch("/devices/challenge", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ device_id: deviceId })
+    });
+    if (!res.ok) throw new Error("devices/challenge: " + res.status);
+    const { challenge } = await res.json();
+    const signature = base64FromBuffer(
+      await crypto.subtle.sign({ name: "Ed25519" }, privateKey, new TextEncoder().encode(challenge))
+    );
+    return { challenge, signature };
+  }
+
+  async function authorize(privateKey) {
+    const { challenge, signature } = await signChallenge(privateKey, identity.device_id);
+    const res = await fetch("/session/authorize", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        channel: identity.channel, person_id: identity.person_id, tenant_id: identity.tenant_id,
+        device_id: identity.device_id, memory_space: identity.memory_space,
+        device_proof: { challenge, signature }
+      })
+    });
+    const body = await res.json();
+    if (res.ok && body.ok) return body.grant;
+    if (body.reason === "device_proof_invalid" || body.reason === "unknown_device") return null;
+    throw new Error("session/authorize: " + (body.reason || res.status));
+  }
+
+  async function enrollDevice(privateKey, publicKey, ticket) {
+    const pem = pemFromSpki(await crypto.subtle.exportKey("spki", publicKey));
+    const res = await fetch("/devices/register", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({
+        tenant_id: identity.tenant_id,
+        person_id: identity.person_id,
+        device: { device_id: identity.device_id, kind: "web", public_key_pem: pem },
+        enrollment: { kind: "enrollment_ticket", ticket }
+      })
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || !body.ok) throw new Error("devices/register: " + (body.reason || res.status));
+  }
+
+  async function ensureGrant() {
+    if (grant && grant.expires_at_ms - 30_000 > Date.now()) return grant;
+    if (!deviceKey) deviceKey = await loadOrCreateDeviceKey();
+    grant = await authorize(deviceKey.privateKey);
+    if (!grant) {
+      enrollPanel.style.display = "block";
+      throw new Error("enhet ikke innrullert");
+    }
+    enrollPanel.style.display = "none";
+    return grant;
+  }
+
+  enrollForm.addEventListener("submit", async (e) => {
+    e.preventDefault();
+    const ticket = enrollTicket.value.trim();
+    if (!ticket) return;
+    enrollTicket.value = "";
+    try {
+      if (!deviceKey) deviceKey = await loadOrCreateDeviceKey();
+      await enrollDevice(deviceKey.privateKey, deviceKey.publicKey, ticket);
+      await ensureGrant();
+      statusEl.textContent = "Enheten er innrullert.";
+      await loadAll();
+    } catch (err) {
+      statusEl.textContent = "Innrullering feilet: " + err.message;
+    }
+  });
+
+  /** D-199: kun de to LESE-handlingene servertes /executive/query selv hvitelister. */
+  async function queryExecutive(action) {
+    const active = await ensureGrant();
+    const res = await fetch("/executive/query", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: JSON.stringify({ grant_token: active.grant_token, action })
+    });
+    const body = await res.json().catch(() => ({}));
+    if (!res.ok || !body.ok) throw new Error(action + ": " + (body.reason || body.error || res.status));
+    return body.data;
+  }
+
+  function escapeHtml(text) {
+    const div = document.createElement("div");
+    div.textContent = String(text);
+    return div.innerHTML;
+  }
+
+  /** `get_attention_queue` sin `data` ER selve listen (AttentionItem[]) - ingen wrapper-objekt. */
+  function renderAttentionQueue(data) {
+    const items = Array.isArray(data) ? data : [];
+    if (items.length === 0) {
+      attentionQueueEl.innerHTML = '<p class="empty">Ingen elementer venter på oppmerksomhet.</p>';
+      return;
+    }
+    attentionQueueEl.innerHTML = items.map((item) => {
+      const priority = escapeHtml(item.priority || "normal");
+      const domain = escapeHtml(item.domain || "");
+      const reason = escapeHtml(item.reason || "");
+      const stage = escapeHtml(item.stage || "");
+      const recommended = escapeHtml(item.recommended_next_action || "");
+      const explanation = Array.isArray(item.explanation) ? item.explanation.map(escapeHtml).join(" · ") : "";
+      return '<div class="card">' +
+        '<span class="pill priority-' + priority + '">' + priority + "</span>" +
+        (domain ? '<span class="pill">' + domain + "</span>" : "") +
+        (stage ? '<span class="pill">' + stage + "</span>" : "") +
+        '<div class="title">' + reason + "</div>" +
+        (recommended ? '<div class="meta">Anbefaling: ' + recommended + "</div>" : "") +
+        (explanation ? '<div class="meta">' + explanation + "</div>" : "") +
+        "</div>";
+    }).join("");
+  }
+
+  /** Speiler `ControlSurfaceStatus` (modules/executive/src/types.ts) EKSAKT - ingen oppfunnede felt. */
+  function renderControlSurface(data) {
+    if (!data) {
+      controlSurfaceEl.innerHTML = '<p class="empty">Ingen data.</p>';
+      return;
+    }
+    const killSwitch = data.owner_control && data.owner_control.kill_switch;
+    const killSwitchActive = !!(killSwitch && killSwitch.active);
+    const frozenConnectors = (data.owner_control && Array.isArray(data.owner_control.frozen_connectors))
+      ? data.owner_control.frozen_connectors : [];
+    const revokedCredentials = (data.owner_control && Array.isArray(data.owner_control.revoked_credentials))
+      ? data.owner_control.revoked_credentials : [];
+    const pausedDomains = (data.situation_domain_pauses && Array.isArray(data.situation_domain_pauses.paused))
+      ? data.situation_domain_pauses.paused : [];
+    const financeKillSwitch = data.finance_kill_switch;
+    const financeActive = !!(financeKillSwitch && financeKillSwitch.enabled);
+    const financeKnown = financeKillSwitch !== null && financeKillSwitch !== undefined;
+
+    let html = '<div class="card">' +
+      '<span class="pill ' + (killSwitchActive ? "state-frozen" : "state-inactive") + '">kill switch: ' +
+        (killSwitchActive ? "aktiv" : "inaktiv") + "</span>" +
+      '<span class="pill ' + (financeKnown ? (financeActive ? "state-frozen" : "state-inactive") : "state-active") + '">finans-kill-switch: ' +
+        (financeKnown ? (financeActive ? "aktiv" : "inaktiv") : "aldri konfigurert") + "</span>" +
+      "</div>";
+    html += '<div class="card"><div class="title">Frosne connectors</div><div class="meta">' +
+      (frozenConnectors.length ? frozenConnectors.map((c) => escapeHtml(c.connector_id)).join(", ") : "Ingen") + "</div></div>";
+    html += '<div class="card"><div class="title">Tilbakekalte credentials</div><div class="meta">' +
+      (revokedCredentials.length ? revokedCredentials.map((c) => escapeHtml(c.credential_ref)).join(", ") : "Ingen") + "</div></div>";
+    html += '<div class="card"><div class="title">Pausede domener</div><div class="meta">' +
+      (pausedDomains.length ? pausedDomains.map(escapeHtml).join(", ") : "Ingen") + "</div></div>";
+    controlSurfaceEl.innerHTML = html;
+  }
+
+  async function loadAll() {
+    refreshBtn.disabled = true;
+    statusEl.textContent = "Laster …";
+    try {
+      const [queueData, controlData] = await Promise.all([
+        queryExecutive("get_attention_queue"),
+        queryExecutive("get_control_surface_status")
+      ]);
+      renderAttentionQueue(queueData);
+      renderControlSurface(controlData);
+      statusEl.textContent = "Oppdatert " + new Date().toLocaleTimeString("nb-NO");
+    } catch (err) {
+      statusEl.textContent = "Feil: " + err.message;
+    } finally {
+      refreshBtn.disabled = false;
+    }
+  }
+
+  refreshBtn.addEventListener("click", () => { void loadAll(); });
+  loadAll();
+</script>
+</body>
+</html>

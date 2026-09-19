@@ -4397,6 +4397,39 @@ D-179 i `DECISIONS_AND_ASSUMPTIONS.md` for full begrunnelse/testevidens.
 
 ---
 
+## UA-11 – Executive dashboard-UI, lese-delen (D-199, direkte Tobias-chat-oppgave under D-192)
+
+**Manuell masterplan-slice** (2026-09-19, "Begge, din prioriterte rekkefølge" - dashboard-UI FØR UA-11
+"K2", eksplisitt godkjent av Tobias, under D-192s "din call, fortsett med det du mener er riktig"-
+delegering). Lukker det gjenstående HTTP-/UI-gapet UA-11-design-notatet §7 eksplisitt flagget som
+DEFERRED: `modules/executive`s allerede fullt bygde 17-handlings `executive.*` ToolGateway-namespace
+hadde INGEN HTTP-rute og INGEN UI. Full begrunnelse: D-199 i `DECISIONS_AND_ASSUMPTIONS.md`; design-
+tillegg: `docs/UA11_EXECUTIVE_MODE_DESIGN.md` §7.
+
+**Bygget (KUN de to lese-handlingene - samme "P0 lese FØR P1 mutasjon"-rekkefølge som resten av
+UA-11):**
+- `POST /executive/query` i `apps/api/src/server.ts` - SAMME grant-baserte autoritetsmodell som
+  `/chat`/`/brief`, eget hardkodet `EXECUTIVE_QUERY_ACTIONS`-allowlist (`get_attention_queue`,
+  `get_control_surface_status`) validert FØR grantet løses; identiteten sendt til
+  `toolGateway.execute()` er ALLTID den grant-løste, ALDRI en kaller-oppgitt en.
+- `apps/api/src/main.ts` wirer `executive: { gateway: toolGateway }` inn i `ApiDeps` - samme allerede
+  konstruerte instans som resten av appen.
+- `GET /dashboard` (`apps/web/dashboard.html`) - gjenbruker EKSAKT samme Ed25519-enhetsnøkkel-/grant-
+  autentiseringsflyt som `apps/web/index.html`; viser attention-køen og kontrolloverflaten, INGEN
+  handlingsknapper for noen mutasjon.
+
+**Bygges IKKE i denne sliceen (eksplisitt DEFERRED, se design-notatet §7):** alle 15 mutasjonshandlinger
+(`pause_domain`/`resume_domain`/`resolve_situation`/`activate_kill_switch`/`deactivate_kill_switch`/
+`freeze_connector`/`unfreeze_connector`/`revoke_credential`/`restore_credential`/`revoke_device`/
+`enable_finance_kill_switch`/`disable_finance_kill_switch` m.fl.) - egen, senere, separat gjennomgått
+slice (bekreftelsesdialoger, klasse D-preflight-visning).
+
+**Tester:** `apps/api/test/executive-query-e2e.test.ts` (10, ekte HTTP mot ekte `createApiServer()`/
+Postgres/grant-autoritet), `apps/api/test/executive-query-wiring.test.ts` (6, strukturell
+regresjonsvakt - allowlist er og forblir lese-kun). Se `docs/PROJECT_STATUS.md` for eksakte tall/status.
+
+---
+
 ## Fase-avhengigheter (oversikt)
 
 ```

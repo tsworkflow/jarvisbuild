@@ -88,6 +88,12 @@ describe("A) @jarvis/watchdog er FAKTISK konsumert av produksjons-worker-runtime
     expect(codeOnly(workerMainSource)).not.toMatch(/setInterval\([^)]*JARVIS_WATCHDOG_INTERVAL_MS/);
   });
 
+  it("parser hardgrensen fail-safe via resolveCostHardLimitOre - ALDRI en rå Number(env), som ville gitt NaN og en stille avslått nødstopp", () => {
+    const code = codeOnly(workerMainSource);
+    expect(code).toContain('resolveCostHardLimitOre(process.env["JARVIS_COST_HARD_LIMIT_ORE"])');
+    expect(code).not.toMatch(/Number\(\s*process\.env\["JARVIS_COST_HARD_LIMIT_ORE"\]/);
+  });
+
   it("gjenbruker DEN SAMME TelegramTransport-instansen som firstWaveTools sin telegram.notify - ingen ny Telegram-klient i worker-main", () => {
     const code = codeOnly(workerMainSource);
     expect(code.match(/new TelegramTransport\(\)/g) ?? []).toHaveLength(1);

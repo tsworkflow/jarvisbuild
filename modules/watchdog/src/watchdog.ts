@@ -296,6 +296,24 @@ export function startWatchdog(
   return { stop: () => clearInterval(timer), intervalMs };
 }
 
+/** D-09-kriteriets dokumenterte hardgrense (3 000 kr/måned) - brukt når `JARVIS_COST_HARD_LIMIT_ORE` mangler eller er ugyldig. */
+export const WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE = 300_000;
+
+/**
+ * W1 (D-180): SAMME fail-safe-disiplin som `resolveWatchdogIntervalMs()`, og
+ * her er den enda viktigere. En rå `Number(process.env[...] ?? 300_000)` gir
+ * `NaN` for en skrivefeil ("30000o", "3 000", tom streng med mellomrom) - og
+ * `spent >= NaN` er ALLTID `false`. En enkelt tastefeil i `.env` ville dermed
+ * slått av kostnadsnødstoppen STILLE, uten noen feilmelding, mens alt så helt
+ * normalt ut. Ugyldig/ikke-positiv verdi ⇒ den dokumenterte defaulten, ALDRI
+ * en grense som ikke kan utløses.
+ */
+export function resolveCostHardLimitOre(raw: string | undefined): number {
+  const parsed = Number(raw);
+  if (!raw || !Number.isFinite(parsed) || parsed <= 0) return WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE;
+  return Math.floor(parsed);
+}
+
 /**
  * W1 (D-180): tenant-omfanget hardgrensen/fastlås-sjekken summeres over.
  * Default er den SAMME ene eier-tenanten resten av worker-main.ts allerede

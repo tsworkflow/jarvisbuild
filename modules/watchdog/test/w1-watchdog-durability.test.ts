@@ -29,9 +29,9 @@ import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { InMemoryDeviceRegistry, InMemoryNonceStore, KillSwitch, PolicyGateway } from "@jarvis/policy";
 import {
   AlertDeliveryError, MemoryAlertSink, TelegramAlertSink, WATCHDOG_COST_EXPLOSION_REASON_PREFIX,
-  WATCHDOG_DEFAULT_INTERVAL_MS, WATCHDOG_MAX_INTERVAL_MS, WATCHDOG_MIN_INTERVAL_MS,
-  Watchdog, type Alert, type AlertSink, costExplosionCheck, formatAlertMessage,
-  resolveWatchdogIntervalMs, resolveWatchdogTenantIds
+  WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE, WATCHDOG_DEFAULT_INTERVAL_MS, WATCHDOG_MAX_INTERVAL_MS,
+  WATCHDOG_MIN_INTERVAL_MS, Watchdog, type Alert, type AlertSink, costExplosionCheck,
+  formatAlertMessage, resolveCostHardLimitOre, resolveWatchdogIntervalMs, resolveWatchdogTenantIds
 } from "@jarvis/watchdog";
 
 const TENANT = "tenant-w1";
@@ -411,6 +411,20 @@ describe("I) konfigurasjonen er avgrenset og fail-safe", () => {
     expect(resolveWatchdogIntervalMs("1")).toBe(WATCHDOG_MIN_INTERVAL_MS);
     expect(resolveWatchdogIntervalMs("999999999")).toBe(WATCHDOG_MAX_INTERVAL_MS);
     expect(resolveWatchdogIntervalMs("30000")).toBe(30_000);
+  });
+
+  it("resolveCostHardLimitOre faller tilbake til den dokumenterte defaulten for ugyldige verdier - en skrivefeil kan ALDRI gi NaN (som ville slått av nødstoppen stille)", () => {
+    expect(resolveCostHardLimitOre(undefined)).toBe(WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE);
+    expect(resolveCostHardLimitOre("")).toBe(WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE);
+    expect(resolveCostHardLimitOre("30000o")).toBe(WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE);
+    expect(resolveCostHardLimitOre("3 000")).toBe(WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE);
+    expect(resolveCostHardLimitOre("0")).toBe(WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE);
+    expect(resolveCostHardLimitOre("-1")).toBe(WATCHDOG_DEFAULT_COST_HARD_LIMIT_ORE);
+    expect(resolveCostHardLimitOre("500000")).toBe(500_000);
+    // Det avgjørende: resultatet er ALLTID et tall en sammenligning kan utløse på.
+    for (const raw of [undefined, "", "abc", "NaN", "1e999"]) {
+      expect(Number.isFinite(resolveCostHardLimitOre(raw))).toBe(true);
+    }
   });
 
   it("resolveWatchdogTenantIds bruker den eksplisitte listen når den finnes, ellers eier-tenanten", () => {

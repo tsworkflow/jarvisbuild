@@ -48,7 +48,8 @@ import { KnowledgeSourceRegistry, emailIngestHandler } from "@jarvis/knowledge";
 import { LocalHashEmbedding } from "@jarvis/memory";
 import {
   TelegramAlertSink, Watchdog, consoleWatchdogObserver, costExplosionCheck, databaseCheck,
-  resolveWatchdogIntervalMs, resolveWatchdogTenantIds, startWatchdog, stuckTasksCheck
+  resolveCostHardLimitOre, resolveWatchdogIntervalMs, resolveWatchdogTenantIds, startWatchdog,
+  stuckTasksCheck
 } from "@jarvis/watchdog";
 
 // Q-21 (2026-08-15): fail-closed - en manglende/feilkonfigurert JARVIS_DB_USER, eller
@@ -454,7 +455,10 @@ watchdog.register(databaseCheck(pool));
 watchdog.register(stuckTasksCheck(pool, watchdogTenantIds));
 watchdog.register(
   costExplosionCheck(pool, killSwitch, {
-    hardLimitOre: Number(process.env["JARVIS_COST_HARD_LIMIT_ORE"] ?? 300_000),
+    // Fail-safe parsing: en skrivefeil i `.env` ville med en rå `Number(...)`
+    // gitt `NaN`, og `spent >= NaN` er ALLTID false - altså en stille avslått
+    // kostnadsnødstopp. Se `resolveCostHardLimitOre()`.
+    hardLimitOre: resolveCostHardLimitOre(process.env["JARVIS_COST_HARD_LIMIT_ORE"]),
     tenantIds: watchdogTenantIds,
     // Ordrepunkt B: EKSPLISITT, deterministisk aktør - SAMME
     // `ownerControlAuthority.owner_person_id` som `killSwitch` selv er

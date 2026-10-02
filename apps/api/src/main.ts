@@ -1,5 +1,7 @@
 // .ts-utvidelser kreves: filene kjøres direkte med Nodes type-stripping (ingen build-steg)
-import { envHour, envInt, envPort } from "@jarvis/contracts";
+import "./normalize-env.ts";
+import { envHour, envInt, envPort, systemIdentity } from "@jarvis/contracts";
+import { ownerConfigOrExit } from "./owner.ts";
 import {
   ChannelSessionAuthority,
   ContextBuilder,
@@ -38,7 +40,7 @@ import {
   OllamaAdapter,
   OpenAiAdapter
 } from "@jarvis/provider-adapters";
-import { InProcessWorker, PgTaskQueue, TaskService } from "@jarvis/tasks";
+import { InProcessWorker, PgTaskQueue, TaskService, allowedReposFromEnv } from "@jarvis/tasks";
 import {
   LlmExtractionAdapter,
   LocalHashEmbedding,
@@ -108,6 +110,8 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
   // JARVIS_DB_USER skal ALDRI stille falle tilbake til admin-tilkoblingen (root cause for
   // host-blockeren var nettopp dette - api kjørte som Postgres-superbruker).
   assertRuntimeCredentialsConfigured();
+  // Remediering del 2 (JARVIS-065): ÉN validert eier-identitet for hele prosessen (fail closed uten).
+  const owner = ownerConfigOrExit();
   const pool = createPool(configFromEnv());
   // Migrasjoner kjøres av admin-bruker i drift; her antas app-bruker å ha skjema fra før.
   if (process.env["JARVIS_DB_RUN_MIGRATIONS"] === "true") {
@@ -127,7 +131,7 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
   // FØR noe kan bruke dem, og `PolicyGateway.authorize()`/
   // `ToolGateway.execute()` bruker ALLTID de LIVE `*Durable()`-sjekkene
   // (aldri de rene synkrone), se `KillSwitch`/`OwnerControls` sine filhoder.
-  const ownerControlAuthority = { owner_person_id: process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias" };
+  const ownerControlAuthority = { owner_person_id: owner.owner_person_id };
   const killSwitch = new KillSwitch(pool, ownerControlAuthority);
   await killSwitch.restore();
   const ownerControls = new OwnerControls(killSwitch, pool, ownerControlAuthority);
@@ -151,7 +155,7 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
   const infraGate = new InfraExecutionGate();
   const infraToolIds = new Set(["github", "docker"]);
   // Enhetsregister fra databasen (fase 8): godkjenninger verifiseres mot registrerte enhetsnøkler.
-  const deviceRegistry = new PgDeviceRegistry(pool, process.env["JARVIS_TENANT_ID"] ?? "tenant-personal");
+  const deviceRegistry = new PgDeviceRegistry(pool, owner.tenant_id);
   // D-222: tidligere `.catch(() => undefined)` på begge steder - en vedvarende
   // refresh-feil (DB nede, skjemadrift) ville latt policy-autorisasjon kjøre
   // mot et stille voksende UTDATERT enhetsregister på ubestemt tid, uten NOEN
@@ -184,8 +188,8 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     // for owner gir SOVEREIGN autonom utførelse; sikkerheten ligger i D-pipelinen
     // (preflight/readback/evidens/recovery) + owner-kontrollene, ikke approval.
     authority: {
-      owner_person_id: process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias",
-      owner_tenants: [process.env["JARVIS_TENANT_ID"] ?? "tenant-personal"]
+      owner_person_id: owner.owner_person_id,
+      owner_tenants: [owner.tenant_id]
     }
   });
   const queue = new PgTaskQueue(pool);
@@ -484,11 +488,8 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     new PgGithubRateLimitStore(pool), "JARVIS_GITHUB_TOKEN",
     (event) => console.warn(`[github-rate-limit] ${event.transition} -> ${event.state}${event.retryAt ? ` retry_at=${event.retryAt.toISOString()} source=${event.source}` : ""}`)
   );
-  const ownerIdentity = {
-    person_id: "person-tobias", tenant_id: process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
-    memory_space_id: "personal", session_id: "sess-brief", device_id: "jarvis-core",
-    channel: "api", auth_strength: "active"
-  } as const;
+  // Remediering del 2 (JARVIS-065): systemidentitet med unik sesjons-id per oppstart (ingen falsk fast `sess-brief`).
+  const ownerIdentity = systemIdentity(owner, "brief", { channel: "api" });
   // UA-10 P1 AKTIVERING (D-160): Situation Engine kobles til komposisjons-
   // roten for FØRSTE gang (P0 lot den bevisst stå ukoblet til det fantes en
   // reell kaller - den finnes nå: `situation-sweep`-jobben lenger ned).
@@ -540,7 +541,7 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
   // `SelfModificationService.proposeCodeChange()` under - ALDRI to parallelle
   // `TaskService`-konstruksjoner mot samme pool. Hevet hit (tidligere lenger ned)
   // FORDI selfModificationService (rett under) nå trenger den ved konstruksjon.
-  const taskService = new TaskService(pool, queue, policy);
+  const taskService = new TaskService(pool, queue, policy, { codingRepoAllowlist: allowedReposFromEnv(process.env) });
   // D-125/task #123 (D-214): `sendTelegram` hevet hit (tidligere lenger ned, kun
   // brukt av Telegram-pollerens svarbane/DailyScheduler) - `SelfModificationService`
   // sin nye owner-varsling (se `notify` under) trenger DEN SAMME, allerede
@@ -794,7 +795,7 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     // apps/browser-gateway sin egen prosess) leses via credential_ref inni
     // ToolGateway sin secret-provider-kjede, ALDRI konstruktør-parameter
     // (se browser-transport.ts).
-    browser: new BrowserGatewayTransport(),
+    browser: new BrowserGatewayTransport(process.env["JARVIS_BROWSER_GATEWAY_TOKEN_SECRET"] ?? ""),
     // UA-7 Communications Hub - foerste slice (D-119): eget
     // `conversation_graph.*`-namespace. D-119 FINAL AUTHORITY HARDENING:
     // denne transporten MOTTAR og KREVER `ToolInvocationContext` (D-68) -
@@ -840,6 +841,7 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
       ...ownerControlsToolDefinitions(new OwnerControlsTransport(new OwnerControlsService(killSwitch, ownerControls, {
         pool,
         grants: grantService,
+        devices: new DeviceService(pool),
         authority: ownerControlAuthority
       }), toolGateway)),
       // UA-11 Executive Mode "K2" (D-64): decision log/scenarios/risk register/
@@ -966,6 +968,9 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     personality: loadPersonalityConfig
   });
   const deps: ApiDeps = {
+    // Del 2 (JARVIS-065): den validerte eier-identiteten fyller visningsfeltene i /chat, /dashboard og /voice
+    // (aldri autoritet - den kommer fra et verifisert grant). Uten denne svarer sidene 503 `owner_not_configured`.
+    owner: { tenant_id: owner.tenant_id, person_id: owner.owner_person_id },
     identity: identityService,
     devices: deviceService,
     grants: grantService,
@@ -1070,8 +1075,8 @@ porter: se docs/RUNTIME_GATES.md`;
       { sessions: sessionService, identity: identityService },
       {
         owner_chat_id: process.env["JARVIS_TELEGRAM_CHAT_ID"],
-        tenant_id: process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
-        person_id: process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias",
+        tenant_id: owner.tenant_id,
+        person_id: owner.owner_person_id,
         // Tjeneste-enheten denne prosessen allerede ER seedet som.
         device_id: "jarvis-core",
         memory_space: "personal"
@@ -1195,7 +1200,7 @@ porter: se docs/RUNTIME_GATES.md`;
   ).start(async () => {
     if (!isWeeklyBriefDay(new Date(), "Europe/Oslo", envInt("JARVIS_BUSINESS_WEEKLY_BRIEF_WEEKDAY", 1, { min: 0, max: 7 }))) return;
     const result = await runBusinessWeeklyBriefForAllTenants(pool, toolGateway, (tenantId) => ({
-      ...ownerIdentity, tenant_id: tenantId, memory_space_id: "business", session_id: "sess-business-weekly-brief"
+      ...ownerIdentity, tenant_id: tenantId, memory_space_id: "business", session_id: `${ownerIdentity.session_id}-weekly-brief`
     }));
     if (result.errors.length > 0) {
       console.error(JSON.stringify({ msg: "business_weekly_brief_failed", errors: result.errors }));
@@ -1229,7 +1234,7 @@ porter: se docs/RUNTIME_GATES.md`;
     engine: situationEngine,
     gateway: toolGateway,
     identityFor: (tenantId, memorySpace) => ({
-      ...ownerIdentity, tenant_id: tenantId, memory_space_id: memorySpace, session_id: "sess-situation-sweep"
+      ...ownerIdentity, tenant_id: tenantId, memory_space_id: memorySpace, session_id: `${ownerIdentity.session_id}-situation-sweep`
     })
   }).then(assertSituationSweepHealthy));
   // UA-3 business-event-linkage (D-57) §19/§20/§21: periodisk Gmail/Calendar->

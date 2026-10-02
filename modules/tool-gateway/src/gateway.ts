@@ -412,7 +412,9 @@ export class ToolGateway {
         capability_class: definition.capability_class,
         parameters: request.parameters
       },
-      ...(request.approval !== undefined ? { approval: request.approval } : {})
+      ...(request.approval !== undefined ? { approval: request.approval } : {}),
+      // JARVIS-051: noncen forbrukes FØRST rett før handlingen, etter alle ortogonale porter.
+      deferNonceConsumption: true
     });
     if (decision.decision !== "ALLOW") {
       return this.deny(request, decision.reason);
@@ -529,6 +531,15 @@ export class ToolGateway {
         if (definition.capability_class === "D") {
           return this.deny(request, `preflight_failed:${(err as Error).message.slice(0, 60)}`);
         }
+      }
+    }
+
+    // JARVIS-051: alle ortogonale porter (parameter, rate limit, frys, credential,
+    // preflight) har passert - FØRST NÅ brennes godkjenningens engangs-nonce.
+    if (decision.commit) {
+      const committed = await decision.commit();
+      if (!committed.ok) {
+        return this.deny(request, committed.reason);
       }
     }
 

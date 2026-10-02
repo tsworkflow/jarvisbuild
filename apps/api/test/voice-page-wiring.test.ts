@@ -27,14 +27,16 @@ describe("A: GET /voice serverer apps/web/voice.html, samme mønster som GET /da
   it('ruten sjekker GET og url.pathname === "/voice" FØR den leser WEB_VOICE', () => {
     const routeIdx = serverSource.indexOf('url.pathname === "/voice"');
     expect(routeIdx).toBeGreaterThan(-1);
-    const readIdx = serverSource.indexOf("readFile(WEB_VOICE", routeIdx);
+    const readIdx = serverSource.indexOf("sendStaticPage(res, WEB_VOICE", routeIdx);
     expect(readIdx).toBeGreaterThan(routeIdx);
   });
 
   it("svarer med text/html; charset=utf-8, samme som WEB_INDEX/WEB_DASHBOARD-rutene", () => {
     const routeIdx = serverSource.indexOf('url.pathname === "/voice"');
     const block = serverSource.slice(routeIdx, serverSource.indexOf("return;", routeIdx));
-    expect(block).toContain('"content-type": "text/html; charset=utf-8"');
+    // Remediering del 2: headerne settes nå sentralt i `staticPageHeaders()` (CSP/nonce/rammebeskyttelse) for ALLE sider.
+    expect(block).toContain("sendStaticPage(");
+    expect(serverSource).toContain('"content-type": "text/html; charset=utf-8"');
   });
 });
 

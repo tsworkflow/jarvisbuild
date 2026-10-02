@@ -3,7 +3,10 @@ import type pg from "pg";
 import type { IdentityContext } from "@jarvis/contracts";
 import { withTenantTransaction } from "@jarvis/core";
 import type { PolicyGateway } from "@jarvis/policy";
-import { createGitAuthHandle, GIT_CREDENTIAL_ISOLATION_ARGS } from "./git-auth.ts";
+import { createGitAuthHandle, GIT_CREDENTIAL_ISOLATION_ARGS, githubCredentialScope } from "./git-auth.ts";
+import {
+  GIT_HARDENING_ARGS, GIT_LOCAL_HARDENING_ARGS, GitPolicyError, assertJobBranch, assertRepoAllowed, assertTestCommand
+} from "./git-policy.ts";
 import { publishPullRequestForCodingJob, type PrPublishingGateway } from "./pr-publisher.ts";
 import type { SandboxRunner } from "./sandbox.ts";
 import type { TaskHandler } from "./worker.ts";
@@ -187,6 +190,12 @@ export function createCodingHandler(deps: {
    * bare-repo-tester som ikke trenger nettverksautentisering).
    */
   gitAuth?: { secretProvider: { get(ref: string): Promise<string | null> }; ref?: string };
+  /**
+   * Remediering del 2 (JARVIS-064): eksakt allowlist av `owner/repo` (små bokstaver) git-credentialen kan brukes mot.
+   * PÅKREVD når `gitAuth` er satt - tom/manglende liste feiler lukket (`git_repo_allowlist_empty`). `repo_url` må være
+   * eksakt `https://github.com/<owner>/<repo>`; credentialen utleveres kun til github.com + dette ene repoet.
+   */
+  allowedRepos?: readonly string[];
 }): TaskHandler {
   return async (task, ctx) => {
     const input = task.contract.input.data as { repo_url?: string; test_command?: string[] };
@@ -196,6 +205,32 @@ export function createCodingHandler(deps: {
     const branch = `jarvis/${task.task_id}`;
     if (PROTECTED_BRANCHES.has(branch)) {
       throw new Error("protected_branch_refused");
+    }
+    // Remediering del 2 (JARVIS-009/063/064): all jobb-input valideres i kode FØR policy/credential/sandbox.
+    let cloneUrl: string;
+    let credentialSlug: string | undefined;
+    let testCmd: string[];
+    try {
+      assertJobBranch(branch);
+      if (deps.gitAuth) {
+        // Med credential: kun eksakt `https://github.com/<allowlistet owner/repo>` - aldri en fremmed vert/transport.
+        const ref = assertRepoAllowed(input.repo_url, deps.allowedRepos ?? []);
+        cloneUrl = ref.canonicalUrl;
+        credentialSlug = ref.slug;
+      } else {
+        // Uten credential (lokale/test-repoer): ingen option-injeksjon (`--upload-pack=...`) og ingen `ext::`-transport.
+        // eslint-disable-next-line no-control-regex
+        if (input.repo_url.startsWith("-") || /^ext::/i.test(input.repo_url) || /[\u0000-\u001f]/.test(input.repo_url)) {
+          throw new GitPolicyError("repo_url_invalid");
+        }
+        cloneUrl = input.repo_url;
+      }
+      const requested = input.test_command;
+      // Ingen/tom testkommando = Jarvis' EGEN interne standard (ikke kontraktstyrt). Alt kontraktstyrt må være en kjent testløper.
+      testCmd = Array.isArray(requested) && requested.length > 0 ? assertTestCommand(requested) : ["node", "-e", "process.exit(0)"];
+    } catch (err) {
+      if (err instanceof GitPolicyError) throw new Error(`coding_input_rejected:${err.reason}`);
+      throw err;
     }
 
     // Policy-mandat for utgående push (klasse C) - delegert agent omgår aldri policy.
@@ -228,7 +263,7 @@ export function createCodingHandler(deps: {
       if (!token) {
         throw new Error("git_auth_unavailable");
       }
-      gitAuth = await createGitAuthHandle(token);
+      gitAuth = await createGitAuthHandle(token, githubCredentialScope(credentialSlug as string));
     }
 
     try {
@@ -240,7 +275,9 @@ export function createCodingHandler(deps: {
       // direkte med gitAuth?.env som fjerde argument - dette er den ENESTE
       // veien token-verdien noensinne når et git-underprosess-env, og den når
       // ALDRI `run` (og dermed ALDRI `ClaudeCodeAgent`s eget exec-kall).
-      const run: CodingAgentExec = (cmd, args, timeoutMs) => sandbox.exec(cmd, args, timeoutMs);
+      const run: CodingAgentExec = (cmd, args, timeoutMs) =>
+        sandbox.exec(cmd, cmd === "git" ? [...GIT_LOCAL_HARDENING_ARGS, ...args] : args, timeoutMs);
+      const localGit = (args: string[]) => sandbox.exec("git", [...GIT_LOCAL_HARDENING_ARGS, ...args]);
       const must = (label: string, result: { code: number; stderr?: string }) => {
         if (result.code !== 0) {
           throw new Error(`${label}_failed: ${result.stderr ?? ""}`.slice(0, 300));
@@ -256,16 +293,17 @@ export function createCodingHandler(deps: {
       // full begrunnelse (v2 erstattet den tidligere GIT_ASKPASS-mekanismen
       // etter en ekte Windows-spawn-feil). Uten gitAuth (default) er argv-et
       // 100% uendret fra før denne fiksen.
+      // REMEDIERING DEL 2: nettverkskall får i tillegg GIT_HARDENING_ARGS (hooks av, kun https, ingen redirect-følging,
+      // ingen submoduler) og credential-scopet (host + repo) - se git-policy.ts / git-auth.ts.
       const netArgs = (args: string[]): string[] =>
-        (gitAuth ? [...GIT_CREDENTIAL_ISOLATION_ARGS, ...gitAuth.credentialHelperArgs, ...args] : args);
-      must("clone", sandbox.exec("git", netArgs(["clone", input.repo_url, "."]), undefined, gitAuth?.env));
+        (gitAuth ? [...GIT_CREDENTIAL_ISOLATION_ARGS, ...gitAuth.credentialHelperArgs, ...GIT_HARDENING_ARGS, ...args] : ["-c", "core.hooksPath=/dev/null", "-c", "protocol.ext.allow=never", ...args]);
+      must("clone", sandbox.exec("git", netArgs(["clone", "--", cloneUrl, "."]), undefined, gitAuth?.env));
       await ctx.assertNotCancelled();
       must("branch", run("git", ["checkout", "-b", branch]));
       const description = await deps.agent.modify(run, task.contract.goal);
       await ctx.saveCheckpoint({ step: "modified", branch });
       await ctx.assertNotCancelled();
 
-      const testCmd = input.test_command ?? ["node", "-e", "process.exit(0)"];
       const testResult = sandbox.exec(testCmd[0] as string, testCmd.slice(1));
       await deps.artifacts.save(task.tenant_id, task.task_id, "test-log", "tests.txt",
         `exit=${testResult.code}\n${testResult.stdout}\n${testResult.stderr}`);
@@ -275,14 +313,14 @@ export function createCodingHandler(deps: {
       // korrekt og ærlig ikke gjorde noen endring (f.eks. fordi den ikke
       // hadde grunnlag for å gjette en verdi) skal ALDRI tvinges gjennom en
       // tom commit eller få dette fremstilt som en git-/harness-mekanikk-feil.
-      const status = sandbox.exec("git", ["status", "--porcelain"]);
+      const status = localGit(["status", "--porcelain"]);
       if (status.stdout.trim().length === 0) {
         throw new Error(NO_CHANGES_TO_COMMIT_LABEL);
       }
       must("add", run("git", ["add", "-A"]));
       must("commit", run("git", ["commit", "-m", `jarvis: ${task.contract.goal}`]));
       const commitSha = run("git", ["rev-parse", "HEAD"]).stdout.trim();
-      const diff = sandbox.exec("git", ["show", "--stat", "HEAD"]);
+      const diff = localGit(["show", "--stat", "HEAD"]);
       await deps.artifacts.save(task.tenant_id, task.task_id, "patch", "change.txt", diff.stdout);
       // D-103 §13: kansellering FØR push - den nyeste, første EKSTERNE
       // sideeffekten (en ekte branch synlig på GitHub) skal ALDRI skje etter

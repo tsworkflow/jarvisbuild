@@ -160,6 +160,19 @@ describe("Akseptanse 4 + delegeringskontrakt", () => {
     expect(valid.ok).toBe(true);
   });
 
+  it("Arkitekt-review (P1): kontrakt med en ANNEN owner_person_id enn grant-personen avvises FØR kø, med audit", async () => {
+    const forged = contract({ owner_person_id: "person-eier-som-ikke-er-meg", goal: "skal ikke i køen: forged owner" });
+    const result = await tasks.submit({ ...identity, person_id: "person-delegat" }, forged);
+    expect(result.ok).toBe(false);
+    expect((result as { reason: string }).reason).toBe("owner_mismatch");
+    const queued = await adminPool.query("SELECT 1 FROM tasks WHERE task_id = $1", [forged.task_id]);
+    expect(queued.rowCount).toBe(0);
+    const audit = await adminPool.query("SELECT 1 FROM audit_events WHERE type = 'task.rejected' AND reason = 'owner_mismatch' AND payload->>'task_id' = $1", [forged.task_id]);
+    expect(audit.rowCount).toBe(1);
+    // samme kontrakt med EIERENS egen identitet godtas
+    expect((await tasks.submit(identity, contract({ goal: "eier sender sin egen jobb" }))).ok).toBe(true);
+  });
+
   it("untrusted jobb med privat minne + utgående nettverk avvises strukturelt", async () => {
     const attack = contract({
       input: { data: {}, trust_level: "untrusted", provenance: "ukjent-dokument" },

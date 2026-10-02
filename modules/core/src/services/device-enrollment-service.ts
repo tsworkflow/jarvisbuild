@@ -1,4 +1,4 @@
-import { createHash, createPublicKey, randomBytes } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import type pg from "pg";
 import {
   DeviceEnrollmentRequestSchema,
@@ -7,7 +7,9 @@ import {
 } from "@jarvis/contracts";
 import { withTenantTransaction } from "../db/pool.ts";
 import { writeAudit } from "./audit-writer.ts";
-import type { DeviceService } from "./device-service.ts";
+import {
+  RevokedDeviceKeyError, UnsupportedDeviceKeyError, assertEd25519PublicKeyPem, type DeviceService
+} from "./device-service.ts";
 import type { SessionGrantService } from "./session-grant-service.ts";
 
 /**
@@ -117,9 +119,11 @@ export class DeviceEnrollmentService {
     // Valider nøkkelmaterialet FØR noe annet: en ugyldig PEM skal aldri komme
     // så langt som til å konsumere en billett eller en nonce.
     try {
-      createPublicKey(request.device.public_key_pem);
-    } catch {
-      return { ok: false, reason: "invalid_public_key" };
+      assertEd25519PublicKeyPem(request.device.public_key_pem);
+    } catch (err) {
+      // JARVIS-051: kun Ed25519 kan verifisere noe som helst - en RSA-enhet skal avvises HER,
+      // ikke først som en forvirrende «ugyldig signatur» ved bruk.
+      return { ok: false, reason: err instanceof UnsupportedDeviceKeyError ? "unsupported_key_type" : "invalid_public_key" };
     }
 
     // (a) Enhetsbeviset kjøres FØR transaksjonen, av samme grunn som i
@@ -200,6 +204,16 @@ export class DeviceEnrollmentService {
           }
         }
 
+        // JARVIS-050: en tilbakekalt enhet kan ALDRI rulles inn igjen - heller ikke med samme nøkkel
+        // under en ny device_id. Sjekkes FØR billett-konsumering skriver noe varig (hele
+        // transaksjonen rulles likevel tilbake ved avslag).
+        if (await this.deps.devices.isDeviceRevokedOn(client, request.tenant_id, request.device.device_id)) {
+          throw new EnrollmentDenial("device_revoked");
+        }
+        if (await this.deps.devices.isKeyRevokedOn(client, request.tenant_id, request.device.public_key_pem)) {
+          throw new EnrollmentDenial("key_revoked");
+        }
+
         // Rotasjon vs. førstegangs-innrullering skilles KUN for revisjon og for
         // svaret - begge krever nøyaktig samme autoritet.
         const existing = await client.query(
@@ -208,7 +222,13 @@ export class DeviceEnrollmentService {
         );
         const rotated = Boolean((existing.rows[0] as { public_key_pem: string | null } | undefined)?.public_key_pem);
 
-        const written = await this.deps.devices.registerDeviceOn(client, request, request.device);
+        let written: boolean;
+        try {
+          written = await this.deps.devices.registerDeviceOn(client, request, request.device);
+        } catch (err) {
+          if (err instanceof RevokedDeviceKeyError) throw new EnrollmentDenial("key_revoked");
+          throw err;
+        }
         if (!written) {
           throw new EnrollmentDenial("device_owned_by_other_principal");
         }

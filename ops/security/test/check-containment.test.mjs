@@ -45,15 +45,15 @@ describe("compose-porter: åpne publiseringer avvises", () => {
   it("godtar kun loopback (kort og lang syntaks)", () => {
     const ok = compose(
       svc("postgres", `    image: pgvector/pgvector:pg16${DIGEST}\n    ports:\n      - "127.0.0.1:\${JARVIS_DB_PORT:-5432}:5432"\n      - "[::1]:5433:5432"\n`) +
-        svc("api", `    image: x/y:1${DIGEST}\n    ports:\n      - target: 3010\n        published: 3010\n        host_ip: 127.0.0.1\n`)
+        svc("api", `    <<: *hardening\n    image: x/y:1${DIGEST}\n    ports:\n      - target: 3010\n        published: 3010\n        host_ip: 127.0.0.1\n`)
     );
     expect(checkCompose(ok)).toEqual([]);
   });
 
   it("lang syntaks uten host_ip, eller med 0.0.0.0, avvises", () => {
-    const noIp = compose(svc("api", `    image: x/y:1${DIGEST}\n    ports:\n      - target: 3010\n        published: 3010\n`));
+    const noIp = compose(svc("api", `    <<: *hardening\n    image: x/y:1${DIGEST}\n    ports:\n      - target: 3010\n        published: 3010\n`));
     expect(checkCompose(noIp).join("\n")).toContain("ALL interfaces");
-    const wide = compose(svc("api", `    image: x/y:1${DIGEST}\n    ports:\n      - target: 3010\n        published: 3010\n        host_ip: 0.0.0.0\n`));
+    const wide = compose(svc("api", `    <<: *hardening\n    image: x/y:1${DIGEST}\n    ports:\n      - target: 3010\n        published: 3010\n        host_ip: 0.0.0.0\n`));
     expect(checkCompose(wide).join("\n")).toContain("0.0.0.0");
   });
 
@@ -90,10 +90,10 @@ describe("compose-porter: åpne publiseringer avvises", () => {
 
 describe("Dockerfile-baseimages", () => {
   it("flytende FROM avvises; digest og stage-referanser godtas", () => {
-    expect(checkDockerfile("FROM node:22-alpine\n", "x.Dockerfile")).toHaveLength(1);
-    expect(checkDockerfile(`FROM node:22-alpine${DIGEST}\n`, "x.Dockerfile")).toEqual([]);
-    expect(checkDockerfile(`FROM debian:bookworm-slim${DIGEST} AS build\nFROM build AS final\nFROM scratch\n`, "x.Dockerfile")).toEqual([]);
-    expect(checkDockerfile(`FROM debian:bookworm-slim${DIGEST} AS build\nFROM node:22 AS runtime\n`, "x.Dockerfile")).toHaveLength(1);
+    expect(checkDockerfile("FROM node:22-alpine\nUSER node\n", "x.Dockerfile")).toHaveLength(1);
+    expect(checkDockerfile(`FROM node:22-alpine${DIGEST}\nUSER node\n`, "x.Dockerfile")).toEqual([]);
+    expect(checkDockerfile(`FROM debian:bookworm-slim${DIGEST} AS build\nFROM build AS final\nUSER 1000\n`, "x.Dockerfile")).toEqual([]);
+    expect(checkDockerfile(`FROM debian:bookworm-slim${DIGEST} AS build\nFROM node:22 AS runtime\nUSER node\n`, "x.Dockerfile")).toHaveLength(1);
   });
 });
 
@@ -147,5 +147,48 @@ describe(".env.example og scratch-image", () => {
     expect(checkScratchImageMatchesCompose(c, `IMAGE="pgvector/pgvector:pg16${DIGEST}"\n`)).toEqual([]);
     expect(checkScratchImageMatchesCompose(c, `IMAGE="pgvector/pgvector:pg16@sha256:${"b".repeat(64)}"\n`)).toHaveLength(1);
     expect(checkScratchImageMatchesCompose(c, "")).toHaveLength(1);
+  });
+});
+
+describe("Del 2: isolasjon (JARVIS-009/010/011) - strukturelle invarianter", () => {
+  const hardened = "    <<: *hardening\n";
+  it("avviser env_file, cap_add, unconfined seccomp og root-user", () => {
+    for (const extra of ["    env_file: [../../.env]\n", "    cap_add: [SYS_ADMIN]\n", "    security_opt: [seccomp=unconfined]\n", "    user: root\n"]) {
+      const v = checkCompose(compose(svc("api", `${hardened}${extra}`)));
+      expect(v.length, extra).toBeGreaterThan(0);
+    }
+  });
+  it("cap_add: kun SYS_CHROOT på browser-gateway (D-365); alt annet avvises", () => {
+    const b = (extra) => checkCompose(compose(svc("browser-gateway", `${hardened}    networks: [browser]\n${extra}`)));
+    expect(b('    cap_add: ["SYS_CHROOT"]\n')).toEqual([]);
+    expect(b("    cap_add:\n      - SYS_CHROOT\n")).toEqual([]);
+    expect(b('    cap_add: ["SYS_ADMIN"]\n').length).toBeGreaterThan(0);
+    expect(b('    cap_add: ["SYS_CHROOT", "NET_ADMIN"]\n').length).toBeGreaterThan(0);
+    expect(b("    cap_add:\n      - SYS_CHROOT\n      - SYS_ADMIN\n").length).toBeGreaterThan(0);
+    // SYS_CHROOT er ikke et generelt unntak: andre tjenester får ikke legge den til.
+    expect(checkCompose(compose(svc("api", `${hardened}    cap_add: ["SYS_CHROOT"]\n`))).length).toBeGreaterThan(0);
+  });
+  it("krever herding på api/worker/migrate/voice/browser", () => {
+    const v = checkCompose(compose(svc("worker", "    command: [node]\n")));
+    expect(v.some((x) => x.includes("drop all capabilities"))).toBe(true);
+    expect(v.some((x) => x.includes("no-new-privileges"))).toBe(true);
+    expect(v.some((x) => x.includes("read-only"))).toBe(true);
+    expect(checkCompose(compose(svc("worker", hardened)))).toEqual([]);
+  });
+  it("browser-gateway kan kun ligge på browser-nettverket", () => {
+    const body = `${hardened}    networks: [core, browser]\n`;
+    expect(checkCompose(compose(svc("browser-gateway", body))).some((x) => x.includes("ONLY"))).toBe(true);
+    expect(checkCompose(compose(svc("browser-gateway", `${hardened}    networks: [browser]\n`)))).toEqual([]);
+  });
+  it("vault/DB-admin-hemmeligheter nektes i api/worker/voice/browser", () => {
+    for (const name of ["api", "worker", "voice-gateway", "browser-gateway"]) {
+      const v = checkCompose(compose(svc(name, `${hardened}    environment:\n      INFISICAL_ENCRYPTION_KEY: x\n`)));
+      expect(v.some((x) => x.includes("INFISICAL_ENCRYPTION_KEY")), name).toBe(true);
+    }
+  });
+  it("Dockerfile uten (eller med root) USER avvises", () => {
+    expect(checkDockerfile(`FROM node:22${DIGEST}\n`, "x.Dockerfile")).toHaveLength(1);
+    expect(checkDockerfile(`FROM node:22${DIGEST}\nUSER root\n`, "x.Dockerfile")).toHaveLength(1);
+    expect(checkDockerfile(`FROM node:22${DIGEST}\nUSER node\n`, "x.Dockerfile")).toEqual([]);
   });
 });

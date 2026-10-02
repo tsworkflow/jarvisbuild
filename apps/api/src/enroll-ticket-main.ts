@@ -23,7 +23,7 @@
 //   node --experimental-transform-types src/enroll-ticket-main.ts \
 //     [--tenant <id>] [--person <id>] [--device <id>] [--ttl-minutes <n>] [--path <side>]
 //
-// Uten flagg brukes de SAMME defaultene som `seedOwner()`
+// Uten flagg brukes SAMME validerte eier-konfig som `seedOwner()`
 // (JARVIS_TENANT_ID / JARVIS_OWNER_PERSON_ID).
 //
 // D-347: `--path` velger hvilken side den klikkbare lenken peker til
@@ -35,6 +35,7 @@
 // billetten konsumeres fra). Flagget finnes for å kunne peke lenken direkte
 // til siden eieren faktisk trenger akkurat da (f.eks. `--path dashboard`),
 // uten en ekstra manuell navigering etter innrullering.
+import { ownerConfigOrExit } from "./owner.ts";
 import { adminConfigFromEnv, createEnrollmentTicket, createPool } from "@jarvis/core";
 
 function flag(name: string): string | undefined {
@@ -42,8 +43,10 @@ function flag(name: string): string | undefined {
   return index >= 0 ? process.argv[index + 1] : undefined;
 }
 
-const tenantId = flag("tenant") ?? process.env["JARVIS_TENANT_ID"] ?? "tenant-personal";
-const personId = flag("person") ?? process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias";
+// Remediering del 2 (JARVIS-065): eier fra validert konfig (fail closed uten); flagg kan overstyre KUN eksplisitt.
+const ownerConfig = ownerConfigOrExit();
+const tenantId = flag("tenant") ?? ownerConfig.tenant_id;
+const personId = flag("person") ?? ownerConfig.owner_person_id;
 const deviceId = flag("device");
 const targetPath = (flag("path") ?? "voice").replace(/^\/+/, "");
 const ttlRaw = flag("ttl-minutes");

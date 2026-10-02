@@ -1,3 +1,4 @@
+import { createHash, createHmac, pbkdf2Sync, randomBytes } from "node:crypto";
 import type pg from "pg";
 
 /**
@@ -24,6 +25,24 @@ function quoteIdent(value: string): string {
 
 function quoteLiteral(value: string): string {
   return `'${value.replace(/'/g, "''")}'`;
+}
+
+/**
+ * Remediering del 2 (JARVIS-076): Postgres kan ta et ferdig SCRAM-SHA-256-verifier i `PASSWORD '...'`. Da havner
+ * ALDRI klartekstpassordet i DDL-setningen (server-logg med `log_statement`, `pg_stat_statements`, feilmeldinger).
+ * Format: `SCRAM-SHA-256$<iter>:<salt b64>$<StoredKey b64>:<ServerKey b64>` (RFC 5802/7677). Kun ASCII-passord
+ * (SASLprep-normalisering av ikke-ASCII er bevisst ikke reimplementert) - andre faller tilbake til literal.
+ */
+export function scramSha256Verifier(password: string, salt: Buffer = randomBytes(16), iterations = 4096): string {
+  const salted = pbkdf2Sync(password, salt, iterations, 32, "sha256");
+  const clientKey = createHmac("sha256", salted).update("Client Key").digest();
+  const storedKey = createHash("sha256").update(clientKey).digest();
+  const serverKey = createHmac("sha256", salted).update("Server Key").digest();
+  return `SCRAM-SHA-256$${iterations}:${salt.toString("base64")}$${storedKey.toString("base64")}:${serverKey.toString("base64")}`;
+}
+
+function passwordLiteral(password: string): string {
+  return /^[\u0020-\u007e]+$/.test(password) ? quoteLiteral(scramSha256Verifier(password)) : quoteLiteral(password);
 }
 
 export interface RuntimeRoleConfig {
@@ -60,7 +79,7 @@ export async function ensureRuntimeRole(adminPool: pg.Pool, runtime: RuntimeRole
   }
 
   const ident = quoteIdent(runtime.user);
-  const lit = quoteLiteral(runtime.password);
+  const lit = passwordLiteral(runtime.password);
 
   const exists = await adminPool.query("SELECT 1 FROM pg_roles WHERE rolname = $1", [runtime.user]);
   if (exists.rowCount === 0) {

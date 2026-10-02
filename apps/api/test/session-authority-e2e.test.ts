@@ -323,7 +323,7 @@ describe("G: forsøk på å smugle auth_strength/session_id inn i bevismateriale
     expect(body["reason"]).toBe("grant_not_found");
   });
 
-  it("/chat med en RÅ sesjons-ID (ikke et grant) → 400 malformed_request, aldri en oppgradering til signed", async () => {
+  it("/chat med en RÅ sesjons-ID (ikke et grant) → 400 identity_field_forbidden, aldri en oppgradering til signed", async () => {
     // D-131 funn 1 i sin reneste form: en gyldig, aktiv sesjons-ID er
     // SAMTALEKONTINUITET. Den skal ikke engang være en gyldig kropp lenger.
     const challenge = await challengeFor("dev-sa-web");
@@ -340,6 +340,6 @@ describe("G: forsøk på å smugle auth_strength/session_id inn i bevismateriale
       body: JSON.stringify({ session_id: realSessionId, tenant_id: TENANT_A, memory_space: "personal", channel: "web", message: "hei" })
     });
     expect(res.status).toBe(400);
-    expect(((await res.json()) as Record<string, unknown>)["error"]).toBe("malformed_request");
+    expect(((await res.json()) as Record<string, unknown>)["error"]).toBe("identity_field_forbidden");
   });
 });

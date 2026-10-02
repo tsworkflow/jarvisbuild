@@ -96,7 +96,7 @@ beforeAll(async () => {
   git(seed, "init", "--initial-branch=main", ".");
   git(seed, "config", "user.email", "seed@test");
   git(seed, "config", "user.name", "seed");
-  spawnSync("node", ["-e", "require('fs').writeFileSync('README.md','# repo')"], { cwd: seed });
+  spawnSync("node", ["-e", "const fs=require('fs');fs.writeFileSync('README.md','# repo');fs.writeFileSync('pass.js','process.exit(0)');fs.writeFileSync('fail.js','process.exit(1)')"], { cwd: seed });
   git(seed, "add", "-A");
   git(seed, "commit", "-m", "init");
   git(seed, "push", bareRepo, "main");
@@ -130,7 +130,7 @@ describe("D-104 Part C: incident -> DEN KANONISKE testet-fiks-pipelinen (EKTE Po
     const incident = await incidents.createIncident(TENANT, "business", { title: "produksjonsfeil krever fiks" });
 
     const result = await proposeRepairTask({ taskService, pool: appPool, incidents }, identity, "business", incident, {
-      repo_url: GITHUB_SHAPED_URL, goal: "fiks produksjonsfeilen", test_command: ["node", "-e", "process.exit(0)"]
+      repo_url: GITHUB_SHAPED_URL, goal: "fiks produksjonsfeilen", test_command: ["node", "pass.js"]
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -158,7 +158,7 @@ describe("D-104 Part C: incident -> DEN KANONISKE testet-fiks-pipelinen (EKTE Po
     const incident = await incidents.createIncident(TENANT, "business", { title: "fiks som ikke bestaar tester" });
 
     const result = await proposeRepairTask({ taskService, pool: appPool, incidents }, identity, "business", incident, {
-      repo_url: GITHUB_SHAPED_URL, goal: "fiks noe", test_command: ["node", "-e", "process.exit(1)"]
+      repo_url: GITHUB_SHAPED_URL, goal: "fiks noe", test_command: ["node", "fail.js"]
     });
     expect(result.ok).toBe(true);
     if (!result.ok) return;
@@ -186,7 +186,7 @@ describe("D-104 Part C: incident -> DEN KANONISKE testet-fiks-pipelinen (EKTE Po
       return originalSubmit(id, contract);
     };
     const result = await proposeRepairTask({ taskService, pool: appPool, incidents }, identity, "business", incident, {
-      repo_url: GITHUB_SHAPED_URL, goal: "test", test_command: ["node", "-e", "process.exit(0)"]
+      repo_url: GITHUB_SHAPED_URL, goal: "test", test_command: ["node", "pass.js"]
     });
     expect(result.ok).toBe(true);
     expect(capturedContract?.agent_profile).toBe("coding");
@@ -205,7 +205,7 @@ describe("D-104 Part C: incident -> DEN KANONISKE testet-fiks-pipelinen (EKTE Po
     };
     await expect(
       proposeRepairTask({ taskService, pool: appPool, incidents }, identity, "business", fakeIncident, {
-        repo_url: GITHUB_SHAPED_URL, goal: "test", test_command: ["node", "-e", "process.exit(0)"]
+        repo_url: GITHUB_SHAPED_URL, goal: "test", test_command: ["node", "pass.js"]
       })
     ).rejects.toThrow();
   });

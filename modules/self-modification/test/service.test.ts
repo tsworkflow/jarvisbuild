@@ -326,7 +326,7 @@ describe("B: proposePersonalityChange - lykkes-banen", () => {
   it("B2: commit-meldingen inneholder identitetens person_id (proveniens)", async () => {
     const { service, sandbox } = buildService({});
     await service.proposePersonalityChange(ownerIdentity, { tone_descriptors: ["varm"], style_notes: "test" });
-    const commitCall = sandbox.lastSandbox!.calls.find((c) => c.command === "git" && c.args[0] === "commit");
+    const commitCall = sandbox.lastSandbox!.calls.find((c) => c.command === "git" && c.args.includes("commit"));
     expect(commitCall?.args.join(" ")).toContain(OWNER);
   });
 

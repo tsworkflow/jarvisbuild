@@ -1,4 +1,5 @@
 import type pg from "pg";
+import { serializeMemorySpaces } from "@jarvis/contracts";
 
 /**
  * RLS-kontekst-helpers for erasure (docs/DATA_ERASURE.md §3). Speiler
@@ -14,7 +15,7 @@ import type pg from "pg";
 export async function setSpaceContext(client: pg.PoolClient, tenantId: string, spaces: readonly string[]): Promise<void> {
   await client.query("SELECT set_config('jarvis.tenant_id', $1, true), set_config('jarvis.memory_spaces', $2, true)", [
     tenantId,
-    spaces.join(",")
+    serializeMemorySpaces(spaces)
   ]);
 }
 

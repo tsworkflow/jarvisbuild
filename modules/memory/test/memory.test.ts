@@ -59,7 +59,8 @@ beforeAll(async () => {
   const leasedPostgres = await startLeasedEmbeddedPostgres((port) =>
     new EmbeddedPostgres({
     databaseDir, user: "postgres", password: "test-superuser-pw", port, persistent: false
-  }),
+  })
+,
     // D-141 B: proben maa bruke instansens EGNE credentials.
     { identity: { user: "postgres", password: "test-superuser-pw", database: "postgres" } }
   );
@@ -83,9 +84,9 @@ beforeAll(async () => {
       ('person-tobias', 'tenant-a'), ('person-tobias', 'tenant-b');
     INSERT INTO devices (device_id, tenant_id, person_id, kind) VALUES
       ('dev-pc', 'tenant-a', 'person-tobias', 'pc');
-    INSERT INTO sessions (session_id, tenant_id, person_id, last_channel, last_device_id) VALUES
-      ('sess-mem', 'tenant-a', 'person-tobias', 'web', 'dev-pc'),
-      ('sess-ny-okt', 'tenant-a', 'person-tobias', 'web', 'dev-pc');
+    INSERT INTO sessions (session_id, tenant_id, person_id, last_channel, last_device_id, status) VALUES
+      ('sess-mem', 'tenant-a', 'person-tobias', 'web', 'dev-pc', 'active'),
+      ('sess-ny-okt', 'tenant-a', 'person-tobias', 'web', 'dev-pc', 'closed');
   `);
   appPool = createPool({
     host: "127.0.0.1", port: PORT, database: "jarvis_test", user: "jarvis_test", password: "test-app-pw"

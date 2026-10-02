@@ -1,4 +1,4 @@
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,7 @@ import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ApprovalPayload, IdentityContext, SignedApproval } from "@jarvis/contracts";
-import { approvalSigningBytes } from "@jarvis/contracts";
+import { signApproval } from "@jarvis/contracts";
 import { createPool, runMigrations } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { InMemoryDeviceRegistry, InMemoryNonceStore, KillSwitch, PolicyGateway } from "@jarvis/policy";
@@ -52,7 +52,8 @@ const DEVICE_ID = "watch-authority-1";
 
 const keys = generateKeyPairSync("ed25519");
 const devices = new InMemoryDeviceRegistry();
-devices.register(DEVICE_ID, keys.publicKey);
+// JARVIS-051: godkjenningsenheten tilhører EIEREN (eier-rolle) - delegaten ber om handlingen, eieren godkjenner.
+devices.register(DEVICE_ID, keys.publicKey, { tenant_id: TENANT_A, person_id: OWNER });
 
 function identityFor(personId: string, tenantId: string): IdentityContext {
   return {
@@ -61,17 +62,15 @@ function identityFor(personId: string, tenantId: string): IdentityContext {
   };
 }
 
-function signApproval(payload: ApprovalPayload): SignedApproval {
-  const signature = sign(null, approvalSigningBytes(payload), keys.privateKey).toString("base64");
-  return { ...payload, signature };
-}
-
-/** En godkjenning som eksakt matcher `email.send`-parametrene et gitt reply-kall faktisk sender. */
-function sendApprovalFor(input: { to: string; subject: string; body: string }, overrides: Partial<ApprovalPayload> = {}): SignedApproval {
-  return signApproval({
+/** En godkjenning som eksakt matcher `email.send`-parametrene et gitt reply-kall faktisk sender (bundet til tool/tenant/person/approver). */
+function sendApprovalFor(input: { to: string; subject: string; body: string }, overrides: Partial<Omit<ApprovalPayload, "parameters_hash">> = {}): SignedApproval {
+  return signApproval(keys.privateKey, {
+    tool_id: "email",
     action: "send",
+    tenant_id: TENANT_A,
+    person_id: DELEGATE,
+    approver_person_id: OWNER,
     parameters: { to: input.to, subject: input.subject, body: input.body },
-    expires_at: new Date(Date.now() + 60_000).toISOString(),
     nonce: `nonce-${randomUUID()}`,
     approving_device_id: DEVICE_ID,
     ...overrides

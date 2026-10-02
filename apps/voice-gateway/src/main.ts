@@ -1,3 +1,4 @@
+import "./normalize-env.ts";
 import { envPort } from "@jarvis/contracts";
 import { VoiceHealth } from "./health.ts";
 import { createVoiceGateway, HttpCoreClient } from "./server.ts";

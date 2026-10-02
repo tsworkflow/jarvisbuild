@@ -82,7 +82,14 @@ class CapturingRedirectingSandboxRunner implements SandboxRunner {
     return {
       workdir: sandbox.workdir,
       exec: (command: string, args: string[], timeoutMs?: number, extraEnv?: Record<string, string>): ExecResult => {
-        const rewritten = args.map((a) => (a === this.redirectFrom ? this.redirectTo : a));
+        let rewritten = args.map((a) => (a === this.redirectFrom ? this.redirectTo : a));
+        // Del 2: produksjons-hardening (`protocol.allow=never` + kun https) blokkerer et lokalt bare-repo. Test-harnessen
+        // omdirigerer github-URL-en til en filsti, så den åpner KUN `file`-protokollen rett før nettverkssubkommandoen.
+        // (push går mot `origin` = den lokale stien clone satte, så push omskrives ikke - derfor åpnes `file` for begge.)
+        if (command === "git") {
+          const idx = rewritten.findIndex((a) => a === "clone" || a === "push");
+          if (idx >= 0) rewritten = [...rewritten.slice(0, idx), "-c", "protocol.file.allow=always", ...rewritten.slice(idx)];
+        }
         this.calls.push({ command, args: rewritten, extraEnv });
         return sandbox.exec(command, rewritten, timeoutMs, extraEnv);
       },
@@ -110,6 +117,7 @@ function git(cwd: string, ...args: string[]): string {
 }
 
 const GITHUB_SHAPED_URL = "https://github.com/tsworkflow/jarvisbuild-d103-gitauth-test.git";
+const ALLOWED_REPO = "tsworkflow/jarvisbuild-d103-gitauth-test";
 
 beforeAll(async () => {
   const databaseDir = await mkdtemp(join(tmpdir(), "jarvis-pg-gitauth-"));
@@ -164,6 +172,7 @@ function runJob(sandbox: CapturingRedirectingSandboxRunner, gitAuthToken: string
   worker.register("coding", createCodingHandler({
     sandbox, agent: new WritingFakeAgent(), artifacts, policy,
     identityFor: () => identity,
+    allowedRepos: [ALLOWED_REPO],
     ...(gitAuthToken !== undefined ? { gitAuth: { secretProvider: { get: async () => gitAuthToken } } } : {})
   }));
   const c = jobContract({ input: { data: { repo_url: GITHUB_SHAPED_URL }, trust_level: "internal", provenance: "test" } });
@@ -271,15 +280,16 @@ describe("D-103: git-auth wiring i createCodingHandler (Blokker B)", () => {
   });
 
   it("H: token finnes ALDRI i en kastet feilmelding selv ved en ekte clone-feil (ugyldig repo_url)", async () => {
-    const sandbox = new CapturingRedirectingSandboxRunner(new ProcessSandboxRunner(), "unused", "unused");
+    const sandbox = new CapturingRedirectingSandboxRunner(new ProcessSandboxRunner(), GITHUB_SHAPED_URL, "/nonexistent/path/that/does/not/exist");
     const worker = new InProcessWorker(queue, 60);
     worker.register("coding", createCodingHandler({
       sandbox, agent: new WritingFakeAgent(), artifacts, policy,
       identityFor: () => identity,
+      allowedRepos: [ALLOWED_REPO],
       gitAuth: { secretProvider: { get: async () => REAL_TOKEN } }
     }));
     const c = jobContract({
-      input: { data: { repo_url: "/nonexistent/path/that/does/not/exist" }, trust_level: "internal", provenance: "test" }
+      input: { data: { repo_url: GITHUB_SHAPED_URL }, trust_level: "internal", provenance: "test" }
     });
     await queue.enqueue("tenant-a", c);
     await worker.drain();
@@ -289,15 +299,16 @@ describe("D-103: git-auth wiring i createCodingHandler (Blokker B)", () => {
   });
 
   it("H2: ephemer credential-helper-fil fjernes OGSÅ ved en FORTVUNGEN clone-feil (ugyldig repo_url) - cleanup er IKKE kun en happy-path-garanti", async () => {
-    const sandbox = new CapturingRedirectingSandboxRunner(new ProcessSandboxRunner(), "unused", "unused");
+    const sandbox = new CapturingRedirectingSandboxRunner(new ProcessSandboxRunner(), GITHUB_SHAPED_URL, "/nonexistent/path/that/does/not/exist");
     const worker = new InProcessWorker(queue, 60);
     worker.register("coding", createCodingHandler({
       sandbox, agent: new WritingFakeAgent(), artifacts, policy,
       identityFor: () => identity,
+      allowedRepos: [ALLOWED_REPO],
       gitAuth: { secretProvider: { get: async () => REAL_TOKEN } }
     }));
     const c = jobContract({
-      input: { data: { repo_url: "/nonexistent/path/that/does/not/exist" }, trust_level: "internal", provenance: "test" }
+      input: { data: { repo_url: GITHUB_SHAPED_URL }, trust_level: "internal", provenance: "test" }
     });
     await queue.enqueue("tenant-a", c);
     await worker.drain();
@@ -350,8 +361,103 @@ describe("D-103: git-auth wiring i createCodingHandler (Blokker B)", () => {
     await worker.drain();
     const clone = sandbox.calls.find((call) => call.args.includes("clone"));
     const push = sandbox.calls.find((call) => call.args.includes("push"));
-    expect(clone?.args[0]).toBe("clone");
-    expect(push?.args[0]).toBe("push");
+    // Uten gitAuth: ingen credential-isolasjon/-helper i argv (kun hooks av + `ext::` nektet).
+    for (const call of [clone, push]) {
+      expect(call?.args.slice(0, 2)).not.toEqual([...GIT_CREDENTIAL_ISOLATION_ARGS]);
+      expect(call?.args.some((a) => a.startsWith("credential.helper"))).toBe(false);
+    }
+    expect(clone?.args).toContain("clone");
+    expect(push?.args).toContain("push");
+  });
+
+  it("M (del 2, JARVIS-064): fremmed/ikke-allowlistet repo_url avvises FØR credential hentes og FØR clone - secretProvider kalles aldri", async () => {
+    for (const repoUrl of [
+      "https://evil.example/tsworkflow/jarvisbuild-d103-gitauth-test.git",
+      "https://github.com@evil.example/tsworkflow/jarvisbuild-d103-gitauth-test.git",
+      "https://github.com/tsworkflow/another-repo.git",
+      "ext::sh -c id",
+      "--upload-pack=touch /tmp/pwned"
+    ]) {
+      const sandbox = new CapturingRedirectingSandboxRunner(new ProcessSandboxRunner(), GITHUB_SHAPED_URL, bareRepo);
+      let secretReads = 0;
+      const worker = new InProcessWorker(queue, 60);
+      worker.register("coding", createCodingHandler({
+        sandbox, agent: new WritingFakeAgent(), artifacts, policy, identityFor: () => identity,
+        allowedRepos: [ALLOWED_REPO],
+        gitAuth: { secretProvider: { get: async () => { secretReads += 1; return REAL_TOKEN; } } }
+      }));
+      const c = jobContract({ input: { data: { repo_url: repoUrl }, trust_level: "internal", provenance: "test" } });
+      await queue.enqueue("tenant-a", c);
+      await worker.drain();
+      const view = await queue.get("tenant-a", c.task_id);
+      expect(view?.status, repoUrl).toBe("failed");
+      expect(view?.last_error, repoUrl).toContain("coding_input_rejected");
+      expect(secretReads, repoUrl).toBe(0);
+      expect(sandbox.calls, repoUrl).toHaveLength(0);
+    }
+  });
+
+  it("N (del 2): tom allowlist med gitAuth feiler lukket (git_repo_allowlist_empty) - ingen clone, ingen credential", async () => {
+    const sandbox = new CapturingRedirectingSandboxRunner(new ProcessSandboxRunner(), GITHUB_SHAPED_URL, bareRepo);
+    let secretReads = 0;
+    const worker = new InProcessWorker(queue, 60);
+    worker.register("coding", createCodingHandler({
+      sandbox, agent: new WritingFakeAgent(), artifacts, policy, identityFor: () => identity,
+      gitAuth: { secretProvider: { get: async () => { secretReads += 1; return REAL_TOKEN; } } }
+    }));
+    const c = jobContract({ input: { data: { repo_url: GITHUB_SHAPED_URL }, trust_level: "internal", provenance: "test" } });
+    await queue.enqueue("tenant-a", c);
+    await worker.drain();
+    const view = await queue.get("tenant-a", c.task_id);
+    expect(view?.status).toBe("failed");
+    expect(view?.last_error).toContain("git_repo_allowlist_empty");
+    expect(secretReads).toBe(0);
+    expect(sandbox.calls).toHaveLength(0);
+  });
+
+  it("O (del 2, JARVIS-009): en vilkårlig test_command fra kontrakten kjøres ALDRI - jobben avvises før sandbox opprettes", async () => {
+    for (const testCommand of [["sh", "-c", "id"], ["node", "-e", "process.exit(0)"], ["curl", "http://169.254.169.254/"], ["npm", "install", "evil"]]) {
+      const sandbox = new CapturingRedirectingSandboxRunner(new ProcessSandboxRunner(), GITHUB_SHAPED_URL, bareRepo);
+      const worker = new InProcessWorker(queue, 60);
+      worker.register("coding", createCodingHandler({
+        sandbox, agent: new WritingFakeAgent(), artifacts, policy, identityFor: () => identity,
+        allowedRepos: [ALLOWED_REPO], gitAuth: { secretProvider: { get: async () => REAL_TOKEN } }
+      }));
+      const c = jobContract({ input: { data: { repo_url: GITHUB_SHAPED_URL, test_command: testCommand }, trust_level: "internal", provenance: "test" } });
+      await queue.enqueue("tenant-a", c);
+      await worker.drain();
+      const view = await queue.get("tenant-a", c.task_id);
+      expect(view?.status, testCommand.join(" ")).toBe("failed");
+      expect(view?.last_error, testCommand.join(" ")).toContain("coding_input_rejected:test_command_not_allowed");
+      expect(sandbox.calls, testCommand.join(" ")).toHaveLength(0);
+    }
+  });
+
+  it("P (del 2): repo-hooks kjøres ikke - en pre-commit-hook agenten (eller repoet) legger igjen får aldri kjøre under commit", async () => {
+    const markerDir = await mkdtemp(join(tmpdir(), "jarvis-hook-marker-"));
+    const marker = join(markerDir, "hook-ran");
+    class HookPlantingAgent implements CodingAgentAdapter {
+      readonly name = "hook-planting-agent";
+      async modify(exec: CodingAgentExec, _goal: string): Promise<string> {
+        exec("node", ["-e", `const fs=require('fs');fs.writeFileSync('CHANGES.md','x');fs.mkdirSync('.git/hooks',{recursive:true});fs.writeFileSync('.git/hooks/pre-commit','#!/bin/sh\\ntouch ${marker.replace(/\\/g, "/")}\\n',{mode:0o755})`]);
+        return "plantet hook";
+      }
+    }
+    const sandbox = new CapturingRedirectingSandboxRunner(new ProcessSandboxRunner(), GITHUB_SHAPED_URL, bareRepo);
+    const worker = new InProcessWorker(queue, 60);
+    worker.register("coding", createCodingHandler({
+      sandbox, agent: new HookPlantingAgent(), artifacts, policy, identityFor: () => identity,
+      allowedRepos: [ALLOWED_REPO], gitAuth: { secretProvider: { get: async () => REAL_TOKEN } }
+    }));
+    const c = jobContract({ input: { data: { repo_url: GITHUB_SHAPED_URL }, trust_level: "internal", provenance: "test" } });
+    await queue.enqueue("tenant-a", c);
+    await worker.drain();
+    const view = await queue.get("tenant-a", c.task_id);
+    expect(view?.status).toBe("completed");
+    const { stat } = await import("node:fs/promises");
+    await expect(stat(marker)).rejects.toThrow(); // hooken kjørte ALDRI
+    const commit = sandbox.calls.find((call) => call.command === "git" && call.args.includes("commit"));
+    expect(commit?.args.join(" ")).toContain("core.hooksPath=/dev/null");
   });
 
   it("J: ToolGateway/D-95 PR-publisering forblir uendret NÅR gitAuth OGSÅ er konfigurert samtidig (ingen interferens mellom Blokker A/B og D-95)", async () => {
@@ -362,6 +468,7 @@ describe("D-103: git-auth wiring i createCodingHandler (Blokker B)", () => {
       sandbox, agent: new WritingFakeAgent(), artifacts, policy,
       identityFor: () => identity,
       gitAuth: { secretProvider: { get: async () => REAL_TOKEN } },
+      allowedRepos: [ALLOWED_REPO],
       github: {
         gateway: {
           execute: async (req) => {

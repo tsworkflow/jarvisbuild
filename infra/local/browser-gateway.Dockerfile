@@ -27,5 +27,13 @@ COPY modules ./modules
 ENV PLAYWRIGHT_SKIP_BROWSER_DOWNLOAD=1
 RUN pnpm install --frozen-lockfile --prod
 
+# REMEDIERING DEL 2 (JARVIS-008/010): IKKE-ROOT og AKTIV Chromium-sandbox. `pwuser` (uid 1000) er brukeren
+# Microsofts Playwright-image allerede har for dette. Motoren starter Chromium med `chromiumSandbox: true`
+# (ingen `--no-sandbox`); sandboxen krever user namespaces, som Docker sin standard seccomp-profil blokkerer -
+# compose bruker derfor Microsofts offisielle seccomp-profil (`browser-gateway.seccomp.json`, se compose-kommentaren)
+# i stedet for `SYS_ADMIN`/`privileged`. Starter ikke Chromium, feiler `/health` (503) - aldri en stille fallback.
+USER pwuser
+ENV HOME=/home/pwuser
+
 EXPOSE 3030
 CMD ["node", "--experimental-transform-types", "apps/browser-gateway/src/main.ts"]

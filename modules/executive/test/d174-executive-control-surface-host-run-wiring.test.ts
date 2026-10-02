@@ -91,7 +91,7 @@ describe("live-scriptet bruker PRODUKSJONENS komposisjon - samme secret-kjede og
     expect(liveScriptSource).toMatch(/firstWaveTools\(\{\s*\n?\s*finance:/);
   });
   it("OwnerControlsService gis device-tilbakekallings-avhengighetene (pool+grants+authority) som 3. konstruktørargument - revoke_device er FAKTISK koblet, ikke bare deklarert", () => {
-    expect(liveScriptSource).toContain("new OwnerControlsService(killSwitch, ownerControls, { pool: sidePool, grants, authority })");
+    expect(liveScriptSource).toContain("new OwnerControlsService(killSwitch, ownerControls, { pool: sidePool, grants, devices: new DeviceService(sidePool), authority })");
   });
 });
 

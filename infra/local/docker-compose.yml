@@ -1,19 +1,39 @@
-# Jarvis lokal infrastruktur - fase 1-stub.
-# Fase 1 trenger ingen kjørende tjenester (ingen Postgres før fase 2, D-13/IMPLEMENTATION_PLAN).
-# Filen etablerer kun det portable mønsteret: alt konfigureres via miljøvariabler,
-# ingen hardkodede maskinstier, flyttbart mellom dev-PC (RTX 4070) og UGREEN-NAS (D-20).
+# Jarvis lokal infrastruktur.
+# Alt konfigureres via miljøvariabler, ingen hardkodede maskinstier, flyttbart mellom dev-PC (RTX 4070) og
+# UGREEN-NAS (D-20). Se DEPLOYMENT_STRATEGY.md.
 #
-# Fase 2 legger til: postgres (pgvector, pgmq). Fase 3: langfuse. Se DEPLOYMENT_STRATEGY.md.
-
 # REMEDIERING DEL 1 (JARVIS-009/008/089, containment 2026-10-01):
-#  - INGEN tjeneste publiserer en port på 0.0.0.0. Postgres (superbruker), Infisical,
-#    Langfuse og API er KUN bundet til 127.0.0.1 (Tailscale Serve forwarder til
-#    localhost - se docs/runbooks/D250_NAS_MIGRATION.md); browser-gateway publiserer
-#    ingen port (api/worker når den via tjenestenavnet `browser-gateway:3030`).
-#  - Flytende image-tagger er pinnet til tag@digest (flerarkitektur-indeks-digest,
-#    slått opp mot Docker Hub/MCR 2026-10-01). Sammenlign mot det NAS-en faktisk kjører
+#  - INGEN tjeneste publiserer en port på 0.0.0.0. Postgres (superbruker), Infisical, Langfuse og API er KUN
+#    bundet til 127.0.0.1 (Tailscale Serve forwarder til localhost - se docs/runbooks/D250_NAS_MIGRATION.md);
+#    browser-gateway publiserer ingen port.
+#  - Flytende image-tagger er pinnet til tag@digest. Sammenlign mot det NAS-en faktisk kjører
 #    (`docker compose images`) FØR `up --build` - se docs/remediation/BASELINE.md.
-#  Strukturelt vakt: ops/security/check-containment.mjs (kjøres i CI og som `pnpm check:containment`).
+#
+# REMEDIERING DEL 2 (JARVIS-008/010, 2026-10-02) - ISOLASJON:
+#  - INGEN `env_file: ../../.env` lenger. Hver tjeneste får KUN variablene den trenger (`environment:`-blokkene er
+#    GENERERT fra infra/local/service-env.mjs - `node ops/security/generate-compose-env.mjs`). Vault-hovednøkkel
+#    (INFISICAL_ENCRYPTION_KEY/AUTH_SECRET), DB-superbruker (JARVIS_DB_ADMIN_*), NEXTAUTH/SALT og LANGFUSE_INIT_*
+#    finnes KUN i infisical/langfuse/db-bootstrap/migrate/postgres - aldri i api/worker/voice-gateway/browser-gateway.
+#  - EGNE DB-roller: `jarvis_runtime` (app), `infisical_app`, `langfuse_app` (opprettes av db-bootstrap, hver eier av
+#    sin egen database). Ingen runtime-tjeneste kobler til som cluster-superbruker. `migrate` er en ENGANGS-jobb
+#    (deploy-tid) med admin-rollen og er ikke en runtime-tjeneste.
+#  - IKKE-ROOT: api/worker/migrate (`node`), voice-gateway (`node`), browser-gateway (`pwuser`) - USER i Dockerfilene;
+#    read-only rootfs + tmpfs, alle capabilities droppet, no-new-privileges (x-hardening under). postgres/redis dropper
+#    selv privilegier internt; infisical/langfuse er tredjeparts-images (kun no-new-privileges).
+#  - NETTVERK: `core` (alt) og `browser` (KUN browser-gateway + api + worker). browser-gateway når derfor aldri
+#    postgres/infisical/langfuse/redis - verken på navn eller IP. Egress fra Chromium går i tillegg gjennom en
+#    allowlistet proxy inne i gatewayen (RFC1918/loopback/link-local/metadata blokkert).
+#  - KODEJOBBER kjører IKKE i worker-containeren: ingen Docker-socket monteres, `JARVIS_JOB_RUNNER` er ikke satt ->
+#    HVER kodejobb feiler lukket (`job_container_runner_not_configured`) til en vertsside runner finnes.
+#  Strukturelt vakt: ops/security/check-containment.mjs + modules/core/test/remediation-2-compose-isolation.test.ts.
+#  seccomp-profilen under refereres relativt til compose-filens mappe (Compose v2 løser stien mot prosjektmappen), så
+#  `docker compose -f infra/local/docker-compose.yml ...` virker uavhengig av arbeidskatalog.
+
+x-hardening: &hardening
+  cap_drop: ["ALL"]
+  security_opt: ["no-new-privileges:true"]
+  read_only: true
+  tmpfs: ["/tmp:rw,nosuid,size=256m"]
 
 services:
   postgres:
@@ -29,6 +49,8 @@ services:
       - "127.0.0.1:${JARVIS_DB_PORT:-5432}:5432"
     volumes:
       - jarvis-pgdata:/var/lib/postgresql/data
+    networks: [core]
+    security_opt: ["no-new-privileges:true"]
     healthcheck:
       test: ["CMD-SHELL", "pg_isready -U ${JARVIS_DB_ADMIN_USER:-postgres} -d ${JARVIS_DB_NAME:-jarvis}"]
       interval: 5s
@@ -36,22 +58,22 @@ services:
       retries: 12
     restart: unless-stopped
 
-  # D-240 (funnet live av Tobias, "database infisical does not exist"-krasjløkke):
-  # `postgres` sin egen `POSTGRES_DB` over oppretter KUN én database (`jarvis`) -
-  # `infisical`/`langfuse` under trenger HVER SIN EGEN, separate database på
-  # SAMME Postgres-instans. Denne ene-gangs-tjenesten oppretter dem idempotent
-  # (se bootstrap-databases.sql sitt filhode) FØR infisical/langfuse startes -
-  # trygt å kjøre på HVER oppstart, også når begge allerede finnes (f.eks. et
-  # eksisterende `jarvis-pgdata`-volum fra FØR denne fiksen).
+  # D-240 + REMEDIERING DEL 2: `postgres` sin egen `POSTGRES_DB` oppretter KUN `jarvis`. Denne ene-gangs-tjenesten
+  # oppretter (idempotent) de EGNE rollene `infisical_app`/`langfuse_app` og HVER SIN database med dem som eier, og
+  # overleverer eierskap av en eksisterende `infisical`/`langfuse`-database fra superbrukeren (se
+  # bootstrap-databases.sql). Passordene leses fra miljøet inne i psql (`\getenv`) - de står aldri i kommandolinjen.
   db-bootstrap:
     image: pgvector/pgvector:pg16@sha256:7b822b0aac60967beb1ea5e576b8602c94c300a157d187f385ae3e0da199b90a
     environment:
-      PGPASSWORD: "${JARVIS_DB_ADMIN_PASSWORD}"
+      PGPASSWORD: "${JARVIS_DB_ADMIN_PASSWORD:?sett JARVIS_DB_ADMIN_PASSWORD i .env}"
+      INFISICAL_DB_PASSWORD: "${INFISICAL_DB_PASSWORD:?sett INFISICAL_DB_PASSWORD (kun a-z A-Z 0-9, minst 24 tegn) i .env}"
+      LANGFUSE_DB_PASSWORD: "${LANGFUSE_DB_PASSWORD:?sett LANGFUSE_DB_PASSWORD (kun a-z A-Z 0-9, minst 24 tegn) i .env}"
     volumes:
       - ./bootstrap-databases.sql:/bootstrap/bootstrap-databases.sql:ro
     command: >
       psql -h postgres -U ${JARVIS_DB_ADMIN_USER:-postgres} -d ${JARVIS_DB_NAME:-jarvis}
       -v ON_ERROR_STOP=1 -f /bootstrap/bootstrap-databases.sql
+    networks: [core]
     depends_on:
       postgres:
         condition: service_healthy
@@ -60,9 +82,10 @@ services:
   langfuse:
     # D-27: self-hosted Langfuse v2 (kun Postgres-avhengighet). Init-noekler
     # kommer fra .env (lokale dev-verdier) - aldri hardkodet her.
+    # REMEDIERING DEL 2: kobler til som `langfuse_app` (egen rolle, eier av kun `langfuse`-databasen) - IKKE superbruker.
     image: langfuse/langfuse:2.95.11@sha256:85c278dcab96c15db94191a5c1664f85aba2d7fb6771a00e99681c902c4b7015
     environment:
-      DATABASE_URL: "postgresql://${JARVIS_DB_ADMIN_USER:-postgres}:${JARVIS_DB_ADMIN_PASSWORD}@postgres:5432/langfuse"
+      DATABASE_URL: "postgresql://langfuse_app:${LANGFUSE_DB_PASSWORD:?sett LANGFUSE_DB_PASSWORD i .env}@postgres:5432/langfuse"
       NEXTAUTH_URL: "http://127.0.0.1:3050"
       NEXTAUTH_SECRET: "${NEXTAUTH_SECRET}"
       SALT: "${SALT}"
@@ -76,6 +99,8 @@ services:
       LANGFUSE_INIT_USER_PASSWORD: "${LANGFUSE_INIT_USER_PASSWORD}"
     ports:
       - "127.0.0.1:3050:3000"
+    networks: [core]
+    security_opt: ["no-new-privileges:true"]
     depends_on:
       db-bootstrap:
         condition: service_completed_successfully
@@ -83,6 +108,8 @@ services:
 
   infisical-redis:
     image: redis:7-alpine@sha256:858f009f9709ce576febc734aa78b8f6d624b82571f9ddb6bda4377c833b3499
+    networks: [core]
+    security_opt: ["no-new-privileges:true"]
     restart: unless-stopped
     healthcheck:
       test: ["CMD","redis-cli","ping"]
@@ -91,21 +118,18 @@ services:
 
   infisical:
     # D-35: self-hosted Infisical (deler Docker-Postgres via egen db 'infisical').
+    # REMEDIERING DEL 2: kobler til som `infisical_app` (egen rolle, eier av kun `infisical`-databasen) - IKKE superbruker.
+    # ENCRYPTION_KEY/AUTH_SECRET (vault-hovednøkkelen) finnes KUN her.
     image: infisical/infisical:latest-postgres@sha256:36438985877fb5ab99c76ee1a9c73611e44d8518b44a77304b5d4c05451f8c62
     environment:
       ENCRYPTION_KEY: "${INFISICAL_ENCRYPTION_KEY}"
       AUTH_SECRET: "${INFISICAL_AUTH_SECRET}"
-      DB_CONNECTION_URI: "postgresql://${JARVIS_DB_ADMIN_USER:-postgres}:${JARVIS_DB_ADMIN_PASSWORD}@postgres:5432/infisical"
+      DB_CONNECTION_URI: "postgresql://infisical_app:${INFISICAL_DB_PASSWORD:?sett INFISICAL_DB_PASSWORD i .env}@postgres:5432/infisical"
       REDIS_URL: "redis://infisical-redis:6379"
       SITE_URL: "http://127.0.0.1:3060"
       TELEMETRY_ENABLED: "false"
-      # D-346: uten disse kan Infisical ALDRI sende verifikasjons-/passord-
-      # gjenopprettings-e-post (bevist host-side: "Failed to send verification
-      # code" på /signup, og INGEN "Glemt passord"-gjenoppretting mulig for et
-      # eksisterende admin-medlemskap hvis passordet er tapt). Tomme .env-
-      # verdier (`${VAR:-}`) er trygt no-op når Tobias ikke har fylt dem inn -
-      # samme "aldri en tvunget, hardkodet leverandør"-linje som resten av
-      # denne filen. Aldri en hemmelighet i selve denne filen - kun .env.
+      # D-346: uten disse kan Infisical ALDRI sende verifikasjons-/passord-gjenopprettings-e-post. Tomme .env-
+      # verdier (`${VAR:-}`) er trygt no-op når Tobias ikke har fylt dem inn. Aldri en hemmelighet i selve denne filen.
       SMTP_HOST: "${INFISICAL_SMTP_HOST:-}"
       SMTP_PORT: "${INFISICAL_SMTP_PORT:-}"
       SMTP_USERNAME: "${INFISICAL_SMTP_USERNAME:-}"
@@ -114,6 +138,8 @@ services:
       SMTP_FROM_NAME: "${INFISICAL_SMTP_FROM_NAME:-Infisical}"
     ports:
       - "127.0.0.1:3060:8080"
+    networks: [core]
+    security_opt: ["no-new-privileges:true"]
     depends_on:
       db-bootstrap:
         condition: service_completed_successfully
@@ -121,63 +147,218 @@ services:
         condition: service_started
     restart: unless-stopped
 
-  # One-shot migrasjoner (BO-07): kjører alle migrasjoner nøyaktig én gang før
-  # api/worker starter. restart:no - avsluttet=suksess er startbetingelsen deres.
-  # Q-21 (2026-08-15): bruker ADMIN-credentials (JARVIS_DB_ADMIN_USER/PASSWORD via
-  # migrate-main.ts sin adminConfigFromEnv()) - CREATE ROLE/ALTER TABLE...ENABLE RLS/
-  # CREATE EXTENSION krever admin-privilegier. Bootstrapper SAMTIDIG den ekte
-  # jarvis_runtime-LOGIN-rollen api/worker skal bruke (ensureRuntimeRole) - se
-  # docs/OPEN_QUESTIONS.md Q-21. .env sin JARVIS_DB_USER/PASSWORD (RUNTIME, IKKE admin)
-  # flyter uendret gjennom via env_file under - koden, ikke compose, velger admin vs.
-  # runtime per tjeneste.
+  # One-shot migrasjoner (BO-07): kjører alle migrasjoner nøyaktig én gang før api/worker starter. restart:no -
+  # avsluttet=suksess er startbetingelsen deres. Q-21: bruker ADMIN-credentials (JARVIS_DB_ADMIN_USER/PASSWORD via
+  # migrate-main.ts sin adminConfigFromEnv()) - CREATE ROLE/ALTER TABLE...ENABLE RLS/CREATE EXTENSION krever
+  # admin-privilegier. Bootstrapper SAMTIDIG den ekte jarvis_runtime-LOGIN-rollen api/worker skal bruke
+  # (ensureRuntimeRole). REMEDIERING DEL 2: dette er en ENGANGS-jobb, IKKE en runtime-tjeneste, og den får kun
+  # admin-/rolle-/identitetsvariablene (ingen connector-/modellnøkler).
   migrate:
+    <<: *hardening
     build:
       context: ../..
       dockerfile: infra/local/api.Dockerfile
     command: ["node", "--experimental-transform-types", "apps/api/src/migrate-main.ts"]
-    env_file: ["../../.env"]
     environment:
       JARVIS_DB_HOST: postgres
       JARVIS_DB_PORT: "5432"
       JARVIS_DB_NAME: "${JARVIS_DB_NAME:-jarvis}"
+      # GENERERT fra infra/local/service-env.mjs (SERVICE_ENV.migrate) - rediger der, ikke her.
+      JARVIS_DB_ADMIN_PASSWORD: "${JARVIS_DB_ADMIN_PASSWORD:-}"
+      JARVIS_DB_ADMIN_USER: "${JARVIS_DB_ADMIN_USER:-}"
+      JARVIS_DB_PASSWORD: "${JARVIS_DB_PASSWORD:-}"
+      JARVIS_DB_USER: "${JARVIS_DB_USER:-}"
+      JARVIS_ENV: "${JARVIS_ENV:-dev}"
+      JARVIS_OWNER_NAME: "${JARVIS_OWNER_NAME:-}"
+      JARVIS_OWNER_PERSON_ID: "${JARVIS_OWNER_PERSON_ID:-}"
+      JARVIS_TENANT_ID: "${JARVIS_TENANT_ID:-}"
+    networks: [core]
     depends_on:
       postgres:
         condition: service_healthy
     restart: "no"
 
   api:
-    # Q-21: bruker RUNTIME-credentials (JARVIS_DB_USER/PASSWORD via configFromEnv()) -
-    # ALDRI JARVIS_DB_ADMIN_USER/PASSWORD. main.ts fail-closer ved oppstart hvis
-    # tilkoblingen skulle vise seg å være superuser/BYPASSRLS (assertRuntimeRoleSafe).
+    # Q-21: bruker RUNTIME-credentials (JARVIS_DB_USER/PASSWORD via configFromEnv()) - ALDRI JARVIS_DB_ADMIN_*.
+    # main.ts fail-closer ved oppstart hvis tilkoblingen skulle vise seg å være superuser/BYPASSRLS (assertRuntimeRoleSafe).
+    # D-201-host-fix: LANGFUSE_BASE_URL respekterer en eksplisitt .env-verdi (Langfuse Cloud) med den container-interne
+    # adressen som default.
+    <<: *hardening
     build:
       context: ../..
       dockerfile: infra/local/api.Dockerfile
-    env_file: ["../../.env"]
     environment:
-      JARVIS_API_PORT: "${JARVIS_API_PORT:-3010}"
-      JARVIS_ENV: "${JARVIS_ENV:-dev}"
-      JARVIS_DB_HOST: postgres
-      JARVIS_DB_PORT: "5432"
       JARVIS_DB_NAME: "${JARVIS_DB_NAME:-jarvis}"
-      # Infisical er KUN selvhostet i dette oppsettet (ingen cloud-variant) -
-      # container-intern adresse er derfor alltid riktig, uendret.
+      # GENERERT fra infra/local/service-env.mjs (SERVICE_ENV.api) - rediger der, ikke her.
+      JARVIS_DB_HOST: "postgres"
+      JARVIS_DB_PORT: "5432"
       INFISICAL_URL: "http://infisical:8080"
-      # D-201-host-fix (2026-09-20): Langfuse KAN være enten selvhostet (denne
-      # compose-filens egen `langfuse`-tjeneste) ELLER Langfuse Cloud - i
-      # motsetning til Infisical har den et reelt cloud-alternativ, og `.env`
-      # sin `LANGFUSE_BASE_URL` (satt til f.eks. https://cloud.langfuse.com)
-      # ble tidligere ALLTID overstyrt av denne hardkodede container-interne
-      # adressen, uansett hva eieren faktisk konfigurerte - sporing gikk derfor
-      # stille til feil instans (Tobias sine Cloud-nøkler fikk aldri noen
-      # trafikk, host-verifisert 2026-09-20). `${LANGFUSE_BASE_URL:-...}`
-      # respekterer nå en eksplisitt .env-verdi, med SAMME container-interne
-      # adresse som tidligere som default for det uendrede lokal-selvhostet-
-      # tilfellet - ingen regresjon for eksisterende oppsett uten en satt verdi.
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GEMMA_API_KEY: "${GEMMA_API_KEY:-}"
+      HERMES_API_KEY: "${HERMES_API_KEY:-}"
+      INFISICAL_CLIENT_ID: "${INFISICAL_CLIENT_ID:-}"
+      INFISICAL_CLIENT_SECRET: "${INFISICAL_CLIENT_SECRET:-}"
+      INFISICAL_ENV: "${INFISICAL_ENV:-}"
+      INFISICAL_PROJECT_ID: "${INFISICAL_PROJECT_ID:-}"
+      JARVIS_API_PORT: "${JARVIS_API_PORT:-3010}"
+      JARVIS_APNS_AUTH_KEY: "${JARVIS_APNS_AUTH_KEY:-}"
+      JARVIS_APPLE_MUSIC_TOKEN: "${JARVIS_APPLE_MUSIC_TOKEN:-}"
+      JARVIS_APPLE_SHORTCUTS_TOKEN: "${JARVIS_APPLE_SHORTCUTS_TOKEN:-}"
+      JARVIS_APPLE_WATCH_TOKEN: "${JARVIS_APPLE_WATCH_TOKEN:-}"
+      JARVIS_BRAVE_SEARCH_API_KEY: "${JARVIS_BRAVE_SEARCH_API_KEY:-}"
+      JARVIS_BRIEF_HOUR: "${JARVIS_BRIEF_HOUR:-}"
+      JARVIS_BROWSER_GATEWAY_BASE_URL: "${JARVIS_BROWSER_GATEWAY_BASE_URL:-}"
+      JARVIS_BROWSER_GATEWAY_TOKEN_SECRET: "${JARVIS_BROWSER_GATEWAY_TOKEN_SECRET:-}"
+      JARVIS_BUDGET_APPROVED: "${JARVIS_BUDGET_APPROVED:-}"
+      JARVIS_BUSINESS_INTERNAL_TOKEN: "${JARVIS_BUSINESS_INTERNAL_TOKEN:-}"
+      JARVIS_COST_HARD_LIMIT_ORE: "${JARVIS_COST_HARD_LIMIT_ORE:-}"
+      JARVIS_COUNCIL_MODEL_TIMEOUT_MS: "${JARVIS_COUNCIL_MODEL_TIMEOUT_MS:-}"
+      JARVIS_DB_PASSWORD: "${JARVIS_DB_PASSWORD:-}"
+      JARVIS_DB_USER: "${JARVIS_DB_USER:-}"
+      JARVIS_DEEPGRAM_API_KEY: "${JARVIS_DEEPGRAM_API_KEY:-}"
+      JARVIS_DISCORD_BOT_TOKEN: "${JARVIS_DISCORD_BOT_TOKEN:-}"
+      JARVIS_DOCKER_BIN: "${JARVIS_DOCKER_BIN:-}"
+      JARVIS_DOCKER_MUTATION_TARGETS: "${JARVIS_DOCKER_MUTATION_TARGETS:-}"
+      JARVIS_DROPBOX_TOKEN: "${JARVIS_DROPBOX_TOKEN:-}"
+      JARVIS_ELEVENLABS_API_KEY: "${JARVIS_ELEVENLABS_API_KEY:-}"
+      JARVIS_ELEVENLABS_VOICE_ID: "${JARVIS_ELEVENLABS_VOICE_ID:-}"
+      JARVIS_EMAIL_TOKEN: "${JARVIS_EMAIL_TOKEN:-}"
+      JARVIS_ENV: "${JARVIS_ENV:-dev}"
+      JARVIS_EXA_API_KEY: "${JARVIS_EXA_API_KEY:-}"
+      JARVIS_FIKEN_CLIENT_ID: "${JARVIS_FIKEN_CLIENT_ID:-}"
+      JARVIS_FIKEN_CLIENT_SECRET: "${JARVIS_FIKEN_CLIENT_SECRET:-}"
+      JARVIS_FIKEN_COMPANY_SLUG: "${JARVIS_FIKEN_COMPANY_SLUG:-}"
+      JARVIS_FIKEN_REFRESH_TOKEN: "${JARVIS_FIKEN_REFRESH_TOKEN:-}"
+      JARVIS_FOLIO_API_KEY: "${JARVIS_FOLIO_API_KEY:-}"
+      JARVIS_GCE_MUTATION_TARGETS: "${JARVIS_GCE_MUTATION_TARGETS:-}"
+      JARVIS_GEMINI_MODEL: "${JARVIS_GEMINI_MODEL:-}"
+      JARVIS_GEMMA_LOCAL_MODEL: "${JARVIS_GEMMA_LOCAL_MODEL:-}"
+      JARVIS_GEMMA_LOCAL_URL: "${JARVIS_GEMMA_LOCAL_URL:-}"
+      JARVIS_GEMMA_MODEL: "${JARVIS_GEMMA_MODEL:-}"
+      JARVIS_GITHUB_REPO: "${JARVIS_GITHUB_REPO:-}"
+      JARVIS_GITHUB_TOKEN: "${JARVIS_GITHUB_TOKEN:-}"
+      JARVIS_GIT_ALLOWED_REPOS: "${JARVIS_GIT_ALLOWED_REPOS:-}"
+      JARVIS_GIT_CREDENTIAL_TOKEN: "${JARVIS_GIT_CREDENTIAL_TOKEN:-}"
+      JARVIS_GOOGLE_ACCOUNT: "${JARVIS_GOOGLE_ACCOUNT:-}"
+      JARVIS_GOOGLE_ADS_API_VERSION: "${JARVIS_GOOGLE_ADS_API_VERSION:-}"
+      JARVIS_GOOGLE_ADS_CUSTOMER_ID: "${JARVIS_GOOGLE_ADS_CUSTOMER_ID:-}"
+      JARVIS_GOOGLE_ADS_DEVELOPER_TOKEN: "${JARVIS_GOOGLE_ADS_DEVELOPER_TOKEN:-}"
+      JARVIS_GOOGLE_ADS_LOGIN_CUSTOMER_ID: "${JARVIS_GOOGLE_ADS_LOGIN_CUSTOMER_ID:-}"
+      JARVIS_GOOGLE_ADS_REFRESH_TOKEN: "${JARVIS_GOOGLE_ADS_REFRESH_TOKEN:-}"
+      JARVIS_GOOGLE_CLIENT_ID: "${JARVIS_GOOGLE_CLIENT_ID:-}"
+      JARVIS_GOOGLE_CLIENT_SECRET: "${JARVIS_GOOGLE_CLIENT_SECRET:-}"
+      JARVIS_GOOGLE_CLOUD_PROJECT_ID: "${JARVIS_GOOGLE_CLOUD_PROJECT_ID:-}"
+      JARVIS_GOOGLE_CLOUD_REFRESH_TOKEN: "${JARVIS_GOOGLE_CLOUD_REFRESH_TOKEN:-}"
+      JARVIS_GOOGLE_MAPS_API_KEY: "${JARVIS_GOOGLE_MAPS_API_KEY:-}"
+      JARVIS_GOOGLE_PLACES_API_KEY: "${JARVIS_GOOGLE_PLACES_API_KEY:-}"
+      JARVIS_GOOGLE_ROUTES_API_KEY: "${JARVIS_GOOGLE_ROUTES_API_KEY:-}"
+      JARVIS_GOOGLE_SHEETS_TOKEN: "${JARVIS_GOOGLE_SHEETS_TOKEN:-}"
+      JARVIS_GOOGLE_TOKEN: "${JARVIS_GOOGLE_TOKEN:-}"
+      JARVIS_GOOGLE_VEO_API_KEY: "${JARVIS_GOOGLE_VEO_API_KEY:-}"
+      JARVIS_GRAFANA_API_BASE_URL: "${JARVIS_GRAFANA_API_BASE_URL:-}"
+      JARVIS_GRAFANA_API_KEY: "${JARVIS_GRAFANA_API_KEY:-}"
+      JARVIS_HA_TOKEN: "${JARVIS_HA_TOKEN:-}"
+      JARVIS_HIGGSFIELD_KEY_ID: "${JARVIS_HIGGSFIELD_KEY_ID:-}"
+      JARVIS_HIGGSFIELD_KEY_SECRET: "${JARVIS_HIGGSFIELD_KEY_SECRET:-}"
+      JARVIS_HOMEKIT_TOKEN: "${JARVIS_HOMEKIT_TOKEN:-}"
+      JARVIS_HUBSPOT_API_KEY: "${JARVIS_HUBSPOT_API_KEY:-}"
+      JARVIS_IOS_SHORTCUTS_TOKEN: "${JARVIS_IOS_SHORTCUTS_TOKEN:-}"
+      JARVIS_JIRA_API_TOKEN: "${JARVIS_JIRA_API_TOKEN:-}"
+      JARVIS_JIRA_BASE_URL: "${JARVIS_JIRA_BASE_URL:-}"
+      JARVIS_JIRA_EMAIL: "${JARVIS_JIRA_EMAIL:-}"
+      JARVIS_KLING_ACCESS_KEY: "${JARVIS_KLING_ACCESS_KEY:-}"
+      JARVIS_KLING_SECRET_KEY: "${JARVIS_KLING_SECRET_KEY:-}"
+      JARVIS_LINEAR_API_KEY: "${JARVIS_LINEAR_API_KEY:-}"
+      JARVIS_LIVEKIT_API_KEY: "${JARVIS_LIVEKIT_API_KEY:-}"
+      JARVIS_MAKE_API_BASE_URL: "${JARVIS_MAKE_API_BASE_URL:-}"
+      JARVIS_MAKE_API_KEY: "${JARVIS_MAKE_API_KEY:-}"
+      JARVIS_MCP_ZAPIER_SERVER_URL: "${JARVIS_MCP_ZAPIER_SERVER_URL:-}"
+      JARVIS_META_ADS_ACCESS_TOKEN: "${JARVIS_META_ADS_ACCESS_TOKEN:-}"
+      JARVIS_META_ADS_AD_ACCOUNT_ID: "${JARVIS_META_ADS_AD_ACCOUNT_ID:-}"
+      JARVIS_META_ADS_API_VERSION: "${JARVIS_META_ADS_API_VERSION:-}"
+      JARVIS_MODEL_TIMEOUT_MS: "${JARVIS_MODEL_TIMEOUT_MS:-}"
+      JARVIS_N8N_API_BASE_URL: "${JARVIS_N8N_API_BASE_URL:-}"
+      JARVIS_N8N_API_KEY: "${JARVIS_N8N_API_KEY:-}"
+      JARVIS_NEONOMICS_CLIENT_ID: "${JARVIS_NEONOMICS_CLIENT_ID:-}"
+      JARVIS_NEONOMICS_CLIENT_SECRET: "${JARVIS_NEONOMICS_CLIENT_SECRET:-}"
+      JARVIS_NEONOMICS_DEVICE_ID: "${JARVIS_NEONOMICS_DEVICE_ID:-}"
+      JARVIS_NEONOMICS_ENVIRONMENT: "${JARVIS_NEONOMICS_ENVIRONMENT:-}"
+      JARVIS_NEONOMICS_REALM: "${JARVIS_NEONOMICS_REALM:-}"
+      JARVIS_NEONOMICS_SYNC_HOUR: "${JARVIS_NEONOMICS_SYNC_HOUR:-}"
+      JARVIS_NEONOMICS_TENANT_ID: "${JARVIS_NEONOMICS_TENANT_ID:-}"
+      JARVIS_NEONOMICS_WEBHOOK_API_KEY: "${JARVIS_NEONOMICS_WEBHOOK_API_KEY:-}"
+      JARVIS_NOTION_API_KEY: "${JARVIS_NOTION_API_KEY:-}"
+      JARVIS_OLLAMA_URL: "${JARVIS_OLLAMA_URL:-}"
+      JARVIS_ONEDRIVE_TOKEN: "${JARVIS_ONEDRIVE_TOKEN:-}"
+      JARVIS_OPENAI_IMAGES_API_KEY: "${JARVIS_OPENAI_IMAGES_API_KEY:-}"
+      JARVIS_OPENAI_REALTIME_API_KEY: "${JARVIS_OPENAI_REALTIME_API_KEY:-}"
+      JARVIS_OUTLOOK_TOKEN: "${JARVIS_OUTLOOK_TOKEN:-}"
+      JARVIS_OWNER_NAME: "${JARVIS_OWNER_NAME:-}"
+      JARVIS_OWNER_PERSON_ID: "${JARVIS_OWNER_PERSON_ID:-}"
+      JARVIS_PHILIPS_HUE_API_KEY: "${JARVIS_PHILIPS_HUE_API_KEY:-}"
+      JARVIS_PIPEDRIVE_API_KEY: "${JARVIS_PIPEDRIVE_API_KEY:-}"
+      JARVIS_PIPEDRIVE_BASE_URL: "${JARVIS_PIPEDRIVE_BASE_URL:-}"
+      JARVIS_PLAYWRIGHT_API_KEY: "${JARVIS_PLAYWRIGHT_API_KEY:-}"
+      JARVIS_PROMETHEUS_API_BASE_URL: "${JARVIS_PROMETHEUS_API_BASE_URL:-}"
+      JARVIS_PROMETHEUS_TOKEN: "${JARVIS_PROMETHEUS_TOKEN:-}"
+      JARVIS_RUNWAY_API_KEY: "${JARVIS_RUNWAY_API_KEY:-}"
+      JARVIS_SENTRY_API_TOKEN: "${JARVIS_SENTRY_API_TOKEN:-}"
+      JARVIS_SENTRY_ORG_SLUG: "${JARVIS_SENTRY_ORG_SLUG:-}"
+      JARVIS_SITUATIONS_INTERNAL_TOKEN: "${JARVIS_SITUATIONS_INTERNAL_TOKEN:-}"
+      JARVIS_SLACK_BOT_TOKEN: "${JARVIS_SLACK_BOT_TOKEN:-}"
+      JARVIS_SPOTIFY_CLIENT_ID: "${JARVIS_SPOTIFY_CLIENT_ID:-}"
+      JARVIS_SPOTIFY_CLIENT_SECRET: "${JARVIS_SPOTIFY_CLIENT_SECRET:-}"
+      JARVIS_SPOTIFY_REFRESH_TOKEN: "${JARVIS_SPOTIFY_REFRESH_TOKEN:-}"
+      JARVIS_STRIPE_SECRET_KEY: "${JARVIS_STRIPE_SECRET_KEY:-}"
+      JARVIS_STRIPE_SYNC_HOUR: "${JARVIS_STRIPE_SYNC_HOUR:-}"
+      JARVIS_STRIPE_TENANT_ID: "${JARVIS_STRIPE_TENANT_ID:-}"
+      JARVIS_STRIPE_WEBHOOK_SECRET: "${JARVIS_STRIPE_WEBHOOK_SECRET:-}"
+      JARVIS_SUPPORT_INBOX_EMAILS: "${JARVIS_SUPPORT_INBOX_EMAILS:-}"
+      JARVIS_TAVILY_API_KEY: "${JARVIS_TAVILY_API_KEY:-}"
+      JARVIS_TELEGRAM_CHAT_ID: "${JARVIS_TELEGRAM_CHAT_ID:-}"
+      JARVIS_TELEGRAM_TOKEN: "${JARVIS_TELEGRAM_TOKEN:-}"
+      JARVIS_TELNYX_API_KEY: "${JARVIS_TELNYX_API_KEY:-}"
+      JARVIS_TELNYX_FROM_NUMBER: "${JARVIS_TELNYX_FROM_NUMBER:-}"
+      JARVIS_TENANT_ID: "${JARVIS_TENANT_ID:-}"
+      JARVIS_TODOIST_API_TOKEN: "${JARVIS_TODOIST_API_TOKEN:-}"
+      JARVIS_TRELLO_API_KEY: "${JARVIS_TRELLO_API_KEY:-}"
+      JARVIS_TRELLO_TOKEN: "${JARVIS_TRELLO_TOKEN:-}"
+      JARVIS_TWILIO_ACCOUNT_SID: "${JARVIS_TWILIO_ACCOUNT_SID:-}"
+      JARVIS_TWILIO_AUTH_TOKEN: "${JARVIS_TWILIO_AUTH_TOKEN:-}"
+      JARVIS_TWILIO_FROM_NUMBER: "${JARVIS_TWILIO_FROM_NUMBER:-}"
+      JARVIS_VERCEL_TOKEN: "${JARVIS_VERCEL_TOKEN:-}"
+      JARVIS_VIPPS_CLIENT_ID: "${JARVIS_VIPPS_CLIENT_ID:-}"
+      JARVIS_VIPPS_CLIENT_SECRET: "${JARVIS_VIPPS_CLIENT_SECRET:-}"
+      JARVIS_VIPPS_ENVIRONMENT: "${JARVIS_VIPPS_ENVIRONMENT:-}"
+      JARVIS_VIPPS_MSN: "${JARVIS_VIPPS_MSN:-}"
+      JARVIS_VIPPS_SUBSCRIPTION_KEY: "${JARVIS_VIPPS_SUBSCRIPTION_KEY:-}"
+      JARVIS_VIPPS_SYNC_HOUR: "${JARVIS_VIPPS_SYNC_HOUR:-}"
+      JARVIS_VIPPS_TENANT_ID: "${JARVIS_VIPPS_TENANT_ID:-}"
+      JARVIS_VIPPS_WEBHOOK_SECRET: "${JARVIS_VIPPS_WEBHOOK_SECRET:-}"
+      JARVIS_WALLESTER_ACCOUNT_ID: "${JARVIS_WALLESTER_ACCOUNT_ID:-}"
+      JARVIS_WALLESTER_API_BASE_URL: "${JARVIS_WALLESTER_API_BASE_URL:-}"
+      JARVIS_WALLESTER_API_KEY: "${JARVIS_WALLESTER_API_KEY:-}"
+      JARVIS_WALLESTER_ENVIRONMENT: "${JARVIS_WALLESTER_ENVIRONMENT:-}"
+      JARVIS_WALLESTER_PRIVATE_KEY_PEM: "${JARVIS_WALLESTER_PRIVATE_KEY_PEM:-}"
+      JARVIS_WALLESTER_SYNC_HOUR: "${JARVIS_WALLESTER_SYNC_HOUR:-}"
+      JARVIS_WALLESTER_TENANT_ID: "${JARVIS_WALLESTER_TENANT_ID:-}"
+      JARVIS_WALLESTER_WEBHOOK_BASIC_PASSWORD: "${JARVIS_WALLESTER_WEBHOOK_BASIC_PASSWORD:-}"
+      JARVIS_WALLESTER_WEBHOOK_BASIC_USER: "${JARVIS_WALLESTER_WEBHOOK_BASIC_USER:-}"
+      JARVIS_WATCHDOG_INTERVAL_MS: "${JARVIS_WATCHDOG_INTERVAL_MS:-}"
+      JARVIS_WHATSAPP_PHONE_NUMBER_ID: "${JARVIS_WHATSAPP_PHONE_NUMBER_ID:-}"
+      JARVIS_WHATSAPP_TOKEN: "${JARVIS_WHATSAPP_TOKEN:-}"
+      JARVIS_ZAPIER_API_KEY: "${JARVIS_ZAPIER_API_KEY:-}"
+      KIMI_API_KEY: "${KIMI_API_KEY:-}"
       LANGFUSE_BASE_URL: "${LANGFUSE_BASE_URL:-http://langfuse:3000}"
-      # Fra host-miljø (aldri lagret i fil her):
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LOCAL_LLM_BASE_URL: "${LOCAL_LLM_BASE_URL:-}"
+      LOCAL_LLM_MODEL: "${LOCAL_LLM_MODEL:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
     ports:
       - "127.0.0.1:${JARVIS_API_PORT:-3010}:${JARVIS_API_PORT:-3010}"
+    networks: [core, browser]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${JARVIS_API_PORT:-3010}/health >/dev/null"]
       interval: 10s
@@ -190,87 +371,174 @@ services:
     restart: unless-stopped
 
   worker:
-    # Q-21: samme RUNTIME-credentials som api (aldri admin) - worker-main.ts fail-closer
-    # identisk ved oppstart hvis tilkoblingen skulle vise seg å være superuser/BYPASSRLS.
+    # Q-21: samme RUNTIME-credentials som api (aldri admin). REMEDIERING DEL 2: ingen vault-hovednøkkel, ingen webhook-
+    # hemmeligheter, ingen media-/meldings-leverandørnøkler (se service-env.mjs). Kodejobber kjører IKKE her (se toppen).
+    <<: *hardening
     build:
       context: ../..
       dockerfile: infra/local/api.Dockerfile
     command: ["node", "--experimental-transform-types", "apps/api/src/worker-main.ts"]
-    env_file: ["../../.env"]
     environment:
-      JARVIS_DB_HOST: postgres
-      JARVIS_DB_PORT: "5432"
       JARVIS_DB_NAME: "${JARVIS_DB_NAME:-jarvis}"
-      # I container er prosess-sandbox default (containeren er isolasjonsgrensen;
-      # ingen Docker-socket monteres). Docker-sandbox (D-32) gjelder host-runtime.
-      JARVIS_SANDBOX: "process"
-      # BO-09: worker bruker AI Mesh + Langfuse/Infisical. Infisical er KUN
-      # selvhostet (container-intern adresse, uendret). Langfuse: se D-201-
-      # host-fix-kommentaren ved `api`-tjenesten over - SAMME `${LANGFUSE_
-      # BASE_URL:-...}`-mønster, ikke en duplisert/uavhengig regel.
+      # GENERERT fra infra/local/service-env.mjs (SERVICE_ENV.worker) - rediger der, ikke her.
+      JARVIS_DB_HOST: "postgres"
+      JARVIS_DB_PORT: "5432"
       INFISICAL_URL: "http://infisical:8080"
+      ANTHROPIC_API_KEY: "${ANTHROPIC_API_KEY:-}"
+      GEMINI_API_KEY: "${GEMINI_API_KEY:-}"
+      GEMMA_API_KEY: "${GEMMA_API_KEY:-}"
+      HERMES_API_KEY: "${HERMES_API_KEY:-}"
+      INFISICAL_CLIENT_ID: "${INFISICAL_CLIENT_ID:-}"
+      INFISICAL_CLIENT_SECRET: "${INFISICAL_CLIENT_SECRET:-}"
+      INFISICAL_ENV: "${INFISICAL_ENV:-}"
+      INFISICAL_PROJECT_ID: "${INFISICAL_PROJECT_ID:-}"
+      JARVIS_BRAVE_SEARCH_API_KEY: "${JARVIS_BRAVE_SEARCH_API_KEY:-}"
+      JARVIS_BROWSER_GATEWAY_BASE_URL: "${JARVIS_BROWSER_GATEWAY_BASE_URL:-}"
+      JARVIS_BROWSER_GATEWAY_TOKEN_SECRET: "${JARVIS_BROWSER_GATEWAY_TOKEN_SECRET:-}"
+      JARVIS_BUDGET_APPROVED: "${JARVIS_BUDGET_APPROVED:-}"
+      JARVIS_BUSINESS_INTERNAL_TOKEN: "${JARVIS_BUSINESS_INTERNAL_TOKEN:-}"
+      JARVIS_CLAUDE_BIN: "${JARVIS_CLAUDE_BIN:-}"
+      JARVIS_COST_HARD_LIMIT_ORE: "${JARVIS_COST_HARD_LIMIT_ORE:-}"
+      JARVIS_COUNCIL_MODEL_TIMEOUT_MS: "${JARVIS_COUNCIL_MODEL_TIMEOUT_MS:-}"
+      JARVIS_DB_PASSWORD: "${JARVIS_DB_PASSWORD:-}"
+      JARVIS_DB_USER: "${JARVIS_DB_USER:-}"
+      JARVIS_DISCORD_BOT_TOKEN: "${JARVIS_DISCORD_BOT_TOKEN:-}"
+      JARVIS_DOCKER_BIN: "${JARVIS_DOCKER_BIN:-}"
+      JARVIS_DOCKER_MUTATION_TARGETS: "${JARVIS_DOCKER_MUTATION_TARGETS:-}"
+      JARVIS_DROPBOX_TOKEN: "${JARVIS_DROPBOX_TOKEN:-}"
+      JARVIS_EMAIL_TOKEN: "${JARVIS_EMAIL_TOKEN:-}"
+      JARVIS_ENV: "${JARVIS_ENV:-dev}"
+      JARVIS_EXA_API_KEY: "${JARVIS_EXA_API_KEY:-}"
+      JARVIS_FIKEN_CLIENT_ID: "${JARVIS_FIKEN_CLIENT_ID:-}"
+      JARVIS_FIKEN_CLIENT_SECRET: "${JARVIS_FIKEN_CLIENT_SECRET:-}"
+      JARVIS_FIKEN_COMPANY_SLUG: "${JARVIS_FIKEN_COMPANY_SLUG:-}"
+      JARVIS_FIKEN_REFRESH_TOKEN: "${JARVIS_FIKEN_REFRESH_TOKEN:-}"
+      JARVIS_GCE_MUTATION_TARGETS: "${JARVIS_GCE_MUTATION_TARGETS:-}"
+      JARVIS_GEMINI_MODEL: "${JARVIS_GEMINI_MODEL:-}"
+      JARVIS_GEMMA_LOCAL_MODEL: "${JARVIS_GEMMA_LOCAL_MODEL:-}"
+      JARVIS_GEMMA_LOCAL_URL: "${JARVIS_GEMMA_LOCAL_URL:-}"
+      JARVIS_GEMMA_MODEL: "${JARVIS_GEMMA_MODEL:-}"
+      JARVIS_GITHUB_REPO: "${JARVIS_GITHUB_REPO:-}"
+      JARVIS_GITHUB_TOKEN: "${JARVIS_GITHUB_TOKEN:-}"
+      JARVIS_GIT_ALLOWED_REPOS: "${JARVIS_GIT_ALLOWED_REPOS:-}"
+      JARVIS_GIT_CREDENTIAL_TOKEN: "${JARVIS_GIT_CREDENTIAL_TOKEN:-}"
+      JARVIS_GOOGLE_ACCOUNT: "${JARVIS_GOOGLE_ACCOUNT:-}"
+      JARVIS_GOOGLE_ADS_API_VERSION: "${JARVIS_GOOGLE_ADS_API_VERSION:-}"
+      JARVIS_GOOGLE_ADS_CUSTOMER_ID: "${JARVIS_GOOGLE_ADS_CUSTOMER_ID:-}"
+      JARVIS_GOOGLE_ADS_DEVELOPER_TOKEN: "${JARVIS_GOOGLE_ADS_DEVELOPER_TOKEN:-}"
+      JARVIS_GOOGLE_ADS_LOGIN_CUSTOMER_ID: "${JARVIS_GOOGLE_ADS_LOGIN_CUSTOMER_ID:-}"
+      JARVIS_GOOGLE_ADS_REFRESH_TOKEN: "${JARVIS_GOOGLE_ADS_REFRESH_TOKEN:-}"
+      JARVIS_GOOGLE_CLIENT_ID: "${JARVIS_GOOGLE_CLIENT_ID:-}"
+      JARVIS_GOOGLE_CLIENT_SECRET: "${JARVIS_GOOGLE_CLIENT_SECRET:-}"
+      JARVIS_GOOGLE_CLOUD_PROJECT_ID: "${JARVIS_GOOGLE_CLOUD_PROJECT_ID:-}"
+      JARVIS_GOOGLE_CLOUD_REFRESH_TOKEN: "${JARVIS_GOOGLE_CLOUD_REFRESH_TOKEN:-}"
+      JARVIS_GOOGLE_MAPS_API_KEY: "${JARVIS_GOOGLE_MAPS_API_KEY:-}"
+      JARVIS_GOOGLE_PLACES_API_KEY: "${JARVIS_GOOGLE_PLACES_API_KEY:-}"
+      JARVIS_GOOGLE_ROUTES_API_KEY: "${JARVIS_GOOGLE_ROUTES_API_KEY:-}"
+      JARVIS_GOOGLE_SHEETS_TOKEN: "${JARVIS_GOOGLE_SHEETS_TOKEN:-}"
+      JARVIS_GOOGLE_TOKEN: "${JARVIS_GOOGLE_TOKEN:-}"
+      JARVIS_GRAFANA_API_BASE_URL: "${JARVIS_GRAFANA_API_BASE_URL:-}"
+      JARVIS_GRAFANA_API_KEY: "${JARVIS_GRAFANA_API_KEY:-}"
+      JARVIS_HA_TOKEN: "${JARVIS_HA_TOKEN:-}"
+      JARVIS_HUBSPOT_API_KEY: "${JARVIS_HUBSPOT_API_KEY:-}"
+      JARVIS_JIRA_API_TOKEN: "${JARVIS_JIRA_API_TOKEN:-}"
+      JARVIS_JIRA_BASE_URL: "${JARVIS_JIRA_BASE_URL:-}"
+      JARVIS_JIRA_EMAIL: "${JARVIS_JIRA_EMAIL:-}"
+      JARVIS_JOB_EGRESS_PROXY: "${JARVIS_JOB_EGRESS_PROXY:-}"
+      JARVIS_JOB_IMAGE: "${JARVIS_JOB_IMAGE:-}"
+      JARVIS_JOB_NETWORK: "${JARVIS_JOB_NETWORK:-}"
+      JARVIS_JOB_RUNNER: "${JARVIS_JOB_RUNNER:-}"
+      JARVIS_LINEAR_API_KEY: "${JARVIS_LINEAR_API_KEY:-}"
+      JARVIS_MCP_ZAPIER_SERVER_URL: "${JARVIS_MCP_ZAPIER_SERVER_URL:-}"
+      JARVIS_META_ADS_ACCESS_TOKEN: "${JARVIS_META_ADS_ACCESS_TOKEN:-}"
+      JARVIS_META_ADS_AD_ACCOUNT_ID: "${JARVIS_META_ADS_AD_ACCOUNT_ID:-}"
+      JARVIS_META_ADS_API_VERSION: "${JARVIS_META_ADS_API_VERSION:-}"
+      JARVIS_MODEL_TIMEOUT_MS: "${JARVIS_MODEL_TIMEOUT_MS:-}"
+      JARVIS_NEONOMICS_CLIENT_ID: "${JARVIS_NEONOMICS_CLIENT_ID:-}"
+      JARVIS_NEONOMICS_CLIENT_SECRET: "${JARVIS_NEONOMICS_CLIENT_SECRET:-}"
+      JARVIS_NEONOMICS_DEVICE_ID: "${JARVIS_NEONOMICS_DEVICE_ID:-}"
+      JARVIS_NEONOMICS_ENVIRONMENT: "${JARVIS_NEONOMICS_ENVIRONMENT:-}"
+      JARVIS_NEONOMICS_REALM: "${JARVIS_NEONOMICS_REALM:-}"
+      JARVIS_NEONOMICS_SYNC_HOUR: "${JARVIS_NEONOMICS_SYNC_HOUR:-}"
+      JARVIS_NEONOMICS_TENANT_ID: "${JARVIS_NEONOMICS_TENANT_ID:-}"
+      JARVIS_NOTION_API_KEY: "${JARVIS_NOTION_API_KEY:-}"
+      JARVIS_OLLAMA_URL: "${JARVIS_OLLAMA_URL:-}"
+      JARVIS_ONEDRIVE_TOKEN: "${JARVIS_ONEDRIVE_TOKEN:-}"
+      JARVIS_OUTLOOK_TOKEN: "${JARVIS_OUTLOOK_TOKEN:-}"
+      JARVIS_OWNER_NAME: "${JARVIS_OWNER_NAME:-}"
+      JARVIS_OWNER_PERSON_ID: "${JARVIS_OWNER_PERSON_ID:-}"
+      JARVIS_PIPEDRIVE_API_KEY: "${JARVIS_PIPEDRIVE_API_KEY:-}"
+      JARVIS_PIPEDRIVE_BASE_URL: "${JARVIS_PIPEDRIVE_BASE_URL:-}"
+      JARVIS_PROMETHEUS_API_BASE_URL: "${JARVIS_PROMETHEUS_API_BASE_URL:-}"
+      JARVIS_PROMETHEUS_TOKEN: "${JARVIS_PROMETHEUS_TOKEN:-}"
+      JARVIS_SENTRY_API_TOKEN: "${JARVIS_SENTRY_API_TOKEN:-}"
+      JARVIS_SENTRY_ORG_SLUG: "${JARVIS_SENTRY_ORG_SLUG:-}"
+      JARVIS_SITUATIONS_INTERNAL_TOKEN: "${JARVIS_SITUATIONS_INTERNAL_TOKEN:-}"
+      JARVIS_SLACK_BOT_TOKEN: "${JARVIS_SLACK_BOT_TOKEN:-}"
+      JARVIS_STRIPE_SECRET_KEY: "${JARVIS_STRIPE_SECRET_KEY:-}"
+      JARVIS_STRIPE_SYNC_HOUR: "${JARVIS_STRIPE_SYNC_HOUR:-}"
+      JARVIS_STRIPE_TENANT_ID: "${JARVIS_STRIPE_TENANT_ID:-}"
+      JARVIS_SUPPORT_INBOX_EMAILS: "${JARVIS_SUPPORT_INBOX_EMAILS:-}"
+      JARVIS_TAVILY_API_KEY: "${JARVIS_TAVILY_API_KEY:-}"
+      JARVIS_TELEGRAM_CHAT_ID: "${JARVIS_TELEGRAM_CHAT_ID:-}"
+      JARVIS_TELEGRAM_TOKEN: "${JARVIS_TELEGRAM_TOKEN:-}"
+      JARVIS_TENANT_ID: "${JARVIS_TENANT_ID:-}"
+      JARVIS_TODOIST_API_TOKEN: "${JARVIS_TODOIST_API_TOKEN:-}"
+      JARVIS_TRELLO_API_KEY: "${JARVIS_TRELLO_API_KEY:-}"
+      JARVIS_TRELLO_TOKEN: "${JARVIS_TRELLO_TOKEN:-}"
+      JARVIS_VERCEL_TOKEN: "${JARVIS_VERCEL_TOKEN:-}"
+      JARVIS_VIPPS_CLIENT_ID: "${JARVIS_VIPPS_CLIENT_ID:-}"
+      JARVIS_VIPPS_CLIENT_SECRET: "${JARVIS_VIPPS_CLIENT_SECRET:-}"
+      JARVIS_VIPPS_ENVIRONMENT: "${JARVIS_VIPPS_ENVIRONMENT:-}"
+      JARVIS_VIPPS_MSN: "${JARVIS_VIPPS_MSN:-}"
+      JARVIS_VIPPS_SUBSCRIPTION_KEY: "${JARVIS_VIPPS_SUBSCRIPTION_KEY:-}"
+      JARVIS_VIPPS_SYNC_HOUR: "${JARVIS_VIPPS_SYNC_HOUR:-}"
+      JARVIS_VIPPS_TENANT_ID: "${JARVIS_VIPPS_TENANT_ID:-}"
+      JARVIS_WALLESTER_ACCOUNT_ID: "${JARVIS_WALLESTER_ACCOUNT_ID:-}"
+      JARVIS_WALLESTER_API_BASE_URL: "${JARVIS_WALLESTER_API_BASE_URL:-}"
+      JARVIS_WALLESTER_API_KEY: "${JARVIS_WALLESTER_API_KEY:-}"
+      JARVIS_WALLESTER_ENVIRONMENT: "${JARVIS_WALLESTER_ENVIRONMENT:-}"
+      JARVIS_WALLESTER_PRIVATE_KEY_PEM: "${JARVIS_WALLESTER_PRIVATE_KEY_PEM:-}"
+      JARVIS_WALLESTER_SYNC_HOUR: "${JARVIS_WALLESTER_SYNC_HOUR:-}"
+      JARVIS_WALLESTER_TENANT_ID: "${JARVIS_WALLESTER_TENANT_ID:-}"
+      JARVIS_WATCHDOG_INTERVAL_MS: "${JARVIS_WATCHDOG_INTERVAL_MS:-}"
+      KIMI_API_KEY: "${KIMI_API_KEY:-}"
       LANGFUSE_BASE_URL: "${LANGFUSE_BASE_URL:-http://langfuse:3000}"
+      LANGFUSE_PUBLIC_KEY: "${LANGFUSE_PUBLIC_KEY:-}"
+      LANGFUSE_SECRET_KEY: "${LANGFUSE_SECRET_KEY:-}"
+      LOCAL_LLM_BASE_URL: "${LOCAL_LLM_BASE_URL:-}"
+      LOCAL_LLM_MODEL: "${LOCAL_LLM_MODEL:-}"
       OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    networks: [core, browser]
     depends_on:
       migrate:
         condition: service_completed_successfully
     restart: unless-stopped
 
   voice-gateway:
-    # D-212 (task #120): egen prosess (CLAUDE.md ufravikelig regel 5) - IKKE
-    # en rute i `api`. `JARVIS_CORE_URL` peker på `api`-tjenestens
-    # container-interne adresse - UTEN dette faller gatewayen tilbake til
-    # sin egen default (`http://127.0.0.1:3010`), som er FEIL inne i
-    # compose-nettverket.
-    #
-    # D-253: EGET image (voice-gateway.Dockerfile), IKKE lenger det delte
-    # api.Dockerfile-imaget api/worker/migrate bruker - lokal whisper.cpp/
-    # piper (bygd/hentet i imaget) trenger et glibc-baseimage + en C/C++-
-    # toolchain, som ville blåst opp de tre andre, rent Node-baserte
-    # tjenestene helt unødvendig. Se D-253 i DECISIONS_AND_ASSUMPTIONS.md.
+    # D-212 (task #120): egen prosess (CLAUDE.md ufravikelig regel 5) - IKKE en rute i `api`. `JARVIS_CORE_URL` peker på
+    # `api`-tjenestens container-interne adresse. D-253: EGET image (voice-gateway.Dockerfile) med lokal whisper.cpp/piper.
+    # REMEDIERING DEL 1 (JARVIS-080): rå-lyd-dump er FJERNET (`JARVIS_VOICE_DEBUG_DUMP_DIR` videresendes ikke).
+    # REMEDIERING DEL 2: kun talenøkler (OPENAI/DEEPGRAM/ELEVENLABS) + VAD-konfig, ingen DB-/vault-/connector-hemmeligheter.
+    <<: *hardening
     build:
       context: ../..
       dockerfile: infra/local/voice-gateway.Dockerfile
     environment:
-      JARVIS_VOICE_PORT: "${JARVIS_VOICE_PORT:-3020}"
       JARVIS_CORE_URL: "http://api:${JARVIS_API_PORT:-3010}"
-      # Fra host-miljø (aldri lagret i fil her). OpenAI STT/TTS er kodet og
-      # wiret; Q-32 punkt 1 sin juridiske/eier-verifisering er nå gjort
-      # (D-226, 2026-09-22, processor_terms_status: VERIFIED) - kun `health`-
-      # space (D-23) og klient-oppgitte, ikke server-verifiserte spaces
-      # (D-123) forblir strukturelt avvist - se docs/OPEN_QUESTIONS.md.
-      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
-      # REMEDIERING DEL 1 (JARVIS-080): rå-lyd-dump (D-279/D-280) er FJERNET fra
-      # compose - `JARVIS_VOICE_DEBUG_DUMP_DIR` videresendes ikke lenger og
-      # `./voice-debug-dumps` monteres ikke. Koden krever i tillegg et eksplisitt
-      # samtykke-flagg (se apps/voice-gateway/src/debug-audio-dump.ts), så en
-      # gammel `.env`-verdi alene aktiverer aldri lagring av rå lyd.
-      # D-353 (Tobias direkte i chat: "den hører meg veldig dårlig ... kan
-      # heller ikke bryte han midt i en samtale"). SAMME D-280-disiplin som
-      # over: må listes HER eksplisitt, ellers når en `.env`-verdi ALDRI
-      # containeren. Usatt: `main.ts` sine egne defaultverdier (0.05/700ms,
-      # D-275) gjelder uendret - ingen atferdsendring uten eksplisitt
-      # operatør-handling.
-      JARVIS_VOICE_VAD_THRESHOLD: "${JARVIS_VOICE_VAD_THRESHOLD:-}"
+      # GENERERT fra infra/local/service-env.mjs (SERVICE_ENV.voice) - rediger der, ikke her.
+      JARVIS_DEEPGRAM_API_KEY: "${JARVIS_DEEPGRAM_API_KEY:-}"
+      JARVIS_DEEPGRAM_LANG: "${JARVIS_DEEPGRAM_LANG:-}"
+      JARVIS_ELEVENLABS_API_KEY: "${JARVIS_ELEVENLABS_API_KEY:-}"
+      JARVIS_ELEVENLABS_VOICE_ID: "${JARVIS_ELEVENLABS_VOICE_ID:-}"
+      JARVIS_VOICE_PORT: "${JARVIS_VOICE_PORT:-3020}"
       JARVIS_VOICE_VAD_HANGOVER_MS: "${JARVIS_VOICE_VAD_HANGOVER_MS:-}"
-    # D-362 (Tobias direkte i chat, live NAS-funn under D-361-redeploy:
-    # "failed to bind host port 0.0.0.0:3020/tcp: address already in use").
-    # Root cause: `JARVIS_PUBLIC_VOICE_BASE_URL` (se .env.example) betyr
-    # Tailscale Serve/Funnel ALLEREDE lytter PÅ TAILSCALE-GRENSESNITTET sin
-    # egen 3020-port og reverse-proxyer inn til denne containeren - en
-    # ubundet `3020:3020`-publisering (implisitt `0.0.0.0`, ALLE grensesnitt)
-    # kolliderer derfor med Tailscale sin egen lytter på NØYAKTIG samme port.
-    # Bundet til KUN loopback her: Tailscale Serve forwarder uansett til
-    # `localhost:3020` (ALDRI den rå LAN-/WAN-adressen), så dette endrer
-    # INGEN faktisk nåbarhet for Tobias sin reelle bruk - det fjerner KUN en
-    # unødvendig, bredere eksponering enn det som faktisk trengs (samme
-    # "lokal først, ALDRI direkte til internett uten Tailscale" prinsipp som
-    # regel 9). Container-til-container-kall (ingen finnes i dag for denne
-    # porten - `JARVIS_CORE_URL` over går motsatt vei, api->voice-gateway
-    # finnes ikke) ville uansett brukt tjenestenavnet `voice-gateway:3020`
-    # over det interne Docker-nettverket, aldri denne host-publiseringen.
+      JARVIS_VOICE_VAD_THRESHOLD: "${JARVIS_VOICE_VAD_THRESHOLD:-}"
+      OPENAI_API_KEY: "${OPENAI_API_KEY:-}"
+    # D-362: loopback-binding (Tailscale Serve forwarder til localhost; en ubundet 3020 kolliderte med Tailscale sin lytter).
     ports:
       - "127.0.0.1:${JARVIS_VOICE_PORT:-3020}:${JARVIS_VOICE_PORT:-3020}"
+    networks: [core]
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${JARVIS_VOICE_PORT:-3020}/health >/dev/null"]
       interval: 10s
@@ -283,20 +551,31 @@ services:
     restart: unless-stopped
 
   browser-gateway:
-    # D-339: egen prosess (CLAUDE.md ufravikelig regel 5, SAMME "egen
-    # prosess"-presedens som voice-gateway) - en ekte nettleserøkt har
-    # tilstand (cookies/innlogging/faner) som ikke passer inn i
-    # `api`/`worker`. Ingen database, ingen credentials - `credential_ref`
-    # (`JARVIS_BROWSER_GATEWAY_BASE_URL`) på `api`/`worker`-siden peker
-    # bare på DENNE tjenestens container-interne adresse.
+    # D-339: egen prosess. REMEDIERING DEL 2 (JARVIS-008): krever tjeneste-token (JARVIS_BROWSER_GATEWAY_TOKEN_SECRET) fra
+    # api/worker, kun på det private `browser`-nettverket (ingen host-port), ikke-root (`pwuser`), AKTIV Chromium-sandbox via
+    # Microsofts offisielle seccomp-profil (user namespaces) i stedet for SYS_ADMIN/privileged, read-only rootfs + tmpfs.
+    # Profilen er hentet fra https://github.com/microsoft/playwright/blob/main/utils/docker/seccomp_profile.json (Apache-2.0).
     build:
       context: ../..
       dockerfile: infra/local/browser-gateway.Dockerfile
     environment:
+      # GENERERT fra infra/local/service-env.mjs (SERVICE_ENV.browser) - rediger der, ikke her.
       JARVIS_BROWSER_GATEWAY_PORT: "${JARVIS_BROWSER_GATEWAY_PORT:-3030}"
-    # REMEDIERING DEL 1 (JARVIS-008): INGEN host-publisering. Gatewayen har ingen
-    # autentisering og kjører en delt Chromium-side - den skal kun nås fra api/worker
-    # via det interne Docker-nettverket (`http://browser-gateway:3030`).
+      JARVIS_BROWSER_GATEWAY_TOKEN_SECRET: "${JARVIS_BROWSER_GATEWAY_TOKEN_SECRET:?sett JARVIS_BROWSER_GATEWAY_TOKEN_SECRET (>= 32 tegn) i .env}"
+    networks: [browser]
+    cap_drop: ["ALL"]
+    # D-365 (NAS-probe, ikke gjetting): Chromiums namespace-sandbox kaller chroot("/proc/self/fdinfo/") og feiler uten
+    # SYS_CHROOT når `cap_drop: ALL` er satt ("Zygote process exited prematurely"). Dette er den ENESTE capabilityen som legges
+    # tilbake (SYS_ADMIN/privileged er fortsatt forbudt; sjekket av ops/security/check-containment.mjs).
+    cap_add: ["SYS_CHROOT"]
+    security_opt:
+      - "no-new-privileges:true"
+      - "seccomp=./browser-gateway.seccomp.json"
+    read_only: true
+    tmpfs:
+      - "/tmp:rw,nosuid,size=512m"
+      - "/home/pwuser:rw,nosuid,uid=1000,gid=1000,size=256m"
+    # REMEDIERING DEL 1 (JARVIS-008): INGEN host-publisering - kun api/worker når den via `http://browser-gateway:3030`.
     healthcheck:
       test: ["CMD-SHELL", "wget -qO- http://127.0.0.1:${JARVIS_BROWSER_GATEWAY_PORT:-3030}/health >/dev/null"]
       interval: 10s
@@ -304,6 +583,12 @@ services:
       retries: 6
       start_period: 20s
     restart: unless-stopped
+
+networks:
+  core: {}
+  # Privat nettverk for nettleser-gatewayen: kun api, worker og browser-gateway. Ikke `internal` - Chromium skal nå
+  # internett, men all egress går gjennom gatewayens egen allowlistede proxy (egress-proxy.ts).
+  browser: {}
 
 volumes:
   jarvis-pgdata:

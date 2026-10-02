@@ -20,13 +20,16 @@ import {
   MeshToolExecutor, meshToolDefinitions, ToolGateway, firstWaveTools
 } from "@jarvis/tool-gateway";
 import { ModelGateway, traceSinkFromEnv, type ToolExecutor } from "@jarvis/model-gateway";
+import { loadOwnerConfig } from "@jarvis/contracts";
+// Remediering del 2 (JARVIS-065): eier fra validert konfig (JARVIS_TENANT_ID/JARVIS_OWNER_PERSON_ID/JARVIS_OWNER_NAME), ingen hardkoding.
+const owner = loadOwnerConfig();
 
 const pool = createPool(configFromEnv());
 const OPENAI_MODEL = process.env["JARVIS_OPENAI_MODEL"] ?? "gpt-4o-mini";
 
 // Trusted tool-lag: samme Policy/ToolGateway-pipeline som resten av Jarvis (§17).
 const killSwitch = new KillSwitch();
-const deviceRegistry = new PgDeviceRegistry(pool, "tenant-personal");
+const deviceRegistry = new PgDeviceRegistry(pool, owner.tenant_id);
 await deviceRegistry.refresh().catch(() => undefined);
 const policy = new PolicyGateway({
   devices: deviceRegistry,
@@ -34,8 +37,8 @@ const policy = new PolicyGateway({
   killSwitch,
   // Samme sovereign-owner-wiring som api/worker (BO-11.1 §2).
   authority: {
-    owner_person_id: process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias",
-    owner_tenants: [process.env["JARVIS_TENANT_ID"] ?? "tenant-personal"]
+    owner_person_id: owner.owner_person_id,
+    owner_tenants: [owner.tenant_id]
   }
 });
 const toolGateway = new ToolGateway(pool, policy, new EnvSecretProvider(), new OwnerControls(killSwitch));
@@ -44,7 +47,7 @@ for (const tool of firstWaveTools({
   github: new GithubTransport(), telegram: new TelegramTransport()
 })) toolGateway.register(tool);
 const owner = {
-  person_id: "person-tobias", tenant_id: "tenant-personal", memory_space_id: "personal",
+  person_id: owner.owner_person_id, tenant_id: owner.tenant_id, memory_space_id: "personal",
   session_id: "sess-bo11", device_id: "jarvis-core", channel: "api", auth_strength: "active"
 } as const;
 
@@ -73,7 +76,7 @@ console.log("== STREAMING LIVE (§7) ==");
 for (const provider of ["openai", "anthropic"] as const) {
   const events: StreamEvent[] = [];
   const r = await gw.stream(
-    { tenant_id: "tenant-personal", session_id: "sess-bo11", task_id: `task-bo11-stream-${provider}`, provider, request: REQ("Tell fra 1 til 5, ett tall per ord.", 60) },
+    { tenant_id: owner.tenant_id, session_id: "sess-bo11", task_id: `task-bo11-stream-${provider}`, provider, request: REQ("Tell fra 1 til 5, ett tall per ord.", 60) },
     (e) => events.push(e)
   );
   const deltas = events.filter((e) => e.type === "text_delta").length;
@@ -90,7 +93,7 @@ for (const provider of ["openai", "anthropic"] as const) {
   let deltasBeforeCancel = 0;
   const err = await gw
     .stream(
-      { tenant_id: "tenant-personal", session_id: "sess-bo11", task_id: `task-bo11-cancel-${provider}`, provider, request: REQ("Skriv et langt dikt om fjell, minst 200 ord.", 800) },
+      { tenant_id: owner.tenant_id, session_id: "sess-bo11", task_id: `task-bo11-cancel-${provider}`, provider, request: REQ("Skriv et langt dikt om fjell, minst 200 ord.", 800) },
       (e) => {
         if (e.type === "text_delta") {
           deltasBeforeCancel += 1;
@@ -102,7 +105,7 @@ for (const provider of ["openai", "anthropic"] as const) {
     .then(() => null)
     .catch((e: unknown) => e);
   const kind = err instanceof ProviderError ? err.kind : "feil-type";
-  const next = await gw.complete({ tenant_id: "tenant-personal", session_id: "sess-bo11", provider, request: REQ("Si 'ok'.", 8) });
+  const next = await gw.complete({ tenant_id: owner.tenant_id, session_id: "sess-bo11", provider, request: REQ("Si 'ok'.", 8) });
   console.log(`${provider}: cancel etter ${deltasBeforeCancel} deltas -> ${kind}; neste request OK=${next.text.length > 0}`);
 }
 
@@ -126,7 +129,7 @@ class FailFirst implements ModelProviderAdapter {
 const gwFB = newGateway([new FailFirst(new OpenAiAdapter(undefined, OPENAI_MODEL)), new AnthropicAdapter()]);
 const fbEvents: StreamEvent[] = [];
 const fbResult = await gwFB.stream(
-  { tenant_id: "tenant-personal", session_id: "sess-bo11", task_id: "task-bo11-streamfb", purpose: "CHAT", request: REQ("Si 'stream-fallback-ok'.", 16) },
+  { tenant_id: owner.tenant_id, session_id: "sess-bo11", task_id: "task-bo11-streamfb", purpose: "CHAT", request: REQ("Si 'stream-fallback-ok'.", 16) },
   (e) => fbEvents.push(e)
 );
 const fbEvent = fbEvents.find((e) => e.type === "fallback") as { from: string; to: string; reason: string } | undefined;
@@ -137,7 +140,7 @@ console.log("== TOOL CALLING LIVE (§14-16) ==");
 for (const provider of ["openai", "anthropic"] as const) {
   const { executor, count } = countingExecutor();
   const r = await gw.completeWithTools(
-    { tenant_id: "tenant-personal", session_id: "sess-bo11", task_id: `task-bo11-tool-${provider}`, provider, request: REQ("Hvor mange åpne GitHub-issues har prosjektet nå? Bruk verktøyet og svar kort.") },
+    { tenant_id: owner.tenant_id, session_id: "sess-bo11", task_id: `task-bo11-tool-${provider}`, provider, request: REQ("Hvor mange åpne GitHub-issues har prosjektet nå? Bruk verktøyet og svar kort.") },
     { tools: meshToolDefinitions(), executor }
   );
   console.log(`${provider}: tool_rounds=${r.metadata?.["tool_rounds"]} executions=${count()} svar-len=${r.text.length} (${r.provider}:${r.model})`);
@@ -148,7 +151,7 @@ console.log("== MULTIPLE TOOLS (§23) ==");
 {
   const { executor, count } = countingExecutor();
   const r = await gw.completeWithTools(
-    { tenant_id: "tenant-personal", session_id: "sess-bo11", task_id: "task-bo11-multitool", provider: "openai", request: REQ("Bruk verktøyene til å sjekke BÅDE dagens kalender OG åpne GitHub-issues, og oppsummer begge kort.") },
+    { tenant_id: owner.tenant_id, session_id: "sess-bo11", task_id: "task-bo11-multitool", provider: "openai", request: REQ("Bruk verktøyene til å sjekke BÅDE dagens kalender OG åpne GitHub-issues, og oppsummer begge kort.") },
     { tools: meshToolDefinitions(), executor }
   );
   console.log(`multi: executions=${count()} tool_rounds=${r.metadata?.["tool_rounds"]} svar-len=${r.text.length}`);
@@ -170,7 +173,7 @@ class DieAfterTool implements ModelProviderAdapter {
   const { executor, count } = countingExecutor();
   const gwRec = newGateway([new DieAfterTool(new OpenAiAdapter(undefined, OPENAI_MODEL)), new AnthropicAdapter()]);
   const r = await gwRec.completeWithTools(
-    { tenant_id: "tenant-personal", session_id: "sess-bo11", task_id: "task-bo11-recovery", purpose: "CHAT", request: REQ("Hvor mange åpne GitHub-issues finnes? Bruk verktøyet, svar kort.") },
+    { tenant_id: owner.tenant_id, session_id: "sess-bo11", task_id: "task-bo11-recovery", purpose: "CHAT", request: REQ("Hvor mange åpne GitHub-issues finnes? Bruk verktøyet, svar kort.") },
     { tools: meshToolDefinitions(), executor }
   );
   console.log(`recovery: endte hos ${r.provider} | executions=${count()} (skal være 1) | svar-len=${r.text.length}`);
@@ -181,7 +184,7 @@ console.log("== UNKNOWN TOOL (§26) ==");
 {
   const inner = new MeshToolExecutor(toolGateway, owner);
   const bad: ToolCallRequest = { tool_call_id: "x1", tool_name: "delete_all_files", arguments: {}, provider: "openai", model: OPENAI_MODEL };
-  const res = await inner.execute(bad, { tenant_id: "tenant-personal", idempotency_key: "bo11-unknown" });
+  const res = await inner.execute(bad, { tenant_id: owner.tenant_id, idempotency_key: "bo11-unknown" });
   console.log(`delete_all_files -> success=${res.success} category=${res.error_category}`);
 }
 

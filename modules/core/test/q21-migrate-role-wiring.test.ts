@@ -67,17 +67,21 @@ describe("§9.D/§9.E: admin/runtime config kan ikke resolve hverandres variable
   });
 });
 
-describe("§9.F: docker-compose sin migrate-tjeneste er wired til ADMIN-vars via env_file, ingen runtime-override", () => {
-  it("migrate-blokken setter aldri JARVIS_DB_USER/PASSWORD eksplisitt (ville skygget for env_file/admin-config)", () => {
+describe("§9.F: docker-compose sin migrate-tjeneste er wired til ADMIN-vars (eksplisitt per-tjeneste env, ingen env_file), ingen runtime-override", () => {
+  it("migrate-blokken videresender JARVIS_DB_ADMIN_* og setter aldri JARVIS_DB_USER/PASSWORD til en literal (ville skygget for admin-config)", () => {
     const compose = readSource("../../../infra/local/docker-compose.yml");
     const lines = compose.split("\n");
     const startIdx = lines.findIndex((l) => /^\s*migrate:\s*$/.test(l));
     expect(startIdx).toBeGreaterThan(-1);
     const endIdx = lines.findIndex((l, i) => i > startIdx && /^ {2}\S/.test(l));
     const migrateBlock = lines.slice(startIdx, endIdx === -1 ? undefined : endIdx).join("\n");
-    expect(migrateBlock).toMatch(/env_file:\s*\["\.\.\/\.\.\/\.env"\]/);
-    expect(migrateBlock).not.toMatch(/JARVIS_DB_USER:/);
-    expect(migrateBlock).not.toMatch(/JARVIS_DB_PASSWORD:/);
+    // Del 2 (JARVIS-009): ingen env_file (hele .env-settet) - kun eksplisitt listede variabler.
+    expect(migrateBlock).not.toMatch(/env_file:/);
+    expect(migrateBlock).toMatch(/JARVIS_DB_ADMIN_PASSWORD:\s*"\$\{JARVIS_DB_ADMIN_PASSWORD:-\}"/);
+    expect(migrateBlock).toMatch(/JARVIS_DB_ADMIN_USER:\s*"\$\{JARVIS_DB_ADMIN_USER:-\}"/);
+    // Runtime-variablene kan KUN være ren videresending av samme navn (migrate setter runtime-rollens passord), aldri en literal.
+    expect(migrateBlock).not.toMatch(/JARVIS_DB_USER: +(?!"\$\{JARVIS_DB_USER:-\}")/);
+    expect(migrateBlock).not.toMatch(/JARVIS_DB_PASSWORD: +(?!"\$\{JARVIS_DB_PASSWORD:-\}")/);
   });
 });
 

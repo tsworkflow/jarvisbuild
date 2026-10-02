@@ -1,3 +1,4 @@
+import { guardedFetch } from "./url-safety.ts";
 import type { JsonValue } from "@jarvis/contracts";
 import type { ToolTransport } from "./gateway.ts";
 import { googleAccessToken } from "./live-transports.ts";
@@ -102,7 +103,7 @@ async function gceRequest(options: GceRequestOptions): Promise<JsonValue> {
   const url = `https://compute.googleapis.com/compute/${API_VERSION}/${options.path}`;
   let lastError: GceApiError | undefined;
   for (let attempt = 1; attempt <= MAX_ATTEMPTS; attempt++) {
-    const response = await fetch(url, {
+    const response = await guardedFetch(url, {
       method: options.method,
       headers: { authorization: `Bearer ${options.accessToken}` }
     });

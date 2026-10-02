@@ -8,6 +8,9 @@
 import { configFromEnv, createPool } from "@jarvis/core";
 import { OpenAiAdapter, AnthropicAdapter } from "@jarvis/provider-adapters";
 import { ModelGateway, traceSinkFromEnv } from "@jarvis/model-gateway";
+import { loadOwnerConfig } from "@jarvis/contracts";
+// Remediering del 2 (JARVIS-065): eier fra validert konfig (JARVIS_TENANT_ID/JARVIS_OWNER_PERSON_ID/JARVIS_OWNER_NAME), ingen hardkoding.
+const owner = loadOwnerConfig();
 
 const pool = createPool(configFromEnv());
 const OPENAI_MODEL = process.env["JARVIS_OPENAI_MODEL"] ?? "gpt-4o-mini";
@@ -25,7 +28,7 @@ console.log("== §5 STREAMING-METRICS I COST_EVENTS (Docker-PG) ==");
   let deltas = 0;
   const result = await gateway.stream(
     {
-      tenant_id: process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
+      tenant_id: owner.tenant_id,
       session_id: SESSION,
       purpose: "CHAT",
       request: { messages: [{ role: "user", content: "Svar med ett ord: klar." }], max_tokens: 20 }
@@ -52,8 +55,8 @@ console.log("== §5 STREAMING-METRICS I COST_EVENTS (Docker-PG) ==");
 console.log("== §7 SSE-DISCONNECT → UPSTREAM ABORT (mot kjørende api) ==");
 {
   const body = {
-    person_id: "person-tobias",
-    tenant_id: process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
+    person_id: owner.owner_person_id,
+    tenant_id: owner.tenant_id,
     device_id: "jarvis-core",
     memory_space: "personal",
     channel: "api",

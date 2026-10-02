@@ -3,6 +3,7 @@ import type pg from "pg";
 import { JobContractSchema, type IdentityContext, type JobContract, type MemorySpace } from "@jarvis/contracts";
 import { withTenantTransaction, writeAudit } from "@jarvis/core";
 import type { PolicyGateway } from "@jarvis/policy";
+import { GitPolicyError, assertRepoAllowed, assertTestCommand } from "./git-policy.ts";
 import type { TaskView, WorkflowAdapter } from "./workflow-adapter.ts";
 
 export type TaskServiceResult<T> = { ok: true; value: T } | { ok: false; reason: string };
@@ -12,11 +13,21 @@ export type TaskServiceResult<T> = { ok: true; value: T } | { ok: false; reason:
  * gjennom Policy Gateway (klasse B) før de når køen - sikkerhetsflyt:
  * IdentityContext → policy → DB-transaksjon → skriv → audit.
  */
+export interface TaskServiceOptions {
+  /**
+   * Remediering del 2 (JARVIS-064): når satt, avvises en kodejobb (agent_profile "coding") ved innsending hvis
+   * `repo_url` ikke er eksakt `https://github.com/<owner>/<repo>` i denne allowlisten (tom liste = alt avvises).
+   * Uten verdien håndheves allowlisten kun av kodejobb-handleren ved kjøring (fail closed når git-credential er konfigurert).
+   */
+  readonly codingRepoAllowlist?: readonly string[];
+}
+
 export class TaskService {
   constructor(
     private readonly pool: pg.Pool,
     private readonly queue: WorkflowAdapter,
-    private readonly policy: PolicyGateway
+    private readonly policy: PolicyGateway,
+    private readonly options: TaskServiceOptions = {}
   ) {}
 
   async create(identity: IdentityContext, goal: string): Promise<TaskServiceResult<{ task_id: string }>> {
@@ -93,6 +104,14 @@ export class TaskService {
     if (contract.tenant_id !== identity.tenant_id) {
       return { ok: false, reason: "tenant_mismatch" };
     }
+    // Arkitekt-review av #219 (P1): kontraktens `owner_person_id` blir kodejobbens identitet i workeren (og eier ⇒ SOVEREIGN
+    // i policy). Den MÅ derfor være nøyaktig den verifiserte grant-personen - aldri en verdi klienten selv har satt.
+    if (contract.owner_person_id !== identity.person_id) {
+      await withTenantTransaction(this.pool, identity.tenant_id, (client) =>
+        writeAudit(client, identity, { type: "task.rejected", reason: "owner_mismatch", payload: { task_id: contract.task_id } })
+      );
+      return { ok: false, reason: "owner_mismatch" };
+    }
     // Remediering del 1 (JARVIS-001/010): executive-`command`-jobber (vilkårlig
     // kommandokjøring i worker-containeren) er deaktivert - avvises FØR kø/policy.
     const submittedData = contract.input.data as Record<string, unknown>;
@@ -105,6 +124,22 @@ export class TaskService {
         })
       );
       return { ok: false, reason: "executive_command_disabled" };
+    }
+    // Remediering del 2 (JARVIS-009/064): kodejobb-input valideres deterministisk FØR kø - repo må være allowlistet,
+    // testkommando må være en kjent testløper (aldri en vilkårlig kommando fra en task contract).
+    if (contract.agent_profile === "coding") {
+      try {
+        const testCommand = submittedData["test_command"];
+        if (Array.isArray(testCommand) && testCommand.length > 0) assertTestCommand(testCommand);
+        else if (testCommand !== undefined && testCommand !== null && !Array.isArray(testCommand)) throw new GitPolicyError("test_command_invalid");
+        if (this.options.codingRepoAllowlist !== undefined) assertRepoAllowed(submittedData["repo_url"], this.options.codingRepoAllowlist);
+      } catch (err) {
+        if (!(err instanceof GitPolicyError)) throw err;
+        await withTenantTransaction(this.pool, identity.tenant_id, (client) =>
+          writeAudit(client, identity, { type: "task.rejected", reason: `coding_input_rejected:${err.reason}`, payload: { task_id: contract.task_id } })
+        );
+        return { ok: false, reason: `coding_input_rejected:${err.reason}` };
+      }
     }
     const privateSpaces = ["personal", "health", "business", "project", "home"];
     if (

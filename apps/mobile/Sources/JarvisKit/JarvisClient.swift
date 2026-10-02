@@ -21,12 +21,20 @@ public struct ChatReply: Codable, Sendable {
     public let task_id: String?
 }
 
+/// REMEDIERING DEL 2 (JARVIS-051): godkjenningen er kryptografisk bundet til verktøy, handling,
+/// parameter-hash, tenant, forespørrende person, godkjennende person, utstedelse og utløp (maks 5 min).
+/// UVERIFISERT på Apple-maskinvare (ingen Swift-toolchain i remedieringsmiljøet) - se APPLE_PHASE8_CHECKLIST.
 public struct SignedApproval: Codable, Sendable {
+    public let tool_id: String
     public let action: String
-    public let parameters: [String: String]
+    public let parameters_hash: String
+    public let tenant_id: String
+    public let person_id: String
+    public let approver_person_id: String
+    public let approving_device_id: String
+    public let issued_at: String
     public let expires_at: String
     public let nonce: String
-    public let approving_device_id: String
     public let signature: String
 }
 
@@ -77,20 +85,29 @@ enum KeychainStore {
 }
 
 // MARK: - Godkjenningssignering (klasse D)
-// Kanonisk JSON MÅ matche backendens approvalSigningBytes: nøkler i rekkefølgen
-// action, approving_device_id, expires_at, nonce, parameters (sorterte nøkler).
+// Kanonisk JSON MÅ matche backendens approvalSigningBytes (packages/contracts/src/approval.ts):
+// nøkler i SORTERT rekkefølge: action, approver_person_id, approving_device_id, expires_at,
+// issued_at, nonce, parameters_hash, person_id, tenant_id, tool_id.
+// `parameters_hash` = SHA-256 (hex) av parametrenes kanoniske JSON (sorterte nøkler).
 
 public enum ApprovalSigner {
-    public static func sign(action: String, parameters: [String: String], deviceId: String,
+    public static func sign(toolId: String, action: String, parameters: [String: String], tenantId: String,
+                            personId: String, approverPersonId: String, deviceId: String,
                             validSeconds: TimeInterval, key: Curve25519.Signing.PrivateKey) throws -> SignedApproval {
-        let expires = ISO8601DateFormatter().string(from: Date().addingTimeInterval(validSeconds))
+        let formatter = ISO8601DateFormatter()
+        formatter.formatOptions = [.withInternetDateTime, .withFractionalSeconds]
+        let issued = formatter.string(from: Date())
+        // Serveren avviser levetid over 5 minutter - klienten kapper til samme tak.
+        let expires = formatter.string(from: Date().addingTimeInterval(min(validSeconds, 300)))
         let nonce = "nonce-\(UUID().uuidString.lowercased())"
         let sortedParams = parameters.keys.sorted()
             .map { "\(jsonString($0)):\(jsonString(parameters[$0]!))" }.joined(separator: ",")
-        let canonical = "{\"action\":\(jsonString(action)),\"approving_device_id\":\(jsonString(deviceId)),\"expires_at\":\(jsonString(expires)),\"nonce\":\(jsonString(nonce)),\"parameters\":{\(sortedParams)}}"
+        let parametersHash = SHA256.hash(data: Data("{\(sortedParams)}".utf8)).map { String(format: "%02x", $0) }.joined()
+        let canonical = "{\"action\":\(jsonString(action)),\"approver_person_id\":\(jsonString(approverPersonId)),\"approving_device_id\":\(jsonString(deviceId)),\"expires_at\":\(jsonString(expires)),\"issued_at\":\(jsonString(issued)),\"nonce\":\(jsonString(nonce)),\"parameters_hash\":\(jsonString(parametersHash)),\"person_id\":\(jsonString(personId)),\"tenant_id\":\(jsonString(tenantId)),\"tool_id\":\(jsonString(toolId))}"
         let signature = try key.signature(for: Data(canonical.utf8)).base64EncodedString()
-        return SignedApproval(action: action, parameters: parameters, expires_at: expires,
-                              nonce: nonce, approving_device_id: deviceId, signature: signature)
+        return SignedApproval(tool_id: toolId, action: action, parameters_hash: parametersHash, tenant_id: tenantId,
+                              person_id: personId, approver_person_id: approverPersonId, approving_device_id: deviceId,
+                              issued_at: issued, expires_at: expires, nonce: nonce, signature: signature)
     }
     static func jsonString(_ s: String) -> String {
         let data = try! JSONEncoder().encode(s)
@@ -126,6 +143,12 @@ public actor JarvisClient {
         self.baseURL = baseURL
         self.identity = identity
         completedUtterances = Set(UserDefaults.standard.stringArray(forKey: "jarvis.completed") ?? [])
+    }
+
+    /// Remediering del 2: kontrollrutene tar KUN et grant (aldri en identitet i kroppen).
+    public func currentGrantToken() throws -> String {
+        guard let grantToken else { throw NSError(domain: "Jarvis", code: 401, userInfo: [NSLocalizedDescriptionKey: "grant_required"]) }
+        return grantToken
     }
 
     public func health() async throws -> Bool {

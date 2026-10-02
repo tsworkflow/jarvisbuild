@@ -77,7 +77,8 @@ describe("W1: @jarvis/watchdog er faktisk konsumert av worker-main.ts (WATCHDOG_
     const callIdx = workerMainSource.indexOf("costExplosionCheck(pool,");
     expect(callIdx).toBeGreaterThan(-1);
     const call = workerMainSource.slice(callIdx, workerMainSource.indexOf(")\n);", callIdx) + 1);
-    expect(call).toMatch(/process\.env\["JARVIS_TENANT_ID"\]\s*\?\?\s*"tenant-personal"/);
+    // Remediering del 2 (JARVIS-065): tenant kommer fra den validerte eier-konfigen, ikke en env-default.
+    expect(call).toMatch(/owner\.tenant_id/);
     // ownerPersonId og tenantId er to DISTINKTE argumenter - tenantId erstatter IKKE ownerPersonId.
     expect(call).toContain("ownerControlAuthority.owner_person_id");
   });

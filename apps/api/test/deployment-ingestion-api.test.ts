@@ -29,6 +29,7 @@ import {
 } from "@jarvis/tool-gateway";
 import { ConversationEngine } from "../src/conversation.ts";
 import { createApiServer } from "../src/server.ts";
+import { generateDeviceKey, mintGrant, type TestDeviceKey } from "./support/grant-client.ts";
 
 /**
  * D-105 (UA-5 kriterium 1 host-fix): ENDE-TIL-ENDE HTTP-bevis for den NYE
@@ -63,6 +64,18 @@ const identityB = {
   person_id: "person-deploy-b", tenant_id: TENANT_B, memory_space: "business",
   channel: "api", device_id: "dev-b", session_id: "sess-b", auth_strength: "active"
 } as const;
+
+// Remediering del 2: kontrollrutene tar KUN et grant - identiteten under er bare
+// beskrivelsen av HVEM som skal få et grant utstedt via den ekte enhetsbevis-veien.
+const deviceKeys: Record<string, TestDeviceKey> = { "dev-a": generateDeviceKey(), "dev-b": generateDeviceKey() };
+const grantCache = new Map<string, string>();
+async function grantOf(identity: typeof identityA | typeof identityB): Promise<string> {
+  const cached = grantCache.get(identity.device_id);
+  if (cached) return cached;
+  const token = await mintGrant(baseUrl, identity, deviceKeys[identity.device_id]!);
+  grantCache.set(identity.device_id, token);
+  return token;
+}
 
 const FAKE_TOKEN = "fake-github-token-D105-TEST-NEVER-REAL-9f3a";
 
@@ -138,9 +151,12 @@ beforeAll(async () => {
     INSERT INTO tenants (tenant_id, name, kind) VALUES ('${TENANT_A}','DeployA','business'), ('${TENANT_B}','DeployB','business');
     INSERT INTO people (person_id, display_name) VALUES ('person-deploy-a','A'), ('person-deploy-b','B');
     INSERT INTO person_tenants (person_id, tenant_id) VALUES ('person-deploy-a','${TENANT_A}'), ('person-deploy-b','${TENANT_B}');
-    INSERT INTO devices (device_id, tenant_id, person_id, kind) VALUES ('dev-a','${TENANT_A}','person-deploy-a','api'), ('dev-b','${TENANT_B}','person-deploy-b','api');
     INSERT INTO memory_spaces (memory_space_id, tenant_id, space) VALUES ('sp-a','${TENANT_A}','business'), ('sp-b','${TENANT_B}','business');
   `);
+  await adminPool.query(
+    "INSERT INTO devices (device_id, tenant_id, person_id, kind, public_key_pem) VALUES ('dev-a',$1,'person-deploy-a','api',$3), ('dev-b',$2,'person-deploy-b','api',$4)",
+    [TENANT_A, TENANT_B, deviceKeys["dev-a"]!.publicKeyPem, deviceKeys["dev-b"]!.publicKeyPem]
+  );
   appPool = createPool({ host: "127.0.0.1", port: PORT, database: "jarvis_test", user: "jarvis_test_deploy_ingest", password: "pw2" });
 
   githubTransport = new FakeGithubTransport();
@@ -174,6 +190,7 @@ beforeAll(async () => {
     // D-130/D-131: `ApiDeps.channelAuthority` og `ApiDeps.grants` er nå
     // påkrevde - strukturelt nødvendige her, ikke brukt av denne testens
     // `/deployments/ingest/github`-fokus.
+    devices: deviceService,
     grants: grantService,
     channelAuthority: new ChannelSessionAuthority({
       pool: appPool, devices: deviceService, sessions: sessionService, identity: identityService, grants: grantService
@@ -209,21 +226,21 @@ async function ingest(body: Record<string, unknown>): Promise<{ status: number; 
 async function correlate(identity: unknown, incident_id: string, repo: string = REPO): Promise<{ status: number; body: Record<string, unknown> }> {
   const response = await fetch(`${baseUrl}/incidents/correlate`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ identity, memory_space: "business", incident_id, repo })
+    body: JSON.stringify({ grant_token: await grantOf(identity as typeof identityA), incident_id, repo })
   });
   return { status: response.status, body: (await response.json()) as Record<string, unknown> };
 }
 
 describe("D-105 host-fix: POST /deployments/ingest/github - EKTE ToolGateway.execute()-vei, ALDRI direkte HTTP", () => {
   it("A: identitet nektes -> 403, INGEN ingestion utført", async () => {
-    const result = await ingest({ identity: { person_id: "unknown", tenant_id: "unknown", device_id: "x", memory_space: "business", channel: "api" }, repo: REPO, workflow_run_id: "555" });
+    const result = await ingest({ grant_token: "grt_ikke-utstedt-av-serveren", repo: REPO, workflow_run_id: "555" });
     expect(result.status).toBe(403);
     expect(result.body["error"]).toBe("identity_denied");
   });
 
   it("B: happy path - ekte ToolGateway-kall normaliseres og persisteres, canonical deployment + provenance returneres", async () => {
     githubTransport.workflowRun = defaultRun({ id: "600", head_sha: "sha-happy-path", head_branch: "main", conclusion: "success" });
-    const result = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "600" });
+    const result = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "600" });
     expect(result.status).toBe(200);
     const deployment = result.body["deployment"] as Record<string, unknown>;
     expect(deployment["commit_sha"]).toBe("sha-happy-path");
@@ -241,37 +258,37 @@ describe("D-105 host-fix: POST /deployments/ingest/github - EKTE ToolGateway.exe
 
   it("C: idempotent - SAMME workflow_run_id gir INGEN duplikat, created=false andre gang", async () => {
     githubTransport.workflowRun = defaultRun({ id: "601", head_sha: "sha-idem", head_branch: "main" });
-    const first = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "601" });
+    const first = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "601" });
     expect(first.body["created"]).toBe(true);
-    const second = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "601" });
+    const second = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "601" });
     expect(second.body["created"]).toBe(false);
     expect((second.body["deployment"] as Record<string, unknown>)["deployment_id"]).toBe((first.body["deployment"] as Record<string, unknown>)["deployment_id"]);
   });
 
   it("D: success/failure/cancelled-mapping uten løgn - EKSPLISITT, ALDRI en antatt suksess", async () => {
     githubTransport.workflowRun = defaultRun({ id: "610", conclusion: "failure" });
-    const failed = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "610" });
+    const failed = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "610" });
     expect((failed.body["deployment"] as Record<string, unknown>)["status"]).toBe("failure");
 
     githubTransport.workflowRun = defaultRun({ id: "611", conclusion: "cancelled" });
-    const cancelled = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "611" });
+    const cancelled = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "611" });
     expect((cancelled.body["deployment"] as Record<string, unknown>)["status"]).toBe("cancelled");
 
     // Tvetydig/ukjent conclusion (f.eks. "neutral") -> KONSERVATIVT "failure", ALDRI gjettet "success":
     githubTransport.workflowRun = defaultRun({ id: "612", conclusion: "neutral" });
-    const ambiguous = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "612" });
+    const ambiguous = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "612" });
     expect((ambiguous.body["deployment"] as Record<string, unknown>)["status"]).toBe("failure");
 
     // status != completed -> in_progress, uansett hva conclusion (er null) sier:
     githubTransport.workflowRun = defaultRun({ id: "613", status: "in_progress", conclusion: null });
-    const running = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "613" });
+    const running = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "613" });
     expect((running.body["deployment"] as Record<string, unknown>)["status"]).toBe("in_progress");
   });
 
   it("E: provider utilgjengelig (feilende get_workflow_run) -> 502, ALDRI en fabrikkert deployment", async () => {
     githubTransport.failWorkflowRun = "github_500_simulated_outage";
     try {
-      const result = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "620" });
+      const result = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "620" });
       expect(result.status).toBe(502);
       expect(result.body["error"]).toBe("provider_unavailable");
     } finally {
@@ -282,7 +299,7 @@ describe("D-105 host-fix: POST /deployments/ingest/github - EKTE ToolGateway.exe
   it("F: manglende workflow (404-lignende) -> 502 provider_unavailable, ALDRI en gjettet deployment", async () => {
     githubTransport.workflowRun = null;
     try {
-      const result = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "not-found-621" });
+      const result = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "not-found-621" });
       expect(result.status).toBe(502);
     } finally {
       githubTransport.workflowRun = defaultRun();
@@ -291,7 +308,7 @@ describe("D-105 host-fix: POST /deployments/ingest/github - EKTE ToolGateway.exe
 
   it("G: misdannet provider-respons (mangler head_sha) -> 422 invalid_provider_response, ALDRI fabrikkert commit_sha", async () => {
     githubTransport.workflowRun = defaultRun({ id: "630", head_sha: "" });
-    const result = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "630" });
+    const result = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "630" });
     expect(result.status).toBe(422);
     expect(result.body["error"]).toBe("invalid_provider_response");
   });
@@ -299,7 +316,7 @@ describe("D-105 host-fix: POST /deployments/ingest/github - EKTE ToolGateway.exe
   it("H: misdannet provider-respons (mangler created_at) -> 422, ALDRI Date.now()-fallback kalt providersannhet", async () => {
     githubTransport.workflowRun = defaultRun({ id: "631" });
     delete githubTransport.workflowRun["created_at"];
-    const result = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "631" });
+    const result = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "631" });
     expect(result.status).toBe(422);
     githubTransport.workflowRun = defaultRun();
   });
@@ -308,7 +325,7 @@ describe("D-105 host-fix: POST /deployments/ingest/github - EKTE ToolGateway.exe
     githubTransport.workflowRun = defaultRun({ id: "640", head_sha: "sha-no-commit-enrichment" });
     githubTransport.failCommit = true;
     try {
-      const result = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "640" });
+      const result = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "640" });
       expect(result.status).toBe(200);
       expect((result.body["deployment"] as Record<string, unknown>)["commit_sha"]).toBe("sha-no-commit-enrichment");
       expect((result.body["provenance"] as Record<string, unknown>)["commit_message"]).toBeUndefined();
@@ -319,9 +336,9 @@ describe("D-105 host-fix: POST /deployments/ingest/github - EKTE ToolGateway.exe
 
   it("J: TENANT-ISOLASJON - tenant B sin ingestion av SAMME repo er en SEPARAT rad, tenant A ser den ikke som sin active_deployment", async () => {
     githubTransport.workflowRun = defaultRun({ id: "650", head_sha: "sha-tenant-a", created_at: "2026-08-22T08:00:00Z" });
-    await ingest({ identity: identityA, repo: REPO, workflow_run_id: "650" });
+    await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "650" });
     githubTransport.workflowRun = defaultRun({ id: "651", head_sha: "sha-tenant-b", created_at: "2026-08-22T08:30:00Z" });
-    await ingest({ identity: identityB, repo: REPO, workflow_run_id: "651" });
+    await ingest({ grant_token: await grantOf(identityB), repo: REPO, workflow_run_id: "651" });
 
     const activeA = await deploymentService.findActiveDeployment(TENANT_A, REPO);
     const activeB = await deploymentService.findActiveDeployment(TENANT_B, REPO);
@@ -331,7 +348,7 @@ describe("D-105 host-fix: POST /deployments/ingest/github - EKTE ToolGateway.exe
 
   it("K: hemmeligheter lekker ALDRI - FAKE_TOKEN-verdien dukker ikke opp i noe response-felt", async () => {
     githubTransport.workflowRun = defaultRun({ id: "660" });
-    const result = await ingest({ identity: identityA, repo: REPO, workflow_run_id: "660" });
+    const result = await ingest({ grant_token: await grantOf(identityA), repo: REPO, workflow_run_id: "660" });
     expect(JSON.stringify(result.body)).not.toContain(FAKE_TOKEN);
   });
 });
@@ -341,12 +358,12 @@ describe("D-105 host-fix: /incidents/correlate bruker canonical DeploymentServic
     const repoL = `${REPO}-l`;
     const create = await fetch(`${baseUrl}/incidents/create`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ identity: identityA, memory_space: "business", title: "D-105 korrelasjonstest L" })
+      body: JSON.stringify({ grant_token: await grantOf(identityA), title: "D-105 korrelasjonstest L" })
     });
     const incident = ((await create.json()) as { incident: { incident_id: string } }).incident;
 
     githubTransport.workflowRun = defaultRun({ id: "670", head_sha: "sha-correlate-l", created_at: "2026-08-22T07:00:00Z" });
-    await ingest({ identity: identityA, repo: repoL, workflow_run_id: "670" });
+    await ingest({ grant_token: await grantOf(identityA), repo: repoL, workflow_run_id: "670" });
 
     const result = await correlate(identityA, incident.incident_id, repoL);
     expect(result.status).toBe(200);
@@ -358,19 +375,19 @@ describe("D-105 host-fix: /incidents/correlate bruker canonical DeploymentServic
     const repoM = `${REPO}-m`;
     const create = await fetch(`${baseUrl}/incidents/create`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ identity: identityA, memory_space: "business", title: "D-105 korrelasjonstest M" })
+      body: JSON.stringify({ grant_token: await grantOf(identityA), title: "D-105 korrelasjonstest M" })
     });
     const incident = ((await create.json()) as { incident: { incident_id: string } }).incident;
 
     githubTransport.workflowRun = defaultRun({ id: "680", head_sha: "sha-suspect-m", created_at: "2026-08-22T06:00:00Z" });
-    const ingested = await ingest({ identity: identityA, repo: repoM, workflow_run_id: "680" });
+    const ingested = await ingest({ grant_token: await grantOf(identityA), repo: repoM, workflow_run_id: "680" });
     const deploymentId = (ingested.body["deployment"] as Record<string, unknown>)["deployment_id"] as string;
 
     // Log-bevis OBSERVERT ETTER deployen (06:30) - suspect_deployment skal peke på 680.
     await fetch(`${baseUrl}/incidents/evidence/add`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        identity: identityA, memory_space: "business", incident_id: incident.incident_id,
+        grant_token: await grantOf(identityA), incident_id: incident.incident_id,
         source_type: "log", summary: "500-feil observert i produksjon", observed_at: "2026-08-22T06:30:00Z"
       })
     });
@@ -378,7 +395,7 @@ describe("D-105 host-fix: /incidents/correlate bruker canonical DeploymentServic
     await fetch(`${baseUrl}/incidents/evidence/add`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({
-        identity: identityA, memory_space: "business", incident_id: incident.incident_id,
+        grant_token: await grantOf(identityA), incident_id: incident.incident_id,
         source_type: "deployment", source_ref: deploymentId, summary: "mistenkt utløsende deploy",
         observed_at: "2026-08-22T06:29:00Z"
       })
@@ -400,7 +417,7 @@ describe("D-105 host-fix: /incidents/correlate bruker canonical DeploymentServic
   it("N: INGEN suspect_deployment når tidsdata IKKE støtter det (ingen bevis registrert ennå)", async () => {
     const create = await fetch(`${baseUrl}/incidents/create`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ identity: identityA, memory_space: "business", title: "D-105 korrelasjonstest N" })
+      body: JSON.stringify({ grant_token: await grantOf(identityA), title: "D-105 korrelasjonstest N" })
     });
     const incident = ((await create.json()) as { incident: { incident_id: string } }).incident;
     const result = await correlate(identityA, incident.incident_id);

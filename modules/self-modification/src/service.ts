@@ -2,7 +2,10 @@ import { randomUUID } from "node:crypto";
 import type pg from "pg";
 import type { IdentityContext, JobContract } from "@jarvis/contracts";
 import type { SandboxRunner, TaskService } from "@jarvis/tasks";
-import { GIT_CREDENTIAL_ISOLATION_ARGS, createGitAuthHandle, publishPullRequestForCodingJob, type PrPublishingGateway } from "@jarvis/tasks";
+import {
+  GIT_CREDENTIAL_ISOLATION_ARGS, GIT_HARDENING_ARGS, GIT_LOCAL_HARDENING_ARGS, assertRepoAllowed, createGitAuthHandle,
+  githubCredentialScope, publishPullRequestForCodingJob, type PrPublishingGateway
+} from "@jarvis/tasks";
 import { classifySelfModification } from "./policy.ts";
 import { PersonalityConfigSchema, type PersonalityConfig, type SelfModificationRequest, type SelfModificationRequestStatus } from "./types.ts";
 import type { SelfModificationGithubClient } from "./github-client.ts";
@@ -151,29 +154,32 @@ export class SelfModificationService {
     if (!gitToken) throw new Error("self_modification_git_auth_unavailable");
 
     const branch = `jarvis/self-mod/personality-${Date.now()}`;
-    const gitAuth = await createGitAuthHandle(gitToken);
+    // Remediering del 2 (JARVIS-064): credentialen gjelder kun github.com + dette ene (konfigurerte) repoet.
+    const repoUrl = `https://github.com/${this.repoSlug}.git`;
+    const repoRef = assertRepoAllowed(repoUrl, [this.repoSlug.toLowerCase()]);
+    const gitAuth = await createGitAuthHandle(gitToken, githubCredentialScope(repoRef.slug));
     const sandbox = await this.deps.sandbox.create();
     try {
-      const netArgs = (args: string[]): string[] => [...GIT_CREDENTIAL_ISOLATION_ARGS, ...gitAuth.credentialHelperArgs, ...args];
-      const repoUrl = `https://github.com/${this.repoSlug}.git`;
+      const netArgs = (args: string[]): string[] => [...GIT_CREDENTIAL_ISOLATION_ARGS, ...gitAuth.credentialHelperArgs, ...GIT_HARDENING_ARGS, ...args];
+      const localGit = (args: string[]) => sandbox.exec("git", [...GIT_LOCAL_HARDENING_ARGS, ...args]);
       const mustOk = (label: string, result: { code: number; stderr?: string }) => {
         if (result.code !== 0) throw new Error(`self_modification_${label}_failed:${(result.stderr ?? "").slice(0, 200)}`);
       };
-      mustOk("clone", sandbox.exec("git", netArgs(["clone", "--depth", "1", "--branch", this.baseBranch, repoUrl, "."]), undefined, gitAuth.env));
-      mustOk("branch", sandbox.exec("git", ["checkout", "-b", branch]));
+      mustOk("clone", sandbox.exec("git", netArgs(["clone", "--depth", "1", "--branch", this.baseBranch, "--", repoRef.canonicalUrl, "."]), undefined, gitAuth.env));
+      mustOk("branch", localGit(["checkout", "-b", branch]));
       const content = `${JSON.stringify(config, null, 2)}\n`;
       const writeResult = sandbox.exec("node", ["-e", `require('fs').writeFileSync(${JSON.stringify(PERSONALITY_CONFIG_PATH)}, ${JSON.stringify(content)})`]);
       mustOk("write_config", writeResult);
-      mustOk("add", sandbox.exec("git", ["add", "--", PERSONALITY_CONFIG_PATH]));
+      mustOk("add", localGit(["add", "--", PERSONALITY_CONFIG_PATH]));
       // D-101-mønster (coding.ts): sjekk at NØYAKTIG den forventede stien ble
       // endret FØR commit - en agent/prosess-feil som ved et uhell rørte en
       // annen fil skal ALDRI committes stille.
-      const staged = sandbox.exec("git", ["diff", "--cached", "--name-only"]);
+      const staged = localGit(["diff", "--cached", "--name-only"]);
       const stagedPaths = staged.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
       if (stagedPaths.length !== 1 || stagedPaths[0] !== PERSONALITY_CONFIG_PATH) {
         throw new Error(`self_modification_unexpected_staged_paths:${stagedPaths.join(",")}`);
       }
-      mustOk("commit", sandbox.exec("git", ["commit", "-m", `jarvis: oppdater Charlie sin personlighetskonfig (${identity.person_id})`]));
+      mustOk("commit", localGit(["commit", "-m", `jarvis: oppdater Charlie sin personlighetskonfig (${identity.person_id})`]));
       mustOk("push", sandbox.exec("git", netArgs(["push", "origin", `${branch}:${branch}`]), undefined, gitAuth.env));
 
       const taskId = `self-mod-${randomUUID()}`;
@@ -355,7 +361,7 @@ export class SelfModificationService {
     }
     const jobIdentity: IdentityContext = {
       person_id: this.deps.ownerPersonId, tenant_id: request.coding_tenant_id, memory_space_id: "personal",
-      session_id: "sess-self-mod-sweep", device_id: "jarvis-core", channel: "api", auth_strength: "active"
+      session_id: `sess-self-mod-sweep-${randomUUID().slice(0, 8)}`, device_id: "jarvis-core", channel: "api", auth_strength: "active"
     };
     const task = await this.deps.taskService.get(jobIdentity, request.coding_task_id);
     if (!task.ok) return "pending"; // f.eks. et forbigående policy-avslag - prøves igjen neste sveip

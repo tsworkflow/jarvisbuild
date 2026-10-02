@@ -5,7 +5,7 @@ import { join } from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { approvalSigningBytes, type ApprovalPayload, type IdentityContext, type SignedApproval } from "@jarvis/contracts";
+import { signApproval, type ApprovalPayload, type IdentityContext, type JsonValue, type SignedApproval } from "@jarvis/contracts";
 import { DeviceService, FakePushAdapter, PgApprovalStore, PgDeviceRegistry, SessionService, createPool, runMigrations } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { KillSwitch, PolicyGateway } from "@jarvis/policy";
@@ -24,13 +24,16 @@ const identity: IdentityContext = {
   session_id: "sess-f8", device_id: "dev-pc", channel: "web", auth_strength: "active"
 };
 
-function approval(overrides: Partial<ApprovalPayload> = {}, key = watchKeys.privateKey): SignedApproval {
-  const payload: ApprovalPayload = {
-    action: "unlock_front_door", parameters: { door: "front" },
-    expires_at: new Date(Date.now() + 60_000).toISOString(),
-    nonce: `nonce-${randomUUID()}`, approving_device_id: "watch-tobias", ...overrides
-  };
-  return { ...payload, signature: sign(null, approvalSigningBytes(payload), key).toString("base64") };
+function approval(
+  overrides: Partial<Omit<ApprovalPayload, "parameters_hash">> & { parameters?: Record<string, JsonValue> } = {},
+  key = watchKeys.privateKey
+): SignedApproval {
+  const { parameters = { door: "front" }, ...rest } = overrides;
+  return signApproval(key, {
+    tool_id: "ha", action: "unlock_front_door", tenant_id: identity.tenant_id, person_id: identity.person_id,
+    approver_person_id: identity.person_id, nonce: `nonce-${randomUUID()}`, approving_device_id: "watch-tobias",
+    parameters, ...rest
+  });
 }
 
 beforeAll(async () => {
@@ -71,7 +74,6 @@ describe("Enhetsidentitet: registrering + DB-basert godkjenningsverifisering", (
       public_key_pem: watchKeys.publicKey.export({ type: "spki", format: "pem" }).toString()
     });
     const registry = new PgDeviceRegistry(appPool, "tenant-a");
-    await registry.refresh();
     const policy = new PolicyGateway({
       devices: registry, nonces: new PgApprovalStore(appPool), killSwitch: new KillSwitch()
     });
@@ -92,8 +94,8 @@ describe("Enhetsidentitet: registrering + DB-basert godkjenningsverifisering", (
 
   it("enhetsnøkler er tenant-isolerte (RLS): tenant-b ser ikke tenant-a sin Watch", async () => {
     const registryB = new PgDeviceRegistry(appPool, "tenant-b");
-    await registryB.refresh();
-    expect(registryB.publicKeyFor("watch-tobias")).toBeUndefined();
+    expect(await registryB.approverFor("watch-tobias", "tenant-b")).toBeUndefined();
+    expect(await registryB.approverFor("watch-tobias", "tenant-a")).toBeDefined();
   });
 
   it("challenge-respons: gyldig signatur bevises; replay og feil nøkkel avvises", async () => {

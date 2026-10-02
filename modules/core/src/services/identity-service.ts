@@ -72,7 +72,7 @@ export class IdentityService {
     }
 
     const device = await client.query(
-      "SELECT 1 FROM devices WHERE device_id = $1 AND tenant_id = $2 AND person_id = $3",
+      "SELECT 1 FROM devices WHERE device_id = $1 AND tenant_id = $2 AND person_id = $3 AND revoked_at IS NULL",
       [input.device_id, input.tenant_id, input.person_id]
     );
     if (!device.rowCount) {

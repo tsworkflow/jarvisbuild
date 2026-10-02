@@ -202,11 +202,10 @@ describe("A: /executive/query med gyldig grant henter EKTE data for begge lese-h
 });
 
 describe("B: /executive/query avviser et ugyldig/manglende grant FØR gateway.execute() kalles", () => {
-  it("uten grant_token: 400 malformed_request/grant_malformed (parseGrantBody() sitt fail-closed-krav om grant_token), gateway.execute() ALDRI kalt", async () => {
+  it("uten grant_token: 401 grant_required (avvist FØR noen domeneoperasjon), gateway.execute() ALDRI kalt", async () => {
     const res = await post("/executive/query", { action: "get_attention_queue" });
-    expect(res.status).toBe(400);
-    expect(res.body["error"]).toBe("malformed_request");
-    expect(res.body["reason"]).toBe("grant_malformed");
+    expect(res.status).toBe(401);
+    expect(res.body["error"]).toBe("grant_required");
     expect(executeCalls).toHaveLength(0);
   });
 
@@ -252,11 +251,11 @@ describe("C: /executive/query begrenser SEG SELV til det hardkodede lese-allowli
     expect(executeCalls).toHaveLength(0);
   });
 
-  it("ukjent kroppsfelt (f.eks. 'tenant_id') avvises fail-closed: 400 malformed_request/grant_malformed", async () => {
+  it("ukjent kroppsfelt (f.eks. 'tenant_id') avvises fail-closed: 400 identity_field_forbidden", async () => {
     const grant = await validGrant();
     const res = await post("/executive/query", { grant_token: grant, action: "get_attention_queue", tenant_id: TENANT_A });
     expect(res.status).toBe(400);
-    expect(res.body["reason"]).toBe("grant_malformed");
+    expect(res.body["error"]).toBe("identity_field_forbidden");
     expect(executeCalls).toHaveLength(0);
   });
 });
@@ -311,10 +310,9 @@ describe("D: /owner-controls/connector-credentials med gyldig grant videreformid
 });
 
 describe("E: /owner-controls/connector-credentials avviser et ugyldig/manglende grant FØR gateway.execute() kalles", () => {
-  it("uten grant_token: 400 malformed_request/grant_malformed, gateway.execute() ALDRI kalt", async () => {
+  it("uten grant_token: 401 grant_required (avvist FØR noen domeneoperasjon), gateway.execute() ALDRI kalt", async () => {
     const res = await post("/owner-controls/connector-credentials", { action: "test_connector", parameters: { connector_id: "github" } });
-    expect(res.status).toBe(400);
-    expect(res.body["reason"]).toBe("grant_malformed");
+    expect(res.status).toBe(401);
     expect(executeCalls).toHaveLength(0);
   });
 
@@ -353,11 +351,11 @@ describe("F: /owner-controls/connector-credentials begrenser SEG SELV til NØYAK
     expect(executeCalls).toHaveLength(0);
   });
 
-  it("ukjent kroppsfelt avvises fail-closed: 400 malformed_request/grant_malformed", async () => {
+  it("ukjent kroppsfelt avvises fail-closed: 400 identity_field_forbidden", async () => {
     const grant = await validGrant();
     const res = await post("/owner-controls/connector-credentials", { grant_token: grant, action: "test_connector", tenant_id: TENANT_A });
     expect(res.status).toBe(400);
-    expect(res.body["reason"]).toBe("grant_malformed");
+    expect(res.body["error"]).toBe("identity_field_forbidden");
     expect(executeCalls).toHaveLength(0);
   });
 });
@@ -417,10 +415,9 @@ describe("G: /executive/mutate med gyldig grant videreformidler til executive.* 
 });
 
 describe("H: /executive/mutate avviser et ugyldig/manglende grant FØR gateway.execute() kalles", () => {
-  it("uten grant_token: 400 malformed_request/grant_malformed, gateway.execute() ALDRI kalt", async () => {
+  it("uten grant_token: 401 grant_required (avvist FØR noen domeneoperasjon), gateway.execute() ALDRI kalt", async () => {
     const res = await post("/executive/mutate", { action: "pause_domain", parameters: { domain: "finance", reason: "test" } });
-    expect(res.status).toBe(400);
-    expect(res.body["reason"]).toBe("grant_malformed");
+    expect(res.status).toBe(401);
     expect(executeCalls).toHaveLength(0);
   });
 
@@ -467,11 +464,11 @@ describe("I: /executive/mutate begrenser SEG SELV til de 12 mutasjonshandlingene
     expect(executeCalls).toHaveLength(0);
   });
 
-  it("ukjent kroppsfelt (f.eks. 'tenant_id') avvises fail-closed: 400 malformed_request/grant_malformed", async () => {
+  it("ukjent kroppsfelt (f.eks. 'tenant_id') avvises fail-closed: 400 identity_field_forbidden", async () => {
     const grant = await validGrant();
     const res = await post("/executive/mutate", { grant_token: grant, action: "pause_domain", tenant_id: TENANT_A });
     expect(res.status).toBe(400);
-    expect(res.body["reason"]).toBe("grant_malformed");
+    expect(res.body["error"]).toBe("identity_field_forbidden");
     expect(executeCalls).toHaveLength(0);
   });
 });

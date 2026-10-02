@@ -3,6 +3,7 @@ import { chmod, mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
+import type { GitCredentialScope } from "../src/git-auth.ts";
 import { GIT_CREDENTIAL_ISOLATION_ARGS, GIT_CREDENTIAL_TOKEN_ENV, buildCredentialHelperConfigValue, createGitAuthHandle } from "@jarvis/tasks";
 import { type GitSmartHttpServer, startGitSmartHttpServer } from "./support/git-smart-http-server.ts";
 
@@ -120,6 +121,7 @@ async function writeBrokenJarvisHelperConfigValue(): Promise<string> {
 describe("D-103 HOST-FIX v2: ambient credential.helper kan IKKE kapre Jarvis sin eksplisitte git credential.helper", () => {
   let server: GitSmartHttpServer;
   let fakeSystemConfig: string;
+  let TEST_SCOPE: GitCredentialScope;
   const baseEnv = () => ({ PATH: process.env["PATH"] ?? "", GIT_TERMINAL_PROMPT: "0" });
 
   beforeAll(async () => {
@@ -130,6 +132,8 @@ describe("D-103 HOST-FIX v2: ambient credential.helper kan IKKE kapre Jarvis sin
       { user: JARVIS_HELPER_USER, pass: JARVIS_TOKEN }
     ]);
     server.createBareRepo("repo.git");
+    // Scopet må matche test-serveren (loopback + dynamisk port + repo `repo.git`) - samme mekanisme som github.com i produksjon.
+    TEST_SCOPE = { protocol: "http", host: new URL(server.url("repo.git")).host, path: "repo" };
     const seed = await mkdtemp(join(tmpdir(), "jarvis-gitauth-hostfix-seed-"));
     git(seed, { ...process.env, HOME: seed }, "init", "--initial-branch=main", ".");
     git(seed, { ...process.env, HOME: seed }, "config", "user.email", "seed@test");
@@ -175,7 +179,7 @@ describe("D-103 HOST-FIX v2: ambient credential.helper kan IKKE kapre Jarvis sin
   });
 
   it("C: MED FULL isolasjon (reset + Jarvis sin registrerte credential.helper, D-103 HOST-FIX v1+v2) vinner Jarvis sin identitet, ALDRI ambient - clone lykkes mot en ekte, kontrollert git-transport", async () => {
-    const gitAuth = await createGitAuthHandle(JARVIS_TOKEN);
+    const gitAuth = await createGitAuthHandle(JARVIS_TOKEN, TEST_SCOPE);
     try {
       const dir = await mkdtemp(join(tmpdir(), "jarvis-gitauth-hostfix-clone-c-"));
       const env = { ...baseEnv(), GIT_CONFIG_SYSTEM: fakeSystemConfig, ...gitAuth.env };
@@ -192,7 +196,7 @@ describe("D-103 HOST-FIX v2: ambient credential.helper kan IKKE kapre Jarvis sin
   });
 
   it("D: push lykkes OGSÅ mot en ekte, kontrollert git-transport MED full isolasjon - identitet forblir Jarvis sin, ALDRI ambient, gjennom BEGGE nettverkskall (clone OG push)", async () => {
-    const gitAuth = await createGitAuthHandle(JARVIS_TOKEN);
+    const gitAuth = await createGitAuthHandle(JARVIS_TOKEN, TEST_SCOPE);
     try {
       const dir = await mkdtemp(join(tmpdir(), "jarvis-gitauth-hostfix-push-d-"));
       const env = { ...baseEnv(), GIT_CONFIG_SYSTEM: fakeSystemConfig, ...gitAuth.env };
@@ -217,7 +221,7 @@ describe("D-103 HOST-FIX v2: ambient credential.helper kan IKKE kapre Jarvis sin
   });
 
   it("E: token finnes ALDRI i argv, remote-URL eller resulterende git config gjennom HELE denne flyten (clone+commit+push, MED full isolasjon)", async () => {
-    const gitAuth = await createGitAuthHandle(JARVIS_TOKEN);
+    const gitAuth = await createGitAuthHandle(JARVIS_TOKEN, TEST_SCOPE);
     try {
       const dir = await mkdtemp(join(tmpdir(), "jarvis-gitauth-hostfix-secrecy-e-"));
       const env = { ...baseEnv(), GIT_CONFIG_SYSTEM: fakeSystemConfig, ...gitAuth.env };

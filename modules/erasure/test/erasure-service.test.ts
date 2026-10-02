@@ -1,12 +1,12 @@
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp, writeFile } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it, vi } from "vitest";
-import type { ApprovalPayload, IdentityContext, JsonValue, SignedApproval } from "@jarvis/contracts";
-import { approvalSigningBytes } from "@jarvis/contracts";
+import type { IdentityContext, JsonValue } from "@jarvis/contracts";
+import { signApproval } from "@jarvis/contracts";
 import { createPool, failErasureRequest, runMigrations } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { LocalHashEmbedding, withMemoryTransaction } from "@jarvis/memory";
@@ -797,16 +797,12 @@ describe("Q-20 ErasureService", () => {
   describe("§7/§8: D-klasse policy-integrasjon (ingen ny separat auth-modell)", () => {
     const watchKeys = generateKeyPairSync("ed25519");
 
-    function signApproval(payload: ApprovalPayload): SignedApproval {
-      const signature = sign(null, approvalSigningBytes(payload), watchKeys.privateKey).toString("base64");
-      return { ...payload, signature };
-    }
 
     it("nektes uten approval for en delegert (ikke-sovereign) identitet; tillates med gyldig signert approval", async () => {
       const sentinel = `SentinelDelegateApproval${randomUUID().replace(/-/g, "")}`;
       await plantMemoryItem(TENANT_A, "personal", sentinel);
       const devices = new InMemoryDeviceRegistry();
-      devices.register("watch-1", watchKeys.publicKey);
+      devices.register("watch-1", watchKeys.publicKey, { tenant_id: TENANT_A, person_id: identityFor(TENANT_A, "personal").person_id });
       const delegatePolicy = new PolicyGateway({ devices, nonces: new InMemoryNonceStore(), killSwitch: new KillSwitch() });
       const service = new ErasureService(appPool, delegatePolicy, embedding);
       const scope = { type: "memory_space", tenant_id: TENANT_A, memory_space_id: "personal" } as const;
@@ -816,10 +812,13 @@ describe("Q-20 ErasureService", () => {
       expect(denied.status).toBe("failed");
       expect(denied.error).toContain("policy_denied:class_d_missing_approval");
 
-      const approval = signApproval({
+      const approval = signApproval(watchKeys.privateKey, {
+        tool_id: "data-erasure",
         action: "purge",
+        tenant_id: TENANT_A,
+        person_id: identity.person_id,
+        approver_person_id: identity.person_id,
         parameters: { ...scope } as Record<string, JsonValue>,
-        expires_at: new Date(Date.now() + 60_000).toISOString(),
         nonce: `nonce-${randomUUID()}`,
         approving_device_id: "watch-1"
       });

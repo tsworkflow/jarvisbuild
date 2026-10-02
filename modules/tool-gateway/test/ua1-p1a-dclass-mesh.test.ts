@@ -1,11 +1,11 @@
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { approvalSigningBytes, type ApprovalPayload, type IdentityContext, type SignedApproval } from "@jarvis/contracts";
+import { signApproval, type ApprovalPayload, type IdentityContext, type JsonValue, type SignedApproval } from "@jarvis/contracts";
 import { createPool, PgApprovalStore, runMigrations } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { MemoryTraceSink, ModelGateway } from "@jarvis/model-gateway";
@@ -86,16 +86,12 @@ const D_MESH_TOOL: MeshToolMapping = {
   action: "critical_send"
 };
 
-function approval(overrides: Partial<ApprovalPayload> = {}): SignedApproval {
-  const payload: ApprovalPayload = {
-    action: "critical_send",
-    parameters: { note: "test" },
-    expires_at: new Date(Date.now() + 60_000).toISOString(),
-    nonce: `nonce-${randomUUID()}`,
-    approving_device_id: "watch-1",
-    ...overrides
-  };
-  return { ...payload, signature: sign(null, approvalSigningBytes(payload), watchKeys.privateKey).toString("base64") };
+function approval(overrides: Partial<Omit<ApprovalPayload, "parameters_hash">> & { parameters?: Record<string, JsonValue> } = {}): SignedApproval {
+  return signApproval(watchKeys.privateKey, {
+    tool_id: "demo", action: "critical_send", tenant_id: "tenant-a", person_id: "person-tobias",
+    approver_person_id: "person-tobias", parameters: { note: "test" },
+    nonce: `nonce-${randomUUID()}`, approving_device_id: "watch-1", ...overrides
+  });
 }
 
 const dCall = (id: string, note = "test"): ToolCallRequest => ({
@@ -129,7 +125,7 @@ beforeAll(async () => {
   appPool = createPool({ host: "127.0.0.1", port: PORT, database: "jarvis_test", user: "jarvis_test", password: "pw2" });
 
   const devices = new InMemoryDeviceRegistry();
-  devices.register("watch-1", watchKeys.publicKey);
+  devices.register("watch-1", watchKeys.publicKey, { tenant_id: "tenant-a", person_id: "person-tobias" });
   // Samme sovereign-owner-konfig som produksjonswiringen (main/worker):
   const policy = new PolicyGateway({
     devices,

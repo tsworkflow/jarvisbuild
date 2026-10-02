@@ -6,7 +6,7 @@ import type { AddressInfo } from "node:net";
 import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { approvalSigningBytes, type ApprovalPayload, type IdentityContext, type SignedApproval } from "@jarvis/contracts";
+import { signApproval, type ApprovalPayload, type IdentityContext, type JsonValue, type SignedApproval } from "@jarvis/contracts";
 import {
   ChannelSessionAuthority,
   ContextBuilder,
@@ -84,17 +84,18 @@ const webIdentity = {
   channel: "web"
 } as const;
 
-function makeApproval(overrides: Partial<ApprovalPayload> = {}): SignedApproval {
-  const payload: ApprovalPayload = {
+function makeApproval(overrides: Partial<Omit<ApprovalPayload, "parameters_hash">> & { parameters?: Record<string, JsonValue> } = {}): SignedApproval {
+  return signApproval(watchKeys.privateKey, {
+    tool_id: "demo",
     action: "critical_demo",
+    tenant_id: webIdentity.tenant_id,
+    person_id: webIdentity.person_id,
+    approver_person_id: webIdentity.person_id,
     parameters: { confirm: true },
-    expires_at: new Date(Date.now() + 60_000).toISOString(),
     nonce: `nonce-${randomUUID()}`,
     approving_device_id: "watch-1",
     ...overrides
-  };
-  const signature = sign(null, approvalSigningBytes(payload), watchKeys.privateKey).toString("base64");
-  return { ...payload, signature };
+  });
 }
 
 /**
@@ -211,7 +212,7 @@ beforeAll(async () => {
   });
 
   const devices = new InMemoryDeviceRegistry();
-  devices.register("watch-1", watchKeys.publicKey);
+  devices.register("watch-1", watchKeys.publicKey, { tenant_id: "tenant-personal", person_id: "person-tobias" });
   const policy = new PolicyGateway({
     devices,
     nonces: new PgApprovalStore(appPool),
@@ -366,21 +367,11 @@ describe("Akseptanse 2: modellkall har kostnad knyttet til session/task", () => 
 });
 
 describe("Akseptanse 3: kritisk verktøy (klasse D) i kjørende app", () => {
-  const identityBody = {
-    person_id: "person-tobias",
-    tenant_id: "tenant-personal",
-    memory_space: "personal",
-    session_id: "sess-critical",
-    device_id: "dev-web",
-    channel: "web",
-    auth_strength: "active"
-  };
-
   async function criticalDemo(approval?: SignedApproval) {
     const response = await fetch(`${baseUrl}/tools/critical-demo`, {
       method: "POST",
       headers: { "content-type": "application/json" },
-      body: JSON.stringify({ identity: identityBody, parameters: { confirm: true }, approval })
+      body: JSON.stringify({ grant_token: await authorize(webIdentity), parameters: { confirm: true }, approval })
     });
     return { status: response.status, body: (await response.json()) as Record<string, unknown> };
   }
@@ -633,8 +624,9 @@ describe("D-30 live-funn-fix: ConversationEngine → mesh tool bridge (§1-§6)"
   });
 
   it("H: owner-seed (inkl. voice-device og web-device) er idempotent - to kjøringer, én rad per device", async () => {
-    await seedOwner(adminPool);
-    await seedOwner(adminPool); // idempotens: andre kjøring endrer ingenting
+    const owner = { tenant_id: "tenant-personal", owner_person_id: "person-tobias", owner_display_name: "Tobias" };
+    await seedOwner(adminPool, owner);
+    await seedOwner(adminPool, owner); // idempotens: andre kjøring endrer ingenting
     const devices = await adminPool.query(
       "SELECT device_id, kind, COUNT(*)::int AS n FROM devices WHERE device_id IN ('jarvis-core','jarvis-voice-live','dev-web') GROUP BY device_id, kind ORDER BY device_id"
     );

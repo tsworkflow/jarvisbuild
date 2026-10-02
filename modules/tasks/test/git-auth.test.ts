@@ -1,6 +1,7 @@
 import { spawnSync } from "node:child_process";
 import { readFile, stat } from "node:fs/promises";
 import { describe, expect, it } from "vitest";
+import type { GitCredentialScope } from "../src/git-auth.ts";
 import {
   GIT_CREDENTIAL_ISOLATION_ARGS, GIT_CREDENTIAL_TOKEN_ENV, buildCredentialHelperConfigValue,
   createGitAuthHandle, generateCredentialHelperScriptContent
@@ -15,15 +16,17 @@ import {
  * og selve skriptets kjøretidsoppførsel (den EKTE credential-helper-protokollen,
  * kjørt direkte via node, uten git eller shell involvert).
  */
+const TEST_SCOPE: GitCredentialScope = { protocol: "https", host: "github.com", path: "acme/repo" };
+
 describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanisme", () => {
   it("A: generateCredentialHelperScriptContent() refererer GIT_CREDENTIAL_TOKEN_ENV, ALDRI et hardkodet token", () => {
-    const content = generateCredentialHelperScriptContent();
+    const content = generateCredentialHelperScriptContent(TEST_SCOPE);
     expect(content).toContain(GIT_CREDENTIAL_TOKEN_ENV);
     expect(content).not.toMatch(/sk-ant-|ghp_|gho_/);
   });
 
   it("B: createGitAuthHandle() skriver credential-helper.cjs på en ephemer sti som faktisk finnes", async () => {
-    const handle = await createGitAuthHandle("test-token-b");
+    const handle = await createGitAuthHandle("test-token-b", TEST_SCOPE);
     try {
       const scriptPath = handle.credentialHelperArgs[1].match(/"([^"]+credential-helper\.cjs)"/)?.[1];
       expect(scriptPath).toBeDefined();
@@ -34,7 +37,7 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
   });
 
   it("C: GIT_TERMINAL_PROMPT=0 satt - hindrer interaktiv/ambient terminal-fallback selv om credential-helperen skulle feile å svare", async () => {
-    const handle = await createGitAuthHandle("test-token-c");
+    const handle = await createGitAuthHandle("test-token-c", TEST_SCOPE);
     try {
       expect(handle.env["GIT_TERMINAL_PROMPT"]).toBe("0");
     } finally {
@@ -44,7 +47,7 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
 
   it("D: token-verdien finnes KUN i env[GIT_CREDENTIAL_TOKEN_ENV] - ingen andre env-nøkler, og ALDRI i credentialHelperArgs, bærer den", async () => {
     const token = "test-token-d-unique-value";
-    const handle = await createGitAuthHandle(token);
+    const handle = await createGitAuthHandle(token, TEST_SCOPE);
     try {
       expect(handle.env[GIT_CREDENTIAL_TOKEN_ENV]).toBe(token);
       const otherKeys = Object.keys(handle.env).filter((k) => k !== GIT_CREDENTIAL_TOKEN_ENV);
@@ -60,7 +63,7 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
 
   it("E: selve credential-helper-skriptfilen på disk inneholder ALDRI token-verdien - kun logikk", async () => {
     const token = "test-token-e-never-on-disk";
-    const handle = await createGitAuthHandle(token);
+    const handle = await createGitAuthHandle(token, TEST_SCOPE);
     try {
       const scriptPath = handle.credentialHelperArgs[1].match(/"([^"]+credential-helper\.cjs)"/)?.[1] as string;
       const fileContent = await readFile(scriptPath, "utf8");
@@ -71,15 +74,15 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
   });
 
   it("F: cleanup() fjerner den ephemere temp-katalogen fullstendig", async () => {
-    const handle = await createGitAuthHandle("test-token-f");
+    const handle = await createGitAuthHandle("test-token-f", TEST_SCOPE);
     const scriptPath = handle.credentialHelperArgs[1].match(/"([^"]+credential-helper\.cjs)"/)?.[1] as string;
     await handle.cleanup();
     await expect(stat(scriptPath)).rejects.toThrow();
   });
 
   it("G: to separate createGitAuthHandle()-kall gir to distinkte, isolerte temp-kataloger", async () => {
-    const a = await createGitAuthHandle("token-a");
-    const b = await createGitAuthHandle("token-b");
+    const a = await createGitAuthHandle("token-a", TEST_SCOPE);
+    const b = await createGitAuthHandle("token-b", TEST_SCOPE);
     try {
       expect(a.credentialHelperArgs[1]).not.toBe(b.credentialHelperArgs[1]);
     } finally {
@@ -92,12 +95,12 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
   // involvert) - EKSAKT slik git selv ville kalt det ETTER at sh -c har startet
   // node med skriptstien + operasjonen som argv (se buildCredentialHelperConfigValue()).
   it("H: skriptet kjørt med 'get' og stdin lukket returnerer username=x-access-token OG password=<token> på stdout", async () => {
-    const handle = await createGitAuthHandle("expected-token-h");
+    const handle = await createGitAuthHandle("expected-token-h", TEST_SCOPE);
     try {
       const scriptPath = handle.credentialHelperArgs[1].match(/"([^"]+credential-helper\.cjs)"/)?.[1] as string;
       const result = spawnSync(process.execPath, [scriptPath, "get"], {
         encoding: "utf8",
-        input: "protocol=https\nhost=github.com\n\n",
+        input: "protocol=https\nhost=github.com\npath=acme/repo.git\n\n",
         env: { ...process.env, [GIT_CREDENTIAL_TOKEN_ENV]: "expected-token-h" }
       });
       expect(result.status).toBe(0);
@@ -107,15 +110,15 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
     }
   });
 
-  it("I: skriptet kjørt med 'get' UTEN token i env returnerer et tomt passord - kaster ALDRI, skriver ALDRI 'undefined'", async () => {
-    const handle = await createGitAuthHandle("unused-token-i");
+  it("I: skriptet kjørt med 'get' UTEN token i env svarer ingenting (aldri et tomt passord) - kaster ALDRI, skriver ALDRI 'undefined'", async () => {
+    const handle = await createGitAuthHandle("unused-token-i", TEST_SCOPE);
     try {
       const scriptPath = handle.credentialHelperArgs[1].match(/"([^"]+credential-helper\.cjs)"/)?.[1] as string;
       const env = { ...process.env };
       delete env[GIT_CREDENTIAL_TOKEN_ENV];
-      const result = spawnSync(process.execPath, [scriptPath, "get"], { encoding: "utf8", input: "\n", env });
+      const result = spawnSync(process.execPath, [scriptPath, "get"], { encoding: "utf8", input: "protocol=https\nhost=github.com\npath=acme/repo.git\n\n", env });
       expect(result.status).toBe(0);
-      expect(result.stdout).toBe("username=x-access-token\npassword=\n");
+      expect(result.stdout).toBe("");
       expect(result.stdout).not.toContain("undefined");
     } finally {
       await handle.cleanup();
@@ -123,7 +126,7 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
   });
 
   it("J: skriptet kjørt med 'store' skriver INGENTING til stdout og eksiterer 0 (git sin forventede kontrakt for persistering-operasjoner)", async () => {
-    const handle = await createGitAuthHandle("unused-token-j");
+    const handle = await createGitAuthHandle("unused-token-j", TEST_SCOPE);
     try {
       const scriptPath = handle.credentialHelperArgs[1].match(/"([^"]+credential-helper\.cjs)"/)?.[1] as string;
       const result = spawnSync(process.execPath, [scriptPath, "store"], {
@@ -138,7 +141,7 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
   });
 
   it("K: skriptet kjørt med 'erase' skriver INGENTING til stdout og eksiterer 0 (samme kontrakt som 'store')", async () => {
-    const handle = await createGitAuthHandle("unused-token-k");
+    const handle = await createGitAuthHandle("unused-token-k", TEST_SCOPE);
     try {
       const scriptPath = handle.credentialHelperArgs[1].match(/"([^"]+credential-helper\.cjs)"/)?.[1] as string;
       const result = spawnSync(process.execPath, [scriptPath, "erase"], {
@@ -179,7 +182,7 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
   });
 
   it("N: createGitAuthHandle()s credentialHelperArgs har eksakt formen ['-c', 'credential.helper=!\"<node>\" \"<script>\"']", async () => {
-    const handle = await createGitAuthHandle("unused-token-n");
+    const handle = await createGitAuthHandle("unused-token-n", TEST_SCOPE);
     try {
       expect(handle.credentialHelperArgs[0]).toBe("-c");
       expect(handle.credentialHelperArgs[1]).toMatch(/^credential\.helper=!"/);
@@ -191,9 +194,58 @@ describe("D-103 HOST-FIX v2: git-auth.ts - ephemer git credential.helper-mekanis
   });
 
   it("O: createGitAuthHandle()s env inneholder ALDRI en GIT_ASKPASS-nøkkel (v1-mekanismen er fullstendig fjernet, ikke bare deaktivert)", async () => {
-    const handle = await createGitAuthHandle("unused-token-o");
+    const handle = await createGitAuthHandle("unused-token-o", TEST_SCOPE);
     try {
       expect("GIT_ASKPASS" in handle.env).toBe(false);
+    } finally {
+      await handle.cleanup();
+    }
+  });
+});
+
+describe("Remediering del 2 (JARVIS-064): credentialen utleveres KUN til eksakt protokoll + vert + repo", () => {
+  const ask = async (input: string) => {
+    const handle = await createGitAuthHandle("scoped-token-xyz", TEST_SCOPE);
+    try {
+      const scriptPath = handle.credentialHelperArgs[1].match(/"([^"]+credential-helper\.cjs)"/)?.[1] as string;
+      return spawnSync(process.execPath, [scriptPath, "get"], { encoding: "utf8", input, env: { ...process.env, [GIT_CREDENTIAL_TOKEN_ENV]: "scoped-token-xyz" } });
+    } finally {
+      await handle.cleanup();
+    }
+  };
+  const OK = "username=x-access-token\npassword=scoped-token-xyz\n";
+
+  it("riktig protokoll + vert + repo (med og uten .git, ulik case) får credential", async () => {
+    expect((await ask("protocol=https\nhost=github.com\npath=acme/repo.git\n\n")).stdout).toBe(OK);
+    expect((await ask("protocol=https\nhost=GitHub.com\npath=Acme/Repo\n\n")).stdout).toBe(OK);
+  });
+  it("fremmed vert, undervert, vert med port, http, feil repo, manglende path og userinfo-triks får ALDRI credential", async () => {
+    for (const input of [
+      "protocol=https\nhost=evil.example\npath=acme/repo.git\n\n",
+      "protocol=https\nhost=github.com.evil.example\npath=acme/repo.git\n\n",
+      "protocol=https\nhost=gist.github.com\npath=acme/repo.git\n\n",
+      "protocol=https\nhost=github.com:8443\npath=acme/repo.git\n\n",
+      "protocol=http\nhost=github.com\npath=acme/repo.git\n\n",
+      "protocol=https\nhost=github.com\npath=acme/other.git\n\n",
+      "protocol=https\nhost=github.com\npath=acme/repo/extra\n\n",
+      "protocol=https\nhost=github.com\n\n",
+      "protocol=ssh\nhost=github.com\npath=acme/repo.git\n\n",
+      "protocol=https\nhost=github.com@evil.example\npath=acme/repo.git\n\n",
+      ""
+    ]) {
+      const res = await ask(input);
+      expect(res.status, input).toBe(0);
+      expect(res.stdout, input).toBe("");
+    }
+  });
+  it("ugyldig scope (feil vert-/stiformat) avvises ved opprettelse", async () => {
+    await expect(createGitAuthHandle("t", { protocol: "https", host: "evil.example/../x", path: "a/b" })).rejects.toThrow("git_credential_scope_invalid");
+    await expect(createGitAuthHandle("t", { protocol: "https", host: "github.com", path: "a/b/c" })).rejects.toThrow("git_credential_scope_invalid");
+  });
+  it("credentialHelperArgs aktiverer credential.useHttpPath slik at helperen ser repo-stien", async () => {
+    const handle = await createGitAuthHandle("t", TEST_SCOPE);
+    try {
+      expect(handle.credentialHelperArgs.slice(2)).toEqual(["-c", "credential.useHttpPath=true"]);
     } finally {
       await handle.cleanup();
     }

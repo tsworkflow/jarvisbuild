@@ -7,8 +7,13 @@
 // CREATE EXTENSION krever admin-privilegier) - ALDRI runtime-config. Bootstrapper i
 // samme kjøring den ekte runtime-LOGIN-rollen api/worker skal koble til med, slik at
 // de aldri trenger/kan falle tilbake til admin-tilkoblingen.
+import "./normalize-env.ts";
 import { adminConfigFromEnv, configFromEnv, createPool, ensureRuntimeRole, runMigrations } from "@jarvis/core";
+import { ownerConfigOrExit } from "./owner.ts";
 import { seedOwner } from "./seed.ts";
+
+// Remediering del 2 (JARVIS-065): eier-identiteten seedes fra validert konfig (fail closed uten) - ingen defaults.
+const owner = ownerConfigOrExit();
 
 const resolvedAdminConfig = adminConfigFromEnv();
 // Q-21 HOST RECOVERY #2 (2026-08-15): grunnsannhets-diagnostikk - hvilken rolle
@@ -23,7 +28,7 @@ try {
   await runMigrations(adminPool);
   // Owner-seed (BO-08 + D-30 voice-device): idempotent, delt funksjon (testes
   // direkte) - fjerner det manuelle one-time-SQL-steget fra BO-07.
-  await seedOwner(adminPool);
+  await seedOwner(adminPool, owner);
 
   const runtime = configFromEnv();
   const adminUser = process.env["JARVIS_DB_ADMIN_USER"] ?? "postgres";

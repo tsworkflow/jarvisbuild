@@ -1,5 +1,8 @@
 // Jarvis worker-prosess (BO-07): egen container/prosess som drenerer durable-køen.
 // .ts-utvidelser kreves: filene kjøres direkte med Nodes type-stripping (ingen build-steg)
+import "./normalize-env.ts";
+import { systemIdentity } from "@jarvis/contracts";
+import { ownerConfigOrExit } from "./owner.ts";
 import { assertRuntimeCredentialsConfigured, assertRuntimeRoleSafe, configFromEnv, createPool, PgApprovalStore, PgDeviceRegistry } from "@jarvis/core";
 import { InfraExecutionGate, KillSwitch, OwnerControls, PolicyGateway } from "@jarvis/policy";
 import { assertProvidersHaveExplicitPricing, DEFAULT_PRICING, ModelGateway, traceSinkFromEnv } from "@jarvis/model-gateway";
@@ -38,11 +41,11 @@ import {
 import {
   ArtifactStore,
   ClaudeCodeAgent,
-  DockerSandboxRunner,
   InProcessWorker,
   PgTaskQueue,
-  ProcessSandboxRunner,
+  allowedReposFromEnv,
   createCodingHandler,
+  resolveJobSandboxRunner,
   withSecretRedaction
 } from "@jarvis/tasks";
 import { KnowledgeSourceRegistry, emailIngestHandler } from "@jarvis/knowledge";
@@ -63,6 +66,8 @@ try {
 } catch (err) {
   failStartup(err);
 }
+// Remediering del 2 (JARVIS-065): ÉN validert eier-identitet (fail closed uten) - ingen env-defaults for eier/tenant.
+const owner = ownerConfigOrExit();
 const pool = createPool(configFromEnv());
 try {
   await assertRuntimeRoleSafe(pool);
@@ -113,7 +118,7 @@ try {
 // IKKE her (samme presedens som `situations`/`executive`, D-163/D-164
 // fresh-audit: ingen eier-vendt kaller i worker-prosessen for det
 // namespace-et) - kun selve autorisasjons-KONTROLLEN er delt her.
-const ownerControlAuthority = { owner_person_id: process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias" };
+const ownerControlAuthority = { owner_person_id: owner.owner_person_id };
 const killSwitch = new KillSwitch(pool, ownerControlAuthority);
 await killSwitch.restore();
 const ownerControls = new OwnerControls(killSwitch, pool, ownerControlAuthority);
@@ -128,7 +133,7 @@ await ownerControls.restore();
 const infraGate = new InfraExecutionGate();
 // D-105: "docker" lagt til (samme rasjonale som apps/api/src/main.ts).
 const infraToolIds = new Set(["github", "docker"]);
-const deviceRegistry = new PgDeviceRegistry(pool, process.env["JARVIS_TENANT_ID"] ?? "tenant-personal");
+const deviceRegistry = new PgDeviceRegistry(pool, owner.tenant_id);
 // D-222: samme fiks som apps/api/src/main.ts - se den for full begrunnelse.
 await deviceRegistry.refresh().catch((err) => {
   console.error(JSON.stringify({
@@ -147,8 +152,8 @@ const policy = new PolicyGateway({
   infraGate,
   infraToolIds,
   authority: {
-    owner_person_id: process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias",
-    owner_tenants: [process.env["JARVIS_TENANT_ID"] ?? "tenant-personal"]
+    owner_person_id: owner.owner_person_id,
+    owner_tenants: [owner.tenant_id]
   }
 });
 // D-181 (BLOCKER B1, D184): hoistet til en NAVNGITT konstant (var tidligere
@@ -430,7 +435,7 @@ for (const tool of firstWaveTools({
   // D-338: samme wiring-mønster som apps/api/src/main.ts.
   mcp_zapier: new McpZapierTransport(),
   // D-339: samme wiring-mønster som apps/api/src/main.ts.
-  browser: new BrowserGatewayTransport(),
+  browser: new BrowserGatewayTransport(process.env["JARVIS_BROWSER_GATEWAY_TOKEN_SECRET"] ?? ""),
   ...driveTransportsIfConfigured()
 }, {
   // D-105 host-fix: samme wiring-mønster som apps/api/src/main.ts.
@@ -443,12 +448,8 @@ for (const tool of firstWaveTools({
 // registrert på DENNE prosessens `toolGateway` (worker har en delmengde).
 // Hele registeret (`allMeshTools()`) eksponeres ALDRI for modellen.
 const modelToolSurface = resolveModelToolSurface(toolGateway, { onlyRegistered: true });
-const workerIdentity = {
-  person_id: process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias",
-  tenant_id: process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
-  memory_space_id: "personal", session_id: "sess-worker", device_id: "jarvis-core",
-  channel: "api", auth_strength: "active"
-} as const;
+// Systemidentitet med unik sesjons-id per oppstart (ingen falsk fast `sess-worker`).
+const workerIdentity = systemIdentity(owner, "worker", { channel: "api" });
 
 // D-180 (W1, D183 - retter D182 sitt REAL_INTERNAL_GAP-funn): @jarvis/watchdog
 // var FØR denne posten null-koblet til noen produksjonsprosess. Plassert HER,
@@ -501,12 +502,12 @@ watchdog.register(stuckTasksCheck(pool));
 // D-191 (BLOCKER B4, arkitekt-order D191 mot PR #96): `costExplosionCheck`
 // krever nå en eksplisitt `tenantId` (RLS-skopet SELECT via
 // `withTenantTransaction` - se watchdog.ts sin egen begrunnelse). Samme
-// `process.env["JARVIS_TENANT_ID"] ?? "tenant-personal"`-mønster som resten
+// `owner.tenant_id`-mønster (validert eier-konfig) som resten
 // av denne filens wiring (linje ~122/136/319/464) - ALDRI utledet fra
 // urelatert data. `owner_person_id` forblir uendret, separat eksplisitt.
 watchdog.register(
   costExplosionCheck(pool, killSwitch, ownerControlAuthority.owner_person_id,
-    process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
+    owner.tenant_id,
     parseCostHardLimitOre(process.env["JARVIS_COST_HARD_LIMIT_ORE"])
   )
 );
@@ -519,14 +520,16 @@ setInterval(
   WATCHDOG_INTERVAL_MS
 );
 
-// Sandbox-jobber: DockerSandboxRunner på host-runtime (D-32-verifisert). I container
-// er prosess-sandbox default (containeren selv er isolasjonsgrensen; ingen Docker-socket
-// monteres inn). Velges eksplisitt via JARVIS_SANDBOX=docker|process.
-const runner =
-  process.env["JARVIS_SANDBOX"] === "docker" ? new DockerSandboxRunner() : new ProcessSandboxRunner();
+// REMEDIERING DEL 2 (JARVIS-010): kodejobber kjører KUN i en per-jobb-container med eksplisitt policy
+// (ikke-root, read-only rootfs, ressursgrenser, egress via allowlistet proxy, ingen arvede secrets) -
+// se modules/tasks/src/job-container.ts. Finnes ingen gyldig runner (`JARVIS_JOB_RUNNER=container` +
+// digest-pinnet `JARVIS_JOB_IMAGE`/`JARVIS_JOB_NETWORK`/`JARVIS_JOB_EGRESS_PROXY`), feiler HVER kodejobb
+// lukket (`job_container_runner_not_configured`). `ProcessSandboxRunner`/`DockerSandboxRunner` er IKKE
+// lenger koblet til produksjon; det gamle `JARVIS_SANDBOX`-valget finnes ikke.
+const runner = resolveJobSandboxRunner(process.env);
 
 // BO-11.1 §9: delt executive-handler (samme fil som api-workeren) - identisk
-// kontrakt for samme kø: prompt → mesh, tools=true → tool-løkke, command → sandbox.
+// kontrakt for samme kø: prompt → mesh, tools=true → tool-løkke (command-kontrakter avvises).
 worker.register(
   "executive",
   executiveHandler({
@@ -574,7 +577,7 @@ worker.register(
         ...workerIdentity,
         person_id: task.contract.owner_person_id,
         tenant_id: task.tenant_id,
-        session_id: "sess-coding"
+        session_id: `${workerIdentity.session_id}-coding`
       }),
       claudeCodeCredential: { secretProvider: new EnvSecretProvider() },
       // D-103 (Blokker B): SAMME EnvSecretProvider-arkitektur, HELT ATSKILT
@@ -585,6 +588,9 @@ worker.register(
       // jobben feiler FØR clone forsøkes (`git_auth_unavailable`), ALDRI et
       // stille fall til uautentisert git.
       gitAuth: { secretProvider: new EnvSecretProvider() },
+      // Remediering del 2 (JARVIS-064): credentialen gjelder KUN github.com + disse eksakte repoene
+      // (JARVIS_GIT_ALLOWED_REPOS, ellers JARVIS_GITHUB_REPO). Tom allowlist = hver kodejobb feiler lukket.
+      allowedRepos: allowedReposFromEnv(process.env),
       github: { gateway: toolGateway }
     }),
     [process.env["ANTHROPIC_API_KEY"], process.env["JARVIS_GITHUB_TOKEN"]]
@@ -600,7 +606,7 @@ worker.register(
 const knowledgeRegistry = new KnowledgeSourceRegistry([
   {
     source_type: "email_attachment",
-    tenant_id: process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
+    tenant_id: owner.tenant_id,
     memory_space_id: "personal",
     source_instance_id: "email:inbox",
     // D-340: samme tom-streng-.env-bug - JARVIS_GOOGLE_ACCOUNT="" i .env skal falle til defaulten.

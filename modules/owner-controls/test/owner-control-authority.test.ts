@@ -5,7 +5,7 @@ import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { IdentityContext } from "@jarvis/contracts";
-import { createPool, PgApprovalStore, runMigrations, SessionGrantService } from "@jarvis/core";
+import { createPool, DeviceService, PgApprovalStore, runMigrations, SessionGrantService } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { InMemoryDeviceRegistry, KillSwitch, OwnerControls, PolicyGateway } from "@jarvis/policy";
 import { ToolGateway, type SecretProvider } from "@jarvis/tool-gateway";
@@ -98,14 +98,15 @@ function freshStackWithDeviceRevocation(): { gateway: ToolGateway } {
     authority: { owner_person_id: OWNER, owner_tenants: [TENANT, TENANT_B] }
   });
   const gateway = new ToolGateway(appPool, policy, secrets, ownerControls);
-  const service = new OwnerControlsService(killSwitch, ownerControls, { pool: appPool, grants: new SessionGrantService(appPool), authority });
+  const service = new OwnerControlsService(killSwitch, ownerControls, { pool: appPool, grants: new SessionGrantService(appPool), devices: new DeviceService(appPool), authority });
   for (const tool of ownerControlsToolDefinitions(new OwnerControlsTransport(service))) gateway.register(tool);
   return { gateway };
 }
 
 /** Setter inn de MINIMALE, FK-tilfredsstillende radene `session_grants` krever, direkte via admin-poolen (RLS-fri) - ikke via HELE innrullerings-/utstedelsesflyten, som er dekket separat av `@jarvis/core` sine egne tester. */
 async function seedGrant(tenantId: string, deviceId: string, personId: string = OWNER): Promise<void> {
-  const sessionId = `sess-device-revoke-${deviceId}`;
+  // JARVIS-055: kun EN aktiv sesjon per (tenant, person) - alle enheter til samme person deler den.
+  const sessionId = `sess-device-revoke-${tenantId}-${personId}`;
   await adminPool.query(`INSERT INTO devices (device_id, tenant_id, person_id, kind) VALUES ($1,$2,$3,'phone') ON CONFLICT (device_id) DO NOTHING`, [deviceId, tenantId, personId]);
   await adminPool.query(
     `INSERT INTO sessions (session_id, tenant_id, person_id, last_channel, last_device_id) VALUES ($1,$2,$3,'api',$4) ON CONFLICT (session_id) DO NOTHING`,

@@ -44,3 +44,23 @@ export function envHour(name: string, fallback: number, env: Record<string, stri
 export function envPort(name: string, fallback: number, env: Record<string, string | undefined> = process.env): number {
   return envInt(name, fallback, { min: 1, max: 65_535 }, env);
 }
+
+/**
+ * Remediering del 2 (JARVIS-010): compose gir hver tjeneste kun de variablene den trenger via
+ * `NAVN: "${NAVN:-}"`, som setter variabelen til en TOM streng når operatøren ikke har fylt den inn
+ * (i motsetning til `env_file`, der en ikke-oppgitt nøkkel er helt fraværende). Kode som bruker
+ * `process.env["X"] ?? default` ville ellers fått `""` i stedet for defaulten (tom tenant-id, tom
+ * admin-bruker, ...). Denne funksjonen fjerner alle tomme variabler ved oppstart slik at «blank = usatt»
+ * gjelder UNIFORMT. Kalles som SIDE-EFFEKT-import FØRST i hver prosess (se `normalize-env.ts` i appene).
+ * Returnerer navnene som ble fjernet (kun navn - aldri verdier).
+ */
+export function normalizeBlankEnv(env: Record<string, string | undefined> = process.env): string[] {
+  const removed: string[] = [];
+  for (const [key, value] of Object.entries(env)) {
+    if (value === "") {
+      delete env[key];
+      removed.push(key);
+    }
+  }
+  return removed;
+}

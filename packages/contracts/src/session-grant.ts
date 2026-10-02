@@ -113,7 +113,13 @@ export const DeviceEnrollmentDenialReasonSchema = z.enum([
   /** `device_id` finnes allerede, men tilhører en ANNEN person/tenant - aldri overtakelse. */
   "device_owned_by_other_principal",
   /** `public_key_pem` var ikke en gyldig offentlig nøkkel. */
-  "invalid_public_key"
+  "invalid_public_key",
+  /** Nøkkelen er ikke Ed25519 (eneste algoritme verifikatoren støtter) - avvises ved innrullering, ikke først ved bruk. */
+  "unsupported_key_type",
+  /** Enheten er TILBAKEKALT og kan aldri rulles inn igjen (JARVIS-050). */
+  "device_revoked",
+  /** Nøkkelen er tidligere tilbakekalt (under en annen device_id) og kan aldri gjenbrukes. */
+  "key_revoked"
 ]);
 export type DeviceEnrollmentDenialReason = z.infer<typeof DeviceEnrollmentDenialReasonSchema>;
 

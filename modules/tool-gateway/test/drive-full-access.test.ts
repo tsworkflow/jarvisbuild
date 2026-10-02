@@ -1,4 +1,4 @@
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -6,7 +6,7 @@ import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
 import type { ApprovalPayload, IdentityContext, JsonValue, SignedApproval } from "@jarvis/contracts";
-import { approvalSigningBytes } from "@jarvis/contracts";
+import { signApproval } from "@jarvis/contracts";
 import { createPool, runMigrations } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { InMemoryDeviceRegistry, InMemoryNonceStore, KillSwitch, PolicyGateway } from "@jarvis/policy";
@@ -222,8 +222,12 @@ describe("Drive full read/write access - D/E/F: rename/move/trash", () => {
 
 describe("Drive full read/write access - G/H/I: destruktive/sikkerhetskritiske handlinger (klasse D)", () => {
   const watchKeys = generateKeyPairSync("ed25519");
-  function signApproval(payload: ApprovalPayload): SignedApproval {
-    return { ...payload, signature: sign(null, approvalSigningBytes(payload), watchKeys.privateKey).toString("base64") };
+  // JARVIS-051: godkjenningen er bundet til verktøy, tenant, person og approver - ikke bare handling + parametere.
+  function signApprovalFor(payload: Omit<ApprovalPayload, "parameters_hash" | "issued_at" | "expires_at" | "tool_id" | "tenant_id" | "person_id" | "approver_person_id"> & { parameters: Record<string, JsonValue> }): SignedApproval {
+    return signApproval(watchKeys.privateKey, {
+      ...payload, tool_id: "drive", tenant_id: delegateIdentity.tenant_id, person_id: delegateIdentity.person_id,
+      approver_person_id: delegateIdentity.person_id
+    });
   }
 
   it("G: permanent delete - sovereign owner utfører autonomt UTEN approval; delegert nektes uten, tillates med gyldig signert approval", async () => {
@@ -237,7 +241,7 @@ describe("Drive full read/write access - G/H/I: destruktive/sikkerhetskritiske h
     const { transport: delegateTransport, files: delegateFiles } = buildStatefulDriveTransport();
     delegateFiles.set("f2", { id: "f2", name: "fil2.txt", mimeType: "text/plain", parents: [], trashed: false });
     const devices = new InMemoryDeviceRegistry();
-    devices.register("watch-1", watchKeys.publicKey);
+    devices.register("watch-1", watchKeys.publicKey, { tenant_id: delegateIdentity.tenant_id, person_id: delegateIdentity.person_id });
     const { gateway: delegateGateway } = buildGateway(delegateTransport, undefined, devices); // ingen authority = ingen sovereign-modus for noen
 
     const denied = await delegateGateway.execute({ identity: delegateIdentity, tool_id: "drive", action: "delete_permanent", parameters: { file_id: "f2" } });
@@ -245,9 +249,9 @@ describe("Drive full read/write access - G/H/I: destruktive/sikkerhetskritiske h
     expect(!denied.ok && denied.reason).toBe("class_d_missing_approval");
     expect(delegateFiles.has("f2")).toBe(true); // IKKE slettet uten approval
 
-    const approval = signApproval({
+    const approval = signApprovalFor({
       action: "delete_permanent", parameters: { file_id: "f2" } as Record<string, JsonValue>,
-      expires_at: new Date(Date.now() + 60_000).toISOString(), nonce: `nonce-${randomUUID()}`, approving_device_id: "watch-1"
+      nonce: `nonce-${randomUUID()}`, approving_device_id: "watch-1"
     });
     const allowed = await delegateGateway.execute({ identity: delegateIdentity, tool_id: "drive", action: "delete_permanent", parameters: { file_id: "f2" }, approval });
     expect(allowed.ok).toBe(true);
@@ -273,7 +277,7 @@ describe("Drive full read/write access - G/H/I: destruktive/sikkerhetskritiske h
 
     const { transport: delegateTransport } = buildStatefulDriveTransport();
     const devices = new InMemoryDeviceRegistry();
-    devices.register("watch-2", watchKeys.publicKey);
+    devices.register("watch-2", watchKeys.publicKey, { tenant_id: delegateIdentity.tenant_id, person_id: delegateIdentity.person_id });
     const { gateway: delegateGateway } = buildGateway(delegateTransport, undefined, devices);
     const denied = await delegateGateway.execute({
       identity: delegateIdentity, tool_id: "drive", action: "create_permission",

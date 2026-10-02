@@ -54,6 +54,9 @@ import {
 import { assertRuntimeCredentialsConfigured, assertRuntimeRoleSafe, configFromEnv, createPool, PgApprovalStore, PgDeviceRegistry } from "@jarvis/core";
 import { KillSwitch, OwnerControls, PolicyGateway } from "@jarvis/policy";
 import type { IdentityContext } from "@jarvis/contracts";
+import { loadOwnerConfig } from "@jarvis/contracts";
+// Remediering del 2 (JARVIS-065): eier fra validert konfig (JARVIS_TENANT_ID/JARVIS_OWNER_PERSON_ID/JARVIS_OWNER_NAME), ingen hardkoding.
+const owner = loadOwnerConfig();
 
 const results: Record<string, "PASS" | "FAIL" | "BLOCKED_NO_CREDENTIALS"> = {
   drive_runtime_registered: "BLOCKED_NO_CREDENTIALS",
@@ -118,8 +121,8 @@ async function main(): Promise<void> {
     await assertRuntimeRoleSafe(pool);
     diagnostics["q21_runtime_role_safe"] = "PASS";
 
-    const tenantId = process.env["JARVIS_TENANT_ID"] ?? "tenant-personal";
-    const ownerPersonId = process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias";
+    const tenantId = owner.tenant_id;
+    const ownerPersonId = owner.owner_person_id;
     const killSwitch = new KillSwitch();
     const deviceRegistry = new PgDeviceRegistry(pool, tenantId);
     await deviceRegistry.refresh().catch(() => undefined);

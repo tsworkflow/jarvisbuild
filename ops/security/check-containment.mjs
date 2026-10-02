@@ -84,6 +84,21 @@ function pinned(imageRef) {
   return /@sha256:[0-9a-f]{64}$/.test(imageRef.trim());
 }
 
+/** Navn i `cap_add` (flow-liste `[A, B]` eller blokkliste `- A`), uten anførselstegn. */
+function capAddNames(block) {
+  const names = [];
+  for (let i = 0; i < block.length; i++) {
+    const m = /^\s{4}cap_add:\s*(.*)$/.exec(block[i] ?? "");
+    if (!m) continue;
+    const inline = (m[1] ?? "").replace(/#.*$/, "");
+    for (const t of inline.match(/[A-Za-z_]+/g) ?? []) names.push(t.toUpperCase());
+    for (let j = i + 1; j < block.length && /^\s{6}-\s*/.test(block[j] ?? ""); j++) {
+      for (const t of (block[j] ?? "").replace(/#.*$/, "").match(/[A-Za-z_]+/g) ?? []) names.push(t.toUpperCase());
+    }
+  }
+  return names;
+}
+
 export function checkCompose(text, label = "docker-compose.yml") {
   const violations = [];
   const services = parseComposeServices(text);
@@ -97,9 +112,43 @@ export function checkCompose(text, label = "docker-compose.yml") {
     if (/^\s{4}network_mode:\s*["']?host/m.test(body)) violations.push(`${label}: service '${name}' uses network_mode: host`);
     if (/^\s{4}privileged:\s*true/m.test(body)) violations.push(`${label}: service '${name}' is privileged`);
     if (/docker\.sock/.test(body)) violations.push(`${label}: service '${name}' mounts the Docker socket`);
+    // Del 2 (JARVIS-009/010): ingen tjeneste får hele .env-settet; capabilities legges aldri til; ingen sandbox-av.
+    if (/^\s{4}env_file:/m.test(body)) violations.push(`${label}: service '${name}' uses env_file (whole .env set) - list per-service variables explicitly`);
+    // D-365: eneste tillatte unntak er `SYS_CHROOT` på browser-gateway (Chromium-sandboxens chroot under `cap_drop: ALL`).
+    if (/^\s{4}cap_add:/m.test(body)) {
+      const added = capAddNames(block);
+      const allowed = name === "browser-gateway" && added.length === 1 && added[0] === "SYS_CHROOT";
+      if (!allowed) violations.push(`${label}: service '${name}' adds Linux capabilities (cap_add: ${added.join(",") || "?"}) - only SYS_CHROOT on browser-gateway is allowed (D-365)`);
+    }
+    if (/seccomp[=:]\s*unconfined/.test(body) || /apparmor[=:]\s*unconfined/.test(body)) violations.push(`${label}: service '${name}' disables seccomp/apparmor (unconfined)`);
+    if (/^\s{4}user:\s*["']?(root|0)\b/m.test(body)) violations.push(`${label}: service '${name}' runs as root`);
     const image = /^\s{4}image:\s*(\S+)/m.exec(body)?.[1];
     if (image && !pinned(image)) violations.push(`${label}: service '${name}' image '${image}' is not pinned to a @sha256 digest`);
     if (/JARVIS_VOICE_DEBUG_DUMP_DIR/.test(body)) violations.push(`${label}: service '${name}' forwards JARVIS_VOICE_DEBUG_DUMP_DIR (raw audio dump must not be wired in compose)`);
+  }
+  // Del 2: Node-/Chromium-tjenestene skal være herdet (cap_drop ALL + no-new-privileges + read-only rootfs).
+  for (const name of ["api", "worker", "migrate", "voice-gateway", "browser-gateway"]) {
+    const block = services[name];
+    if (!block) continue;
+    const body = block.join("\n");
+    const hardened = /<<:\s*\*hardening/.test(body);
+    if (!hardened && !/cap_drop:\s*\[\s*["']?ALL/.test(body)) violations.push(`${label}: service '${name}' must drop all capabilities (cap_drop: [ALL] / <<: *hardening)`);
+    if (!hardened && !/no-new-privileges:true/.test(body)) violations.push(`${label}: service '${name}' must set no-new-privileges`);
+    if (!hardened && !/^\s{4}read_only:\s*true/m.test(body)) violations.push(`${label}: service '${name}' must have a read-only root filesystem`);
+  }
+  // Del 2: Chromium-tjenesten er aldri på `core`-nettverket (ville gitt vei til DB/vault) og har kun egen seccomp-profil.
+  const browser = services["browser-gateway"];
+  if (browser) {
+    const body = browser.join("\n");
+    if (!/^\s{4}networks:\s*\[\s*browser\s*\]/m.test(body)) violations.push(`${label}: service 'browser-gateway' must be attached ONLY to the 'browser' network`);
+  }
+  // Del 2: hemmeligheter som kun hører hjemme hos vault/DB-bootstrap må ikke lekke inn i app-/worker-/browser-/voice-tjenester.
+  const VAULT_ONLY = ["INFISICAL_ENCRYPTION_KEY", "INFISICAL_AUTH_SECRET", "JARVIS_DB_ADMIN_PASSWORD", "INFISICAL_DB_PASSWORD", "LANGFUSE_DB_PASSWORD", "NEXTAUTH_SECRET"];
+  for (const name of ["api", "worker", "voice-gateway", "browser-gateway"]) {
+    const body = (services[name] ?? []).join("\n");
+    for (const key of VAULT_ONLY) {
+      if (new RegExp(`\\b${key}\\b`).test(body)) violations.push(`${label}: service '${name}' receives ${key} (vault/DB-admin secret must not reach this service)`);
+    }
   }
   // services that must never publish a host port at all
   for (const name of ["browser-gateway", "infisical-redis", "db-bootstrap", "migrate", "worker"]) {
@@ -119,6 +168,12 @@ export function checkDockerfile(text, label) {
     const ref = m[1];
     if (ref !== "scratch" && !stages.has(ref) && !pinned(ref)) violations.push(`${label}: FROM ${ref} is not pinned to a @sha256 digest`);
     if (m[2]) stages.add(m[2]);
+  }
+  // Del 2: den SISTE (kjørende) stage skal ha en ikke-root USER.
+  const users = stripYamlComments(text).filter((l) => /^USER\s+/i.test(l.trim())).map((l) => l.trim().split(/\s+/)[1]);
+  const last = users[users.length - 1];
+  if (!last || last === "root" || last === "0" || last.startsWith("0:")) {
+    violations.push(`${label}: final stage must set a non-root USER (found ${last ?? "none"})`);
   }
   return violations;
 }

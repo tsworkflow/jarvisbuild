@@ -7,6 +7,7 @@ import {
   ToolCallSchema,
   approvalSigningBytes,
   canonicalStringify,
+  hashApprovalParameters,
   jsonEquals
 } from "@jarvis/contracts";
 
@@ -44,8 +45,13 @@ describe("ToolCall", () => {
 
 describe("SignedApproval", () => {
   const approval = {
+    tool_id: "home-assistant",
     action: "unlock_front_door",
-    parameters: { door: "front" },
+    parameters_hash: hashApprovalParameters({ door: "front" }),
+    tenant_id: "tenant-personal",
+    person_id: "person-tobias",
+    approver_person_id: "person-tobias",
+    issued_at: new Date().toISOString(),
     expires_at: new Date(Date.now() + 60_000).toISOString(),
     nonce: "nonce-1234567890abcdef",
     approving_device_id: "watch-1",
@@ -57,10 +63,27 @@ describe("SignedApproval", () => {
     expect(() => SignedApprovalSchema.parse({ ...approval, nonce: "kort" })).toThrow();
   });
 
-  it("signeringsbytes er stabile uavhengig av nøkkelrekkefølge i parameters", () => {
-    const a = approvalSigningBytes({ ...approval, parameters: { a: 1, b: 2 } });
-    const b = approvalSigningBytes({ ...approval, parameters: { b: 2, a: 1 } });
+  it("parameters_hash er stabil uavhengig av nøkkelrekkefølge, og følger innholdet", () => {
+    expect(hashApprovalParameters({ a: 1, b: 2 })).toBe(hashApprovalParameters({ b: 2, a: 1 }));
+    expect(hashApprovalParameters({ a: 1 })).not.toBe(hashApprovalParameters({ a: 2 }));
+    const a = approvalSigningBytes({ ...approval, parameters_hash: hashApprovalParameters({ a: 1, b: 2 }) });
+    const b = approvalSigningBytes({ ...approval, parameters_hash: hashApprovalParameters({ b: 2, a: 1 }) });
     expect(a.equals(b)).toBe(true);
+  });
+
+  it("alle bindinger er en del av signaturgrunnlaget (tool, tenant, person, approver, issued_at)", () => {
+    const base = approvalSigningBytes(approval);
+    for (const changed of [
+      { tool_id: "annet" }, { tenant_id: "t2" }, { person_id: "p2" },
+      { approver_person_id: "p2" }, { issued_at: new Date(Date.now() - 1000).toISOString() }
+    ]) {
+      expect(approvalSigningBytes({ ...approval, ...changed }).equals(base)).toBe(false);
+    }
+  });
+
+  it("skjemaet er strengt: det gamle `parameters`-feltet og ukjente felt avvises", () => {
+    expect(() => SignedApprovalSchema.parse({ ...approval, parameters: { door: "front" } })).toThrow();
+    expect(() => SignedApprovalSchema.parse({ ...approval, parameters_hash: "ikke-hex" })).toThrow();
   });
 });
 

@@ -2,6 +2,7 @@
 <html lang="no">
 <head>
 <meta charset="utf-8">
+<!--JARVIS_OWNER_META-->
 <meta name="viewport" content="width=device-width, initial-scale=1">
 <title>Jarvis · Tale</title>
 <link rel="icon" href="data:image/svg+xml,%3Csvg xmlns='http://www.w3.org/2000/svg' viewBox='0 0 100 100'%3E%3Ccircle cx='50' cy='50' r='48' fill='%230d1117'/%3E%3Ctext x='50' y='68' font-size='58' font-family='system-ui,sans-serif' font-weight='700' fill='%237ee2a8' text-anchor='middle'%3EJ%3C/text%3E%3C/svg%3E">
@@ -136,8 +137,16 @@
     return id;
   }
 
+  // Remediering del 2 (JARVIS-065): eier-identiteten injiseres av serveren fra validert konfig (<meta name="jarvis-owner">)
+  // - ALDRI hardkodet her. Den er kun en visnings-/forespørselsetikett; autoriteten kommer fra serverens grant-verifisering.
+  const JARVIS_OWNER = (() => {
+    const el = document.querySelector('meta[name="jarvis-owner"]');
+    try { const o = JSON.parse(el ? el.content : "null"); if (o && o.person_id && o.tenant_id) return o; } catch (e) { /* faller til feil under */ }
+    throw new Error("owner_not_configured");
+  })();
+
   const identity = {
-    person_id: "person-tobias", tenant_id: "tenant-personal", device_id: loadOrCreateDeviceId(),
+    person_id: JARVIS_OWNER.person_id, tenant_id: JARVIS_OWNER.tenant_id, device_id: loadOrCreateDeviceId(),
     memory_space: "personal"
   };
 
@@ -278,10 +287,10 @@
   }
   tryAutoEnrollFromUrl();
 
+  // Remediering del 2 (JARVIS-066): tidligere `textContent -> innerHTML`, som IKKE escaper anførselstegn - verdier ble brukt i
+  // `data-*="..."`-attributter (attributt-injeksjon). Nå eksplisitt escaping av alle HTML-metategn inkl. " og '.
   function escapeHtml(text) {
-    const div = document.createElement("div");
-    div.textContent = String(text);
-    return div.innerHTML;
+    return String(text).replace(/[&<>"'`]/g, (ch) => ({ "&": "&amp;", "<": "&lt;", ">": "&gt;", '"': "&quot;", "'": "&#39;", "`": "&#96;" })[ch]);
   }
 
   function appendTurn(role, text) {

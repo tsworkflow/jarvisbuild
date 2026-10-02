@@ -1,5 +1,5 @@
 import type pg from "pg";
-import { writeAudit, withTenantTransaction, type SessionGrantService } from "@jarvis/core";
+import { writeAudit, withTenantTransaction, type DeviceService, type SessionGrantService } from "@jarvis/core";
 import { assertOwnerControlAuthorized, type KillSwitch, type OwnerControlAuthority, type OwnerControls } from "@jarvis/policy";
 import { DeviceNotFoundError, type DeviceRevocationResult, type FrozenConnectorEntry, type OwnerControlState, type RevokedCredentialEntry } from "./types.ts";
 
@@ -16,6 +16,12 @@ import { DeviceNotFoundError, type DeviceRevocationResult, type FrozenConnectorE
 export interface OwnerControlsDeviceRevocationDeps {
   pool: pg.Pool;
   grants: SessionGrantService;
+  /**
+   * JARVIS-050: tilbakekalling er PERMANENT - enheten markeres `revoked_at`, nøkkelen fjernes og
+   * fingerprinten lagres, i tillegg til at grants fjernes. Uten dette ble nøkkelen stående
+   * innrullert og kunne hente et nytt grant umiddelbart.
+   */
+  devices: DeviceService;
   authority?: OwnerControlAuthority;
 }
 
@@ -116,7 +122,7 @@ export class OwnerControlsService {
    */
   async revokeDevice(tenantId: string, deviceId: string, reason: string, actorPersonId: string): Promise<DeviceRevocationResult> {
     if (!this.deviceRevocation) throw new Error("owner_controls_device_revocation_not_configured");
-    const { pool, grants, authority } = this.deviceRevocation;
+    const { pool, grants, devices, authority } = this.deviceRevocation;
     assertOwnerControlAuthorized(pool, authority, actorPersonId);
     return withTenantTransaction(pool, tenantId, async (client) => {
       // RLS (migrasjon 005) begrenser `devices` til `jarvis.tenant_id` (satt
@@ -125,6 +131,8 @@ export class OwnerControlsService {
       // `WHERE`-leddet under (som likevel beholdes, defense-in-depth).
       const { rows } = await client.query(`SELECT 1 FROM devices WHERE tenant_id = $1 AND device_id = $2`, [tenantId, deviceId]);
       if (rows.length === 0) throw new DeviceNotFoundError(deviceId);
+      // JARVIS-050: permanent - nøkkelen kan ikke autorisere på nytt og kan ikke rulles inn igjen.
+      await devices.revokeDeviceKeyOn(client, { tenant_id: tenantId, device_id: deviceId }, reason);
       const revokedGrants = await grants.revokeForDeviceOn(client, tenantId, deviceId);
       await writeAudit(
         client,

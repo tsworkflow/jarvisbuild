@@ -64,6 +64,13 @@ export class SessionService {
    * skal ikke kunne opprette hver sin «aktive» sesjon.
    */
   async resumeOrCreateOn(client: pg.PoolClient, principal: SessionPrincipal, channel: Channel): Promise<SessionRef> {
+    // JARVIS-055: `FOR UPDATE` på NULL rader låser ingenting - to samtidige første
+    // autorisasjoner så begge «ingen sesjon» og opprettet hver sin. Rådgivende lås per
+    // (tenant, person) serialiserer dem, og den delvise unike indeksen
+    // `sessions_one_active_per_person_idx` (migrasjon 063) er den strukturelle garantien.
+    await client.query("SELECT pg_advisory_xact_lock(hashtextextended($1, 0))", [
+      `session:${principal.tenant_id}:${principal.person_id}`
+    ]);
     const existing = await client.query(
       `SELECT session_id FROM sessions
          WHERE tenant_id = $1 AND person_id = $2 AND status = 'active'

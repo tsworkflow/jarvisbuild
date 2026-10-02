@@ -1,5 +1,6 @@
 // .ts-utvidelser kreves: filene kjøres direkte med Nodes type-stripping (ingen build-steg)
 import type pg from "pg";
+import type { OwnerConfig } from "@jarvis/contracts";
 
 /**
  * Owner-seed (BO-08 + D-30 live-funn): identitetsdata for fersk database,
@@ -23,10 +24,11 @@ import type pg from "pg";
  * enroll-ticket`, eller proof-of-possession fra en allerede innrullert enhet).
  * Seeden er altså identitets-/medlemskapsdata, ALDRI en tillitsgrense.
  */
-export async function seedOwner(pool: pg.Pool): Promise<void> {
-  const tenant = process.env["JARVIS_TENANT_ID"] ?? "tenant-personal";
-  const person = process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias";
-  const name = process.env["JARVIS_OWNER_NAME"] ?? "Tobias";
+export async function seedOwner(pool: pg.Pool, owner: OwnerConfig): Promise<void> {
+  // Remediering del 2 (JARVIS-065): eier-identiteten kommer fra validert konfig (`loadOwnerConfig`) - ingen defaults.
+  const tenant = owner.tenant_id;
+  const person = owner.owner_person_id;
+  const name = owner.owner_display_name;
   const voiceDevice = process.env["JARVIS_VOICE_DEVICE_ID"] ?? "jarvis-voice-live";
   await pool.query("INSERT INTO tenants (tenant_id,name,kind) VALUES ($1,$2,'person') ON CONFLICT DO NOTHING", [tenant, name]);
   await pool.query("INSERT INTO people (person_id,display_name) VALUES ($1,$2) ON CONFLICT DO NOTHING", [person, name]);

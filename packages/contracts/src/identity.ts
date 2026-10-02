@@ -16,6 +16,21 @@ export const MemorySpaceSchema = z.enum([
 export type MemorySpace = z.infer<typeof MemorySpaceSchema>;
 
 /**
+ * Remediering del 2 (JARVIS-076): RLS leser `jarvis.memory_spaces` som en KOMMA-separert liste
+ * (`string_to_array(current_setting('jarvis.memory_spaces', true), ',')`). Semantikken er derfor presis: elementene
+ * sammenlignes EKSAKT (ingen trimming - `'personal, business'` gir elementene `personal` og ` business`, og det
+ * siste matcher ingenting = fail closed). Serialiseringen skjer KUN her: hvert element må være en gyldig
+ * `MemorySpace` (ingen komma/mellomrom/injeksjon), duplikater fjernes, og en tom liste avvises (en tom GUC ville
+ * gitt tom rad-mengde, men en eksplisitt feil er tryggere enn en stille tom kontekst).
+ */
+export function serializeMemorySpaces(spaces: readonly string[]): string {
+  if (!Array.isArray(spaces) || spaces.length === 0) throw new Error("memory_spaces_empty");
+  const parsed = spaces.map((s) => MemorySpaceSchema.safeParse(s));
+  if (parsed.some((r) => !r.success)) throw new Error("memory_spaces_invalid");
+  return [...new Set(parsed.map((r) => (r as { data: string }).data))].join(",");
+}
+
+/**
  * Gradert autentiseringsstyrke (SECURITY_MODEL §10).
  * passive < active < signed. Stemme alene gir aldri forhøyet styrke.
  */

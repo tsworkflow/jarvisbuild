@@ -5,7 +5,7 @@ import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, beforeEach, describe, expect, it } from "vitest";
 import type { IdentityContext } from "@jarvis/contracts";
-import { createPool, PgApprovalStore, runMigrations, SessionGrantService } from "@jarvis/core";
+import { createPool, DeviceService, PgApprovalStore, runMigrations, SessionGrantService } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { FinanceService, FinanceTransport } from "@jarvis/finance";
 import { InMemoryDeviceRegistry, KillSwitch, OwnerControls, PolicyGateway } from "@jarvis/policy";
@@ -423,6 +423,7 @@ function freshConnectedExecutiveStack(): {
   const stackOwnerControlsService = new OwnerControlsService(stackKillSwitch, stackOwnerControls, {
     pool: appPool,
     grants: new SessionGrantService(appPool),
+    devices: new DeviceService(appPool),
     authority: { owner_person_id: OWNER }
   });
   for (const tool of ownerControlsToolDefinitions(new OwnerControlsTransport(stackOwnerControlsService))) stackGateway.register(tool);

@@ -15,7 +15,7 @@ import {
   withTenantTransaction
 } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
-import type { EventEnvelope } from "@jarvis/contracts";
+import { hashApprovalParameters, type EventEnvelope } from "@jarvis/contracts";
 
 // Ekte PostgreSQL 16 (embedded) - ingen mocks. Datamappe utenfor repoet.
 let PORT = 0;
@@ -38,7 +38,8 @@ beforeAll(async () => {
     password: "test-superuser-pw",
     port,
     persistent: false
-  }),
+  })
+,
     // D-141 B: proben maa bruke instansens EGNE credentials.
     { identity: { user: "postgres", password: "test-superuser-pw", database: "postgres" } }
   );
@@ -291,9 +292,14 @@ describe("Persistent godkjenningslager (replay-vern i database)", () => {
     return {
       nonce,
       tenant_id: "tenant-a",
+      tool_id: "ha",
       action: "unlock_front_door",
       parameters: { door: "front" },
+      parameters_hash: hashApprovalParameters({ door: "front" }),
+      requester_person_id: "person-tobias",
+      approver_person_id: "person-tobias",
       approving_device_id: "dev-phone",
+      issued_at: new Date().toISOString(),
       expires_at: new Date(Date.now() + 60_000).toISOString()
     };
   }

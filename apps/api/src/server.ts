@@ -1,7 +1,9 @@
+import { randomBytes } from "node:crypto";
 import { readFile } from "node:fs/promises";
 import { createServer, type IncomingMessage, type Server, type ServerResponse } from "node:http";
 import { fileURLToPath } from "node:url";
 import type pg from "pg";
+import { ChallengeLimitError } from "@jarvis/core";
 import type {
   ChannelSessionAuthority, DeviceEnrollmentService, DeviceService, IdentityService,
   SessionGrantService, SessionService, VoiceSessionAuthority
@@ -21,7 +23,10 @@ import {
   type CardService, type FinanceService
 } from "@jarvis/finance";
 import type { ConversationEngine } from "./conversation.ts";
-import type { IdentityContext, JsonValue, MemorySpace } from "@jarvis/contracts";
+import type { IdentityContext, JsonValue } from "@jarvis/contracts";
+import {
+  FORBIDDEN_IDENTITY_BODY_KEYS, HttpError, RateLimiter, clientKey, newRequestId, readJsonBody, readRawBodyLimited
+} from "./http-guard.ts";
 
 /**
  * Fase 3: minimalt API uten rammeverk (rammeverksvalg utsatt til behovet
@@ -130,6 +135,14 @@ export interface ApiDeps {
    * den kan ikke slås på via miljøvariabel.
    */
   enableDevRoutes?: boolean;
+  /** Remediering del 2 (JARVIS-063): overstyr rate-limit-tallene (tester). Standard: se `DEFAULT_RATE_LIMITS`. */
+  rateLimits?: Partial<ApiRateLimits>;
+  /**
+   * Remediering del 2 (JARVIS-065): den ENE validerte eier-identiteten (fra `loadOwnerConfig`). Brukes KUN til å fylle
+   * visningsfeltene (`person_id`/`tenant_id`) i de statiske sidene - aldri som autoritet (autoritet kommer alltid fra
+   * en verifisert grant). Uten verdien svarer de brukervendte sidene 503 `owner_not_configured`.
+   */
+  owner?: { tenant_id: string; person_id: string };
 }
 
 export interface HealthStatus {
@@ -280,19 +293,33 @@ const EXECUTIVE_MUTATE_ACTIONS = [
  * Stille ignorering er farlig her: en klient (eller en fremtidig
  * refaktorering) kunne ellers TRO at feltet virket.
  */
-function parseGrantBody<K extends readonly string[]>(raw: unknown, allowedKeys: K): Record<string, unknown> | null {
+/**
+ * Remediering del 2 (JARVIS-001): SAMME avvisningsrekkefølge og -koder som `authedRequest` for de grant-beskyttede rutene som
+ * tolker kroppen selv (chat/brief/executive/governance): ikke-objekt -> 400, forbudt identitetsfelt -> 400
+ * `identity_field_forbidden`, ukjent felt -> 400, manglende grant -> 401 `grant_required`. Sender svaret selv og returnerer null.
+ */
+function grantBodyOrReject<K extends readonly string[]>(res: ServerResponse, raw: unknown, allowedKeys: K): Record<string, unknown> | null {
   if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    json(res, 400, { error: "malformed_request", request_id: requestIdOf(res) });
     return null;
   }
   const obj = raw as Record<string, unknown>;
+  const forbidden = FORBIDDEN_IDENTITY_BODY_KEYS.find((key) => key in obj);
+  if (forbidden !== undefined) {
+    json(res, 400, { error: "identity_field_forbidden", field: forbidden, request_id: requestIdOf(res) });
+    return null;
+  }
   if (Object.keys(obj).some((key) => !(allowedKeys as readonly string[]).includes(key))) {
+    json(res, 400, { error: "malformed_request", reason: "unknown_field", request_id: requestIdOf(res) });
     return null;
   }
   if (typeof obj["grant_token"] !== "string" || obj["grant_token"].length === 0) {
+    json(res, 401, { error: "grant_required", request_id: requestIdOf(res) });
     return null;
   }
   return obj;
 }
+
 
 /**
  * D-131 funn 1: DEN ENE veien fra et framlagt bærer-bevis til en
@@ -316,8 +343,9 @@ function parseGrantBody<K extends readonly string[]>(raw: unknown, allowedKeys: 
  */
 async function resolveFromGrant(
   deps: ApiDeps,
-  grantToken: string
-): Promise<{ ok: true; identity: IdentityContext } | { ok: false; reason: string }> {
+  grantToken: string,
+  res?: ServerResponse
+): Promise<{ ok: true; identity: IdentityContext } | { ok: false; reason: string; responded?: true }> {
   const verified = await deps.grants.verify(grantToken);
   if (!verified.ok) {
     return { ok: false, reason: verified.reason };
@@ -334,6 +362,15 @@ async function resolveFromGrant(
   });
   if (!resolved.ok) {
     return { ok: false, reason: resolved.reason };
+  }
+  // Arkitekt-review (P3): per-enhet rate limit gjelder ALLE grant-beskyttede ruter (ikke bare `authedRequest`-rutene) - et gyldig
+  // grant er det som identifiserer enheten, så grensen tas først ETTER vellykket verifisering. Svaret (429) sendes her.
+  if (res) {
+    const limiters = limiterRegistry.get(res);
+    if (limiters && !limiters.device.take(`${resolved.identity.tenant_id}|${resolved.identity.device_id}`)) {
+      json(res, 429, { error: "rate_limited", request_id: requestIdOf(res) });
+      return { ok: false, reason: "rate_limited", responded: true };
+    }
   }
   return { ok: true, identity: resolved.identity };
 }
@@ -360,25 +397,36 @@ const WEB_COMMAND = fileURLToPath(new URL("../../web/command.html", import.meta.
  */
 const WEB_VOICE = fileURLToPath(new URL("../../web/voice.html", import.meta.url));
 
+/** Størrelsesbegrenset JSON-parsing (413 over grensen, 400 `malformed_json` ved ugyldig JSON). */
 async function readBody(req: IncomingMessage): Promise<unknown> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(chunk as Buffer);
+  return readJsonBody(req);
+}
+
+/**
+ * Autentiseringsrutene (`/session/authorize` m.fl.) har alltid svart med et
+ * deterministisk `403 malformed_evidence` på ugyldig JSON - aldri en feil som
+ * skiller «parseren knakk» fra «beviset holdt ikke». Størrelsesgrensen (413)
+ * og alle andre feil propageres uendret.
+ */
+async function readBodyOrUndefined(req: IncomingMessage): Promise<unknown> {
+  try {
+    return await readJsonBody(req);
+  } catch (err) {
+    if (err instanceof HttpError && err.code === "malformed_json") {
+      return undefined;
+    }
+    throw err;
   }
-  return chunks.length ? JSON.parse(Buffer.concat(chunks).toString("utf8")) : {};
 }
 
 /**
  * D-109: rå byte-for-byte body - `readBody()` over ville JSON.parse()-et og
  * dermed gjort HMAC-signaturverifisering (som må hashe EKSAKT det Stripe
- * sendte) umulig å reprodusere korrekt.
+ * sendte) umulig å reprodusere korrekt. Størrelsesgrensen gjelder FØR
+ * signaturkontrollen (JARVIS-063).
  */
 async function readRawBody(req: IncomingMessage): Promise<Buffer> {
-  const chunks: Buffer[] = [];
-  for await (const chunk of req) {
-    chunks.push(chunk as Buffer);
-  }
-  return Buffer.concat(chunks);
+  return readRawBodyLimited(req);
 }
 
 function json(res: ServerResponse, status: number, body: unknown, extraHeaders: Record<string, string> = {}): void {
@@ -386,22 +434,258 @@ function json(res: ServerResponse, status: number, body: unknown, extraHeaders: 
   res.end(JSON.stringify(body));
 }
 
+function requestIdOf(res: ServerResponse): string {
+  const header = res.getHeader("x-request-id");
+  return typeof header === "string" ? header : "unknown";
+}
+
+/**
+ * Rate limits (JARVIS-063). Per-IP FØR autentisering, per-device ETTER at
+ * grantet er løst. Tallene er bevisst romslige for én eier med noen få
+ * enheter, men gjør brute force/flom mot kontrollflatene kostbart.
+ */
+export interface ApiRateLimits {
+  /** Alle forespørsler per klient-IP per minutt. */
+  perIpPerMinute: number;
+  /** Auth-/innrulleringsrutene per klient-IP per minutt (nonce-/bevisflater). */
+  authPerIpPerMinute: number;
+  /** Grant-beskyttede kontrollruter per enhet per minutt. */
+  perDevicePerMinute: number;
+}
+
+const DEFAULT_RATE_LIMITS: ApiRateLimits = { perIpPerMinute: 600, authPerIpPerMinute: 30, perDevicePerMinute: 120 };
+
+interface RateLimiters {
+  ip: RateLimiter;
+  auth: RateLimiter;
+  device: RateLimiter;
+}
+
+const AUTH_ROUTES: ReadonlySet<string> = new Set([
+  "/devices/challenge", "/devices/register", "/session/authorize", "/voice/session/authorize"
+]);
+
+const limiterRegistry = new WeakMap<ServerResponse, RateLimiters>();
+
+function limitersFor(limits: ApiRateLimits): RateLimiters {
+  const minute = 60_000;
+  return {
+    ip: new RateLimiter(limits.perIpPerMinute, minute),
+    auth: new RateLimiter(limits.authPerIpPerMinute, minute),
+    device: new RateLimiter(limits.perDevicePerMinute, minute)
+  };
+}
+
 export function createApiServer(deps?: ApiDeps): Server {
+  const limiters = limitersFor({ ...DEFAULT_RATE_LIMITS, ...(deps?.rateLimits ?? {}) });
   return createServer((req, res) => {
+    const requestId = newRequestId();
+    res.setHeader("x-request-id", requestId);
+    limiterRegistry.set(res, limiters);
+    const peer = clientKey(req);
+    const path = (req.url ?? "/").split("?")[0] ?? "/";
+    const allowed = limiters.ip.take(peer) && (!AUTH_ROUTES.has(path) || limiters.auth.take(`${peer}|${path}`));
+    if (!allowed) {
+      req.resume();
+      res.setHeader("retry-after", String(limiters.ip.retryAfterSeconds(peer)));
+      return json(res, 429, { error: "rate_limited", request_id: requestId });
+    }
     void route(req, res, deps).catch((err: Error) => {
       // D-251 (live NAS-migreringsfunn): denne grenen logget FØR ingenting når
       // headers allerede var sendt (SSE-streamen fra /chat) - en feil etter
       // `res.writeHead(200, text/event-stream)` avsluttet streamen stille med
       // `res.end()` alene, usynlig for BÅDE klienten (ingen `error`-event) OG
       // server-loggen. Logg ALLTID, uansett hvilken gren som følger.
-      console.error(JSON.stringify({ msg: "route_unhandled_error", path: req.url, error: err.message }));
+      //
+      // JARVIS-064: klienten får ALDRI intern feiltekst (pg-feil, ID-er, stier) -
+      // kun en generisk kode og request-ID-en; detaljene står i server-loggen.
+      if (err instanceof HttpError) {
+        if (!res.headersSent) {
+          json(res, err.status, { error: err.code, request_id: requestId });
+        } else {
+          res.end();
+        }
+        return;
+      }
+      console.error(JSON.stringify({ msg: "route_unhandled_error", request_id: requestId, path, error: err.message }));
       if (!res.headersSent) {
-        json(res, 500, { error: "internal_error", message: err.message });
+        json(res, 500, { error: "internal_error", request_id: requestId });
       } else {
         res.end();
       }
     });
   });
+}
+
+/**
+ * JARVIS-001: DEN ENE inngangen for alle grant-beskyttede kontrollruter
+ * (tasks/incidents/infra/observability/deployments). Identitet, tenant, person,
+ * enhet, sesjon, kanal og auth-styrke utledes UTELUKKENDE fra det verifiserte
+ * grantet - kroppen kan aldri bære dem. Et forsøk på det er en 400, ikke en
+ * stille ignorering (en klient kunne ellers tro at feltet virket).
+ *
+ * Rekkefølge: kropp (størrelse/JSON) → forbudte identitetsfelt → hvitelistede
+ * felt → grant-verifisering → enhet-rate-limit. En 401/403 gis FØR noen
+ * domeneoperasjon er nådd.
+ */
+interface AuthedRequest {
+  identity: IdentityContext;
+  body: Record<string, unknown>;
+}
+
+async function authedRequest(
+  req: IncomingMessage, res: ServerResponse, deps: ApiDeps, allowedKeys: readonly string[]
+): Promise<AuthedRequest | null> {
+  const raw = await readBody(req);
+  if (typeof raw !== "object" || raw === null || Array.isArray(raw)) {
+    json(res, 400, { error: "malformed_request", request_id: requestIdOf(res) });
+    return null;
+  }
+  const body = raw as Record<string, unknown>;
+  const forbidden = FORBIDDEN_IDENTITY_BODY_KEYS.find((key) => key in body);
+  if (forbidden !== undefined) {
+    json(res, 400, { error: "identity_field_forbidden", field: forbidden, request_id: requestIdOf(res) });
+    return null;
+  }
+  const unknownKey = Object.keys(body).find((key) => key !== "grant_token" && !allowedKeys.includes(key));
+  if (unknownKey !== undefined) {
+    json(res, 400, { error: "malformed_request", reason: "unknown_field", request_id: requestIdOf(res) });
+    return null;
+  }
+  const token = body["grant_token"];
+  if (typeof token !== "string" || token.length === 0) {
+    json(res, 401, { error: "grant_required", request_id: requestIdOf(res) });
+    return null;
+  }
+  const resolved = await resolveFromGrant(deps, token, res);
+  if (!resolved.ok) {
+    if (resolved.responded) return null; // 429 er allerede sendt (per-enhet-grense)
+    json(res, 403, { error: "identity_denied", reason: resolved.reason, request_id: requestIdOf(res) });
+    return null;
+  }
+  const { grant_token: _omit, ...rest } = body;
+  void _omit;
+  return { identity: resolved.identity, body: rest };
+}
+
+function fieldString(body: Record<string, unknown>, key: string): string {
+  const value = body[key];
+  if (typeof value !== "string" || value.length === 0 || value.length > 4_000) {
+    throw new HttpError(400, "malformed_request", key);
+  }
+  return value;
+}
+
+function fieldOptionalString(body: Record<string, unknown>, key: string): string | undefined {
+  return body[key] === undefined ? undefined : fieldString(body, key);
+}
+
+function fieldOptionalStringArray(body: Record<string, unknown>, key: string): string[] | undefined {
+  const value = body[key];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (!Array.isArray(value) || value.length > 100 || value.some((item) => typeof item !== "string" || item.length > 4_000)) {
+    throw new HttpError(400, "malformed_request", key);
+  }
+  return value as string[];
+}
+
+function fieldOptionalNumber(body: Record<string, unknown>, key: string): number | undefined {
+  const value = body[key];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "number" || !Number.isFinite(value)) {
+    throw new HttpError(400, "malformed_request", key);
+  }
+  return value;
+}
+
+function fieldOptionalBoolean(body: Record<string, unknown>, key: string): boolean | undefined {
+  const value = body[key];
+  if (value === undefined) {
+    return undefined;
+  }
+  if (typeof value !== "boolean") {
+    throw new HttpError(400, "malformed_request", key);
+  }
+  return value;
+}
+
+function fieldRecord(body: Record<string, unknown>, key: string): Record<string, unknown> {
+  const value = body[key];
+  if (typeof value !== "object" || value === null || Array.isArray(value)) {
+    throw new HttpError(400, "malformed_request", key);
+  }
+  return value as Record<string, unknown>;
+}
+
+/** Fanger en domene-feil uten å lekke den: logges med request-ID, klienten får kun en generisk kode. */
+function domainFailure(res: ServerResponse, status: number, code: string, err: unknown): void {
+  console.error(JSON.stringify({ msg: "route_domain_failure", request_id: requestIdOf(res), code, error: (err as Error).message }));
+  json(res, status, { error: code, request_id: requestIdOf(res) });
+}
+
+
+/**
+ * Remediering del 2 (JARVIS-066): statiske sider får (a) en nonce-basert CSP (ingen `unsafe-inline`-script), (b) rammebeskyttelse
+ * (`frame-ancestors 'self'` + `X-Frame-Options: SAMEORIGIN` - command.html monterer de andre sidene som samme-origin iframes),
+ * (c) `nosniff`/`no-referrer`, og (d) eier-identiteten injisert fra validert konfig i stedet for hardkodet i HTML.
+ */
+const OWNER_META_PLACEHOLDER = "<!--JARVIS_OWNER_META-->";
+
+function escapeAttribute(value: string): string {
+  return value.replace(/&/g, "&amp;").replace(/"/g, "&quot;").replace(/'/g, "&#39;").replace(/</g, "&lt;").replace(/>/g, "&gt;");
+}
+
+export function renderStaticPage(html: string, nonce: string, owner?: { tenant_id: string; person_id: string }): string {
+  const meta = owner
+    ? `<meta name="jarvis-owner" content="${escapeAttribute(JSON.stringify({ tenant_id: owner.tenant_id, person_id: owner.person_id }))}">`
+    : "";
+  return html
+    .replace(OWNER_META_PLACEHOLDER, meta)
+    .replace(/<script>/g, `<script nonce="${nonce}">`)
+    .replace(/<style>/g, `<style nonce="${nonce}">`);
+}
+
+export function staticPageHeaders(nonce: string): Record<string, string> {
+  return {
+    "content-type": "text/html; charset=utf-8",
+    "cache-control": "no-cache",
+    "content-security-policy": [
+      "default-src 'none'",
+      `script-src 'nonce-${nonce}'`,
+      `style-src 'nonce-${nonce}'`,
+      // D-366: sidene setter `style="..."`-attributter (statisk og via innerHTML i dashbordet/stemmesiden). Kun ATTRIBUTTER tillates inline;
+      // `<style>`-elementer krever fortsatt nonce, og script-src har ingen unsafe-inline. Ingen ekstern innlasting er mulig
+      // (default-src 'none', img/font/connect låst), så CSS-injeksjon kan ikke eksfiltrere data.
+      "style-src-attr 'unsafe-inline'",
+      "img-src 'self' data: blob:",
+      "media-src 'self' blob:",
+      // Tale-gatewayen er en egen prosess på samme vert (port 3020) - ws(s) mot samme vert, aldri vilkårlige mål.
+      "connect-src 'self' ws://*:3020 wss://*:3020",
+      "frame-src 'self'",
+      "frame-ancestors 'self'",
+      "base-uri 'none'",
+      "form-action 'self'",
+      "object-src 'none'"
+    ].join("; "),
+    "x-frame-options": "SAMEORIGIN",
+    "x-content-type-options": "nosniff",
+    "referrer-policy": "no-referrer",
+    "permissions-policy": "microphone=(self), camera=(), geolocation=()"
+  };
+}
+
+async function sendStaticPage(res: ServerResponse, file: string, deps: ApiDeps | undefined, needsOwner: boolean): Promise<void> {
+  if (needsOwner && !deps?.owner) {
+    return json(res, 503, { error: "owner_not_configured", request_id: requestIdOf(res) });
+  }
+  const html = await readFile(file, "utf8");
+  const nonce = randomBytes(16).toString("base64");
+  res.writeHead(200, staticPageHeaders(nonce));
+  res.end(renderStaticPage(html, nonce, deps?.owner));
 }
 
 async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps): Promise<void> {
@@ -412,34 +696,22 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
   }
 
   if (req.method === "GET" && url.pathname === "/") {
-    const html = await readFile(WEB_COMMAND, "utf8");
-    // D-249: uten no-cache kan en mobilnettleser fortsette å servere en
-    // gammel, allerede-fikset versjon av siden fra sin lokale cache selv
-    // etter en fersk `docker compose up --build` - forvirrende og vanskelig
-    // å skille fra at selve fiksen ikke virket.
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
-    res.end(html);
+    await sendStaticPage(res, WEB_COMMAND, deps, false);
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/chat") {
-    const html = await readFile(WEB_INDEX, "utf8");
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
-    res.end(html);
+    await sendStaticPage(res, WEB_INDEX, deps, true);
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/dashboard") {
-    const html = await readFile(WEB_DASHBOARD, "utf8");
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
-    res.end(html);
+    await sendStaticPage(res, WEB_DASHBOARD, deps, true);
     return;
   }
 
   if (req.method === "GET" && url.pathname === "/voice") {
-    const html = await readFile(WEB_VOICE, "utf8");
-    res.writeHead(200, { "content-type": "text/html; charset=utf-8", "cache-control": "no-cache" });
-    res.end(html);
+    await sendStaticPage(res, WEB_VOICE, deps, true);
     return;
   }
 
@@ -450,7 +722,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
   ];
   if (!deps) {
     if (depRoutes.includes(url.pathname)) {
-      return json(res, 503, { error: "not_configured", message: "API kjører uten database-avhengigheter" });
+      return json(res, 503, { error: "not_configured", request_id: requestIdOf(res) });
     }
     return json(res, 404, { error: "not_found" });
   }
@@ -474,12 +746,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // `sessions.last_channel` og i audit-radene - en usann kildemerking
     // (CLAUDE.md regel 4). Valideringen hører hjemme i autoriteten slik at det
     // finnes ÉN valideringssannhet uansett hvilken transport som kaller.
-    let raw: unknown;
-    try {
-      raw = await readBody(req);
-    } catch {
-      raw = undefined;
-    }
+    const raw: unknown = await readBodyOrUndefined(req);
     const obj = typeof raw === "object" && raw !== null && !Array.isArray(raw) ? (raw as Record<string, unknown>) : {};
     const { channel, ...evidence } = obj;
     const result = await deps.channelAuthority.authorize(channel, evidence);
@@ -498,17 +765,19 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
   }
 
   if (req.method === "POST" && url.pathname === "/chat") {
-    const parsedBody = parseGrantBody(await readBody(req), CHAT_BODY_KEYS);
-    if (!parsedBody || typeof parsedBody["message"] !== "string") {
-      return json(res, 400, { error: "malformed_request", reason: "grant_malformed" });
+    const parsedBody = grantBodyOrReject(res, await readBody(req), CHAT_BODY_KEYS);
+    if (!parsedBody) return;
+    if (typeof parsedBody["message"] !== "string") {
+      return json(res, 400, { error: "malformed_request", reason: "grant_malformed", request_id: requestIdOf(res) });
     }
     const body: ChatBody = {
       grant_token: parsedBody["grant_token"] as string,
       message: parsedBody["message"],
       ...(typeof parsedBody["provider"] === "string" ? { provider: parsedBody["provider"] } : {})
     };
-    const resolved = await resolveFromGrant(deps, body.grant_token);
+    const resolved = await resolveFromGrant(deps, body.grant_token, res);
     if (!resolved.ok) {
+      if (resolved.responded) return;
       return json(res, 403, { error: "identity_denied", reason: resolved.reason });
     }
     const sessionId = resolved.identity.session_id;
@@ -580,13 +849,12 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
   if (deps.brief && req.method === "POST" && url.pathname === "/brief") {
     // D-131 funn 1: identisk autoritetsmodell som `/chat` over - `/brief` var
     // den ANDRE ruten som oppgraderte en rå sesjons-ID til `signed`.
-    const parsedBody = parseGrantBody(await readBody(req), BRIEF_BODY_KEYS);
-    if (!parsedBody) {
-      return json(res, 400, { error: "malformed_request", reason: "grant_malformed" });
-    }
+    const parsedBody = grantBodyOrReject(res, await readBody(req), BRIEF_BODY_KEYS);
+    if (!parsedBody) return;
     const body: BriefBody = { grant_token: parsedBody["grant_token"] as string };
-    const resolved = await resolveFromGrant(deps, body.grant_token);
+    const resolved = await resolveFromGrant(deps, body.grant_token, res);
     if (!resolved.ok) {
+      if (resolved.responded) return;
       return json(res, 403, { error: "identity_denied", reason: resolved.reason });
     }
     const artifact = await deps.brief.generate(resolved.identity);
@@ -604,15 +872,11 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // for en åpenbart ugyldig forespørsel), men et ugyldig grant avslås
     // UANSETT FØR selve `toolGateway.execute()`-kallet - identisk rekkefølge
     // som `/chat`.
-    let raw: unknown;
-    try {
-      raw = await readBody(req);
-    } catch {
-      raw = undefined;
-    }
-    const parsedBody = parseGrantBody(raw, EXECUTIVE_QUERY_BODY_KEYS);
-    if (!parsedBody || typeof parsedBody["action"] !== "string") {
-      return json(res, 400, { error: "malformed_request", reason: "grant_malformed" });
+    const raw: unknown = await readBodyOrUndefined(req);
+    const parsedBody = grantBodyOrReject(res, raw, EXECUTIVE_QUERY_BODY_KEYS);
+    if (!parsedBody) return;
+    if (typeof parsedBody["action"] !== "string") {
+      return json(res, 400, { error: "malformed_request", reason: "grant_malformed", request_id: requestIdOf(res) });
     }
     const action = parsedBody["action"];
     if (!(EXECUTIVE_QUERY_ACTIONS as readonly string[]).includes(action)) {
@@ -622,8 +886,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       typeof parsedBody["parameters"] === "object" && parsedBody["parameters"] !== null && !Array.isArray(parsedBody["parameters"])
         ? (parsedBody["parameters"] as Record<string, JsonValue>)
         : {};
-    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string);
+    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string, res);
     if (!resolved.ok) {
+      if (resolved.responded) return;
       return json(res, 403, { error: "identity_denied", reason: resolved.reason });
     }
     const result = await deps.executive.gateway.execute({
@@ -640,15 +905,11 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // SAMME rekkefølge/avslagsform som /executive/query (avvis ugyldig
     // action FØR grantet løses, avvis et ugyldig/utløpt grant FØR
     // gateway.execute() nås).
-    let raw: unknown;
-    try {
-      raw = await readBody(req);
-    } catch {
-      raw = undefined;
-    }
-    const parsedBody = parseGrantBody(raw, EXECUTIVE_QUERY_BODY_KEYS);
-    if (!parsedBody || typeof parsedBody["action"] !== "string") {
-      return json(res, 400, { error: "malformed_request", reason: "grant_malformed" });
+    const raw: unknown = await readBodyOrUndefined(req);
+    const parsedBody = grantBodyOrReject(res, raw, EXECUTIVE_QUERY_BODY_KEYS);
+    if (!parsedBody) return;
+    if (typeof parsedBody["action"] !== "string") {
+      return json(res, 400, { error: "malformed_request", reason: "grant_malformed", request_id: requestIdOf(res) });
     }
     const action = parsedBody["action"];
     if (!(OWNER_CONTROLS_CONNECTOR_ACTIONS as readonly string[]).includes(action)) {
@@ -658,8 +919,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       typeof parsedBody["parameters"] === "object" && parsedBody["parameters"] !== null && !Array.isArray(parsedBody["parameters"])
         ? (parsedBody["parameters"] as Record<string, JsonValue>)
         : {};
-    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string);
+    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string, res);
     if (!resolved.ok) {
+      if (resolved.responded) return;
       return json(res, 403, { error: "identity_denied", reason: resolved.reason });
     }
     const result = await deps.executive.gateway.execute({
@@ -678,15 +940,11 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // nås). `tool_id: "executive"` (ALDRI "owner_controls"/"situations"/
     // "finance" direkte) - executive-laget videresender selv, nøstet, med
     // UENDRET identitet (§2 i design-notatet).
-    let raw: unknown;
-    try {
-      raw = await readBody(req);
-    } catch {
-      raw = undefined;
-    }
-    const parsedBody = parseGrantBody(raw, EXECUTIVE_QUERY_BODY_KEYS);
-    if (!parsedBody || typeof parsedBody["action"] !== "string") {
-      return json(res, 400, { error: "malformed_request", reason: "grant_malformed" });
+    const raw: unknown = await readBodyOrUndefined(req);
+    const parsedBody = grantBodyOrReject(res, raw, EXECUTIVE_QUERY_BODY_KEYS);
+    if (!parsedBody) return;
+    if (typeof parsedBody["action"] !== "string") {
+      return json(res, 400, { error: "malformed_request", reason: "grant_malformed", request_id: requestIdOf(res) });
     }
     const action = parsedBody["action"];
     if (!(EXECUTIVE_MUTATE_ACTIONS as readonly string[]).includes(action)) {
@@ -696,8 +954,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       typeof parsedBody["parameters"] === "object" && parsedBody["parameters"] !== null && !Array.isArray(parsedBody["parameters"])
         ? (parsedBody["parameters"] as Record<string, JsonValue>)
         : {};
-    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string);
+    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string, res);
     if (!resolved.ok) {
+      if (resolved.responded) return;
       return json(res, 403, { error: "identity_denied", reason: resolved.reason });
     }
     const result = await deps.executive.gateway.execute({
@@ -716,15 +975,11 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // `toolGateway`-instansen `deps.executive.gateway` allerede peker på
     // (`governanceToolDefinitions()` registrert i main.ts), INGEN ny
     // ApiDeps-nøkkel.
-    let raw: unknown;
-    try {
-      raw = await readBody(req);
-    } catch {
-      raw = undefined;
-    }
-    const parsedBody = parseGrantBody(raw, EXECUTIVE_QUERY_BODY_KEYS);
-    if (!parsedBody || typeof parsedBody["action"] !== "string") {
-      return json(res, 400, { error: "malformed_request", reason: "grant_malformed" });
+    const raw: unknown = await readBodyOrUndefined(req);
+    const parsedBody = grantBodyOrReject(res, raw, EXECUTIVE_QUERY_BODY_KEYS);
+    if (!parsedBody) return;
+    if (typeof parsedBody["action"] !== "string") {
+      return json(res, 400, { error: "malformed_request", reason: "grant_malformed", request_id: requestIdOf(res) });
     }
     const action = parsedBody["action"];
     if (!(GOVERNANCE_QUERY_ACTIONS as readonly string[]).includes(action)) {
@@ -734,8 +989,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       typeof parsedBody["parameters"] === "object" && parsedBody["parameters"] !== null && !Array.isArray(parsedBody["parameters"])
         ? (parsedBody["parameters"] as Record<string, JsonValue>)
         : {};
-    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string);
+    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string, res);
     if (!resolved.ok) {
+      if (resolved.responded) return;
       return json(res, 403, { error: "identity_denied", reason: resolved.reason });
     }
     const result = await deps.executive.gateway.execute({
@@ -753,15 +1009,11 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // lese-only-rute til å skrive"-disiplin D-211/D-213/D-199 allerede
     // fulgte). ALLE ti handlingene er klasse A/B - INGEN klasse C/D-
     // preflight-krav her, i motsetning til /executive/mutate.
-    let raw: unknown;
-    try {
-      raw = await readBody(req);
-    } catch {
-      raw = undefined;
-    }
-    const parsedBody = parseGrantBody(raw, EXECUTIVE_QUERY_BODY_KEYS);
-    if (!parsedBody || typeof parsedBody["action"] !== "string") {
-      return json(res, 400, { error: "malformed_request", reason: "grant_malformed" });
+    const raw: unknown = await readBodyOrUndefined(req);
+    const parsedBody = grantBodyOrReject(res, raw, EXECUTIVE_QUERY_BODY_KEYS);
+    if (!parsedBody) return;
+    if (typeof parsedBody["action"] !== "string") {
+      return json(res, 400, { error: "malformed_request", reason: "grant_malformed", request_id: requestIdOf(res) });
     }
     const action = parsedBody["action"];
     if (!(GOVERNANCE_MUTATE_ACTIONS as readonly string[]).includes(action)) {
@@ -771,8 +1023,9 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       typeof parsedBody["parameters"] === "object" && parsedBody["parameters"] !== null && !Array.isArray(parsedBody["parameters"])
         ? (parsedBody["parameters"] as Record<string, JsonValue>)
         : {};
-    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string);
+    const resolved = await resolveFromGrant(deps, parsedBody["grant_token"] as string, res);
     if (!resolved.ok) {
+      if (resolved.responded) return;
       return json(res, 403, { error: "identity_denied", reason: resolved.reason });
     }
     const result = await deps.executive.gateway.execute({
@@ -796,12 +1049,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     //
     // Ugyldig JSON fanges og sendes inn som `undefined` → deterministisk
     // `malformed_request`, aldri en 500 en klient kan skille fra et avslag.
-    let raw: unknown;
-    try {
-      raw = await readBody(req);
-    } catch {
-      raw = undefined;
-    }
+    const raw: unknown = await readBodyOrUndefined(req);
     const result = await deps.enrollment.enroll(raw);
     if (!result.ok) {
       // 400 for en syntaktisk ugyldig kropp, 403 for et ekte
@@ -818,17 +1066,32 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
   }
 
   if (deps.devices && req.method === "POST" && url.pathname === "/devices/challenge") {
-    const body = (await readBody(req)) as { device_id: string };
-    return json(res, 200, { challenge: deps.devices.issueChallenge(body.device_id) });
-  }
-
-  if (deps.devices && req.method === "POST" && url.pathname === "/devices/challenge/verify") {
-    const body = (await readBody(req)) as {
-      tenant_id: string; device_id: string; challenge: string; signature: string;
-    };
-    const fingerprint = await deps.devices.verifyChallenge(body.tenant_id, body.device_id, body.challenge, body.signature);
-    const ok = fingerprint !== null;
-    return json(res, ok ? 200 : 403, { verified: ok, auth_strength: ok ? "signed" : "passive" });
+    // Engangs-nonce for enhetsbeviset (utstedes KUN her; forbrukes av
+    // `/session/authorize`, `/voice/session/authorize` og `/devices/register`).
+    // JARVIS-063: kroppen valideres, og `DeviceService` begrenser antall
+    // utestående nonces (globalt og per enhet) - ruten kan ikke fylle minnet.
+    //
+    // JARVIS-051 (remediering del 2): den gamle `/devices/challenge/verify`-
+    // ruten er FJERNET. Den returnerte `auth_strength: "signed"` uten
+    // sesjon/grant og var en ALTERNATIV identitetsvei ved siden av
+    // `/session/authorize` (som er den eneste veien til et grant).
+    const body = await readBody(req);
+    const deviceId = typeof body === "object" && body !== null && !Array.isArray(body)
+      ? (body as Record<string, unknown>)["device_id"] : undefined;
+    if (typeof body !== "object" || body === null || Array.isArray(body)
+      || Object.keys(body).some((key) => key !== "device_id")
+      || typeof deviceId !== "string" || !/^[A-Za-z0-9][A-Za-z0-9._:-]{0,127}$/.test(deviceId)) {
+      // JARVIS-063: enhets-id har et lukket tegnsett (ingen stier/mellomrom/kontrolltegn) og maks 128 tegn.
+      return json(res, 400, { error: "malformed_request", request_id: requestIdOf(res) });
+    }
+    try {
+      return json(res, 200, { challenge: deps.devices.issueChallenge(deviceId) });
+    } catch (err) {
+      if (err instanceof ChallengeLimitError) {
+        return json(res, 429, { error: "rate_limited", request_id: requestIdOf(res) });
+      }
+      throw err;
+    }
   }
 
   if (deps.voiceAuthority && req.method === "POST" && url.pathname === "/voice/session/authorize") {
@@ -844,12 +1107,7 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // sendes inn som `undefined`, slik at ALLE former for ugyldig input gir
     // det samme fail-closed `403 malformed_evidence` - aldri en `500` som en
     // klient kan bruke til å skille «parseren knakk» fra «beviset holdt ikke».
-    let body: unknown;
-    try {
-      body = await readBody(req);
-    } catch {
-      body = undefined;
-    }
+    const body: unknown = await readBodyOrUndefined(req);
     const result = await deps.voiceAuthority.authorize(body);
     return json(res, result.ok ? 200 : 403, result);
   }
@@ -859,18 +1117,18 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     // (inkl. `agent_profile: "coding"`) - gjenbruker `TaskService.submit()`
     // UENDRET: kontraktvalidering (Zod), tenant-match, untrusted-privat-
     // minne-og-nettverk-invarianten, klasse B policy-autorisasjon og audit
-    // skjer ALT i den eksisterende metoden. INGEN ny autorisasjonsmekanisme.
-    const body = (await readBody(req)) as {
-      identity: Parameters<IdentityService["resolveIdentity"]>[0] & { session_id: string };
-      contract: unknown;
-    };
-    const resolved = await deps.identity.resolveIdentity(body.identity);
-    if (!resolved.ok) {
-      return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+    // skjer ALT i den eksisterende metoden.
+    //
+    // JARVIS-001 (remediering del 2): identiteten kommer UTELUKKENDE fra det
+    // verifiserte grantet (`authedRequest`) - kroppen er `{ grant_token, contract }`.
+    const authed = await authedRequest(req, res, deps, ["contract"]);
+    if (!authed) return;
+    if (!("contract" in authed.body)) {
+      return json(res, 400, { error: "malformed_request", reason: "contract", request_id: requestIdOf(res) });
     }
-    const result = await deps.tasks.submit(resolved.identity, body.contract);
+    const result = await deps.tasks.submit(authed.identity, authed.body["contract"]);
     if (!result.ok) {
-      return json(res, 400, { error: "task_rejected", reason: result.reason });
+      return json(res, 400, { error: "task_rejected", reason: result.reason, request_id: requestIdOf(res) });
     }
     return json(res, 200, { task_id: result.value.task_id });
   }
@@ -894,10 +1152,10 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       return json(res, status, { received: true, status: result.status, event_id: result.eventId });
     } catch (err) {
       if (err instanceof InvalidWebhookSignatureError) {
-        return json(res, 400, { error: "invalid_signature", message: err.message });
+        return json(res, 400, { error: "invalid_signature", request_id: requestIdOf(res) });
       }
       if (err instanceof StripeCredentialsUnavailableError || err instanceof StripeTenantNotConfiguredError) {
-        return json(res, 503, { error: "not_configured", message: err.message });
+        return json(res, 503, { error: "not_configured", request_id: requestIdOf(res) });
       }
       throw err;
     }
@@ -929,10 +1187,10 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       return json(res, status, { received: true, status: result.status, event_id: result.eventId });
     } catch (err) {
       if (err instanceof InvalidWebhookSignatureError) {
-        return json(res, 401, { error: "invalid_signature", message: err.message });
+        return json(res, 401, { error: "invalid_signature", request_id: requestIdOf(res) });
       }
       if (err instanceof VippsCredentialsUnavailableError || err instanceof VippsTenantNotConfiguredError) {
-        return json(res, 503, { error: "not_configured", message: err.message });
+        return json(res, 503, { error: "not_configured", request_id: requestIdOf(res) });
       }
       throw err;
     }
@@ -957,10 +1215,10 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       return json(res, status, { received: true, status: result.status, event_id: result.eventId });
     } catch (err) {
       if (err instanceof InvalidWebhookSignatureError) {
-        return json(res, 401, { error: "invalid_api_key", message: err.message });
+        return json(res, 401, { error: "invalid_api_key", request_id: requestIdOf(res) });
       }
       if (err instanceof NeonomicsCredentialsUnavailableError || err instanceof NeonomicsTenantNotConfiguredError) {
-        return json(res, 503, { error: "not_configured", message: err.message });
+        return json(res, 503, { error: "not_configured", request_id: requestIdOf(res) });
       }
       throw err;
     }
@@ -993,10 +1251,10 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
       return json(res, status, { received: true, status: result.status, event_id: result.eventId }, echoHeaders);
     } catch (err) {
       if (err instanceof InvalidWebhookSignatureError) {
-        return json(res, 401, { error: "invalid_basic_auth", message: err.message }, echoHeaders);
+        return json(res, 401, { error: "invalid_basic_auth", request_id: requestIdOf(res) }, echoHeaders);
       }
       if (err instanceof WallesterCredentialsUnavailableError || err instanceof WallesterTenantNotConfiguredError) {
-        return json(res, 503, { error: "not_configured", message: err.message }, echoHeaders);
+        return json(res, 503, { error: "not_configured", request_id: requestIdOf(res) }, echoHeaders);
       }
       throw err;
     }
@@ -1011,24 +1269,19 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
   if (deps.enableDevRoutes === true && req.method === "POST" && url.pathname === "/tools/critical-demo") {
     // Klasse D-stub (fase 3-avgrensning): beviser at kritiske verktøy
     // blokkeres uten gyldig signert godkjenning i den KJØRENDE appen.
-    const body = (await readBody(req)) as {
-      identity: Parameters<IdentityService["resolveIdentity"]>[0] & { session_id: string };
-      parameters: Record<string, never>;
-      approval?: unknown;
-    };
-    const resolved = await deps.identity.resolveIdentity(body.identity);
-    if (!resolved.ok) {
-      return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-    }
+    // KUN bak `enableDevRoutes` (aldri i produksjon). Remediering del 2: ruten
+    // tar IKKE lenger en identitet i kroppen - også dev-ruten bruker grantet.
+    const authed = await authedRequest(req, res, deps, ["parameters", "approval"]);
+    if (!authed) return;
     const decision = await deps.policy.authorize({
-      identity: resolved.identity,
+      identity: authed.identity,
       toolCall: {
         tool_id: "demo",
         action: "critical_demo",
         capability_class: "D",
-        parameters: body.parameters ?? {}
+        parameters: (authed.body["parameters"] as Record<string, never> | undefined) ?? {}
       },
-      ...(body.approval !== undefined ? { approval: body.approval } : {})
+      ...(authed.body["approval"] !== undefined ? { approval: authed.body["approval"] } : {})
     });
     if (decision.decision !== "ALLOW") {
       return json(res, 403, { decision: decision.decision, reason: decision.reason });
@@ -1039,92 +1292,90 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
   if (deps.incidents) {
     const { service, deployments, gateway, controls, infraGate, pool } = deps.incidents;
 
+    // JARVIS-001 (remediering del 2): ALLE ruter under /incidents, /deployments,
+    // /infra og /observability bruker `authedRequest()` - identitet/tenant/
+    // memory space kommer fra det verifiserte grantet, aldri fra kroppen.
+    // `memory_space` er derfor IKKE lenger et kroppsfelt: det er grantets scope.
+
     if (req.method === "POST" && url.pathname === "/incidents/create") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0];
-        memory_space: MemorySpace; title: string; severity?: "low" | "normal" | "high" | "critical"; owner_person_id?: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const incident = await service.createIncident(resolved.identity.tenant_id, body.memory_space, {
-        title: body.title, ...(body.severity !== undefined ? { severity: body.severity } : {}),
-        ...(body.owner_person_id !== undefined ? { owner_person_id: body.owner_person_id } : {})
+      const authed = await authedRequest(req, res, deps, ["title", "severity"]);
+      if (!authed) return;
+      const severity = fieldOptionalString(authed.body, "severity") as "low" | "normal" | "high" | "critical" | undefined;
+      const incident = await service.createIncident(authed.identity.tenant_id, authed.identity.memory_space_id, {
+        title: fieldString(authed.body, "title"), ...(severity !== undefined ? { severity } : {}),
+        owner_person_id: authed.identity.person_id
       });
       return json(res, 200, { incident });
     }
 
     if (req.method === "POST" && url.pathname === "/incidents/get") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; memory_space: MemorySpace; incident_id: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const incident = await service.getIncident(resolved.identity.tenant_id, body.memory_space, body.incident_id);
-      if (!incident) return json(res, 404, { error: "incident_not_found" });
-      const evidence = await service.listEvidence(resolved.identity.tenant_id, body.memory_space, body.incident_id);
+      const authed = await authedRequest(req, res, deps, ["incident_id"]);
+      if (!authed) return;
+      const incidentId = fieldString(authed.body, "incident_id");
+      const incident = await service.getIncident(authed.identity.tenant_id, authed.identity.memory_space_id, incidentId);
+      if (!incident) return json(res, 404, { error: "incident_not_found", request_id: requestIdOf(res) });
+      const evidence = await service.listEvidence(authed.identity.tenant_id, authed.identity.memory_space_id, incidentId);
       return json(res, 200, { incident, evidence });
     }
 
     if (req.method === "POST" && url.pathname === "/incidents/list") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; memory_space: MemorySpace;
-        status?: "open" | "diagnosing" | "repair_proposed" | "repair_in_progress" | "resolved" | "wont_fix" | "all";
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const incidents = await service.listIncidents(resolved.identity.tenant_id, body.memory_space, body.status ?? "open");
+      const authed = await authedRequest(req, res, deps, ["status"]);
+      if (!authed) return;
+      const status = (fieldOptionalString(authed.body, "status") ?? "open") as
+        "open" | "diagnosing" | "repair_proposed" | "repair_in_progress" | "resolved" | "wont_fix" | "all";
+      const incidents = await service.listIncidents(authed.identity.tenant_id, authed.identity.memory_space_id, status);
       return json(res, 200, { incidents });
     }
 
     if (req.method === "POST" && url.pathname === "/incidents/evidence/add") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; memory_space: MemorySpace; incident_id: string;
-        source_type: string; status?: string; source_ref?: string; summary: string; observed_at: string; contradicts_evidence_id?: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+      const authed = await authedRequest(req, res, deps, [
+        "incident_id", "source_type", "status", "source_ref", "summary", "observed_at", "contradicts_evidence_id"
+      ]);
+      if (!authed) return;
+      const status = fieldOptionalString(authed.body, "status");
+      const sourceRef = fieldOptionalString(authed.body, "source_ref");
+      const contradicts = fieldOptionalString(authed.body, "contradicts_evidence_id");
       try {
-        const evidence = await service.addEvidence(resolved.identity.tenant_id, body.memory_space, body.incident_id, {
-          source_type: body.source_type as never, ...(body.status !== undefined ? { status: body.status as never } : {}),
-          ...(body.source_ref !== undefined ? { source_ref: body.source_ref } : {}), summary: body.summary, observed_at: body.observed_at,
-          ...(body.contradicts_evidence_id !== undefined ? { contradicts_evidence_id: body.contradicts_evidence_id } : {})
-        });
+        const evidence = await service.addEvidence(
+          authed.identity.tenant_id, authed.identity.memory_space_id, fieldString(authed.body, "incident_id"), {
+            source_type: fieldString(authed.body, "source_type") as never, ...(status !== undefined ? { status: status as never } : {}),
+            ...(sourceRef !== undefined ? { source_ref: sourceRef } : {}), summary: fieldString(authed.body, "summary"),
+            observed_at: fieldString(authed.body, "observed_at"),
+            ...(contradicts !== undefined ? { contradicts_evidence_id: contradicts } : {})
+          }
+        );
         return json(res, 200, { evidence });
       } catch (err) {
-        return json(res, 400, { error: "evidence_rejected", message: (err as Error).message });
+        if (err instanceof HttpError) throw err;
+        return domainFailure(res, 400, "evidence_rejected", err);
       }
     }
 
     if (req.method === "POST" && url.pathname === "/incidents/correlate") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; memory_space: MemorySpace; incident_id: string; repo: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+      const authed = await authedRequest(req, res, deps, ["incident_id", "repo"]);
+      if (!authed) return;
       try {
-        const correlation = await correlateIncident(service, deployments, resolved.identity.tenant_id, body.memory_space, body.incident_id, body.repo);
+        const correlation = await correlateIncident(
+          service, deployments, authed.identity.tenant_id, authed.identity.memory_space_id,
+          fieldString(authed.body, "incident_id"), fieldString(authed.body, "repo")
+        );
         return json(res, 200, { correlation });
       } catch (err) {
-        return json(res, 404, { error: "correlation_failed", message: (err as Error).message });
+        if (err instanceof HttpError) throw err;
+        return domainFailure(res, 404, "correlation_failed", err);
       }
     }
 
     if (req.method === "POST" && url.pathname === "/deployments/ingest/github") {
       // D-105 (UA-5 kriterium 1 host-fix): den EKSISTERENDE `DeploymentService.
-      // recordDeployment()` sin FØRSTE produksjons-callsite - lukker gapet
-      // closeout-audit fant ("ingen produksjons-callsite, kun testtreff").
-      // Kaller UTELUKKENDE `ingestGithubDeployment()`, som selv går via
-      // `ToolGateway`/`github.get_workflow_run` - INGEN egen HTTP/Octokit-
-      // klient her, INGEN rå credential i request-body (samme "identity inn,
-      // credential hentes internt via SecretProvider"-mønster som ENHVER
-      // annen rute i denne filen).
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; repo: string; workflow_run_id: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const outcome = await ingestGithubDeployment({ gateway, deployments }, resolved.identity, {
-        repo: body.repo, workflow_run_id: body.workflow_run_id
+      // recordDeployment()` sin FØRSTE produksjons-callsite. Kaller UTELUKKENDE
+      // `ingestGithubDeployment()`, som selv går via `ToolGateway`/
+      // `github.get_workflow_run` - INGEN egen HTTP/Octokit-klient her, INGEN
+      // rå credential i request-body.
+      const authed = await authedRequest(req, res, deps, ["repo", "workflow_run_id"]);
+      if (!authed) return;
+      const outcome = await ingestGithubDeployment({ gateway, deployments }, authed.identity, {
+        repo: fieldString(authed.body, "repo"), workflow_run_id: fieldString(authed.body, "workflow_run_id")
       });
       if (outcome.status === "provider_unavailable") return json(res, 502, { error: "provider_unavailable", reason: outcome.reason });
       if (outcome.status === "invalid_provider_response") return json(res, 422, { error: "invalid_provider_response", reason: outcome.reason });
@@ -1132,165 +1383,173 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     }
 
     if (req.method === "POST" && url.pathname === "/incidents/correlate/db") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; window_start: string; window_end: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const db_state = await correlateDbState(pool, resolved.identity.tenant_id, body.window_start, body.window_end);
+      const authed = await authedRequest(req, res, deps, ["window_start", "window_end"]);
+      if (!authed) return;
+      const db_state = await correlateDbState(
+        pool, authed.identity.tenant_id, fieldString(authed.body, "window_start"), fieldString(authed.body, "window_end")
+      );
       return json(res, 200, { db_state });
     }
 
     if (req.method === "POST" && url.pathname === "/incidents/evidence/acquire_logs") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; memory_space: MemorySpace; incident_id: string;
-        container: string; since?: string; until?: string; tail?: number;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const outcome = await acquireContainerLogs({ gateway, incidents: service }, resolved.identity, body.memory_space, body.incident_id, {
-        container: body.container, ...(body.since !== undefined ? { since: body.since } : {}),
-        ...(body.until !== undefined ? { until: body.until } : {}), ...(body.tail !== undefined ? { tail: body.tail } : {})
-      });
+      const authed = await authedRequest(req, res, deps, ["incident_id", "container", "since", "until", "tail"]);
+      if (!authed) return;
+      const since = fieldOptionalString(authed.body, "since");
+      const until = fieldOptionalString(authed.body, "until");
+      const tail = fieldOptionalNumber(authed.body, "tail");
+      const outcome = await acquireContainerLogs(
+        { gateway, incidents: service }, authed.identity, authed.identity.memory_space_id,
+        fieldString(authed.body, "incident_id"), {
+          container: fieldString(authed.body, "container"), ...(since !== undefined ? { since } : {}),
+          ...(until !== undefined ? { until } : {}), ...(tail !== undefined ? { tail } : {})
+        }
+      );
       if (outcome.status === "unavailable") return json(res, 502, { error: "acquisition_unavailable", reason: outcome.reason });
       return json(res, 200, { evidence: outcome.evidence });
     }
 
     if (deps.incidents.diagnosis && req.method === "POST" && url.pathname === "/incidents/diagnosis/create") {
       const diagnosisService = deps.incidents.diagnosis;
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; memory_space: MemorySpace; incident_id: string;
-        conclusion: string; status?: string; source: string; supersedes_diagnosis_id?: string;
-        supporting_evidence_ids?: string[]; contradicting_evidence_ids?: string[];
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+      const authed = await authedRequest(req, res, deps, [
+        "incident_id", "conclusion", "status", "source", "supersedes_diagnosis_id",
+        "supporting_evidence_ids", "contradicting_evidence_ids"
+      ]);
+      if (!authed) return;
+      const status = fieldOptionalString(authed.body, "status");
+      const supersedes = fieldOptionalString(authed.body, "supersedes_diagnosis_id");
+      const supporting = fieldOptionalStringArray(authed.body, "supporting_evidence_ids");
+      const contradicting = fieldOptionalStringArray(authed.body, "contradicting_evidence_ids");
       try {
-        const diagnosis = await diagnosisService.createDiagnosis(resolved.identity.tenant_id, body.memory_space, body.incident_id, {
-          conclusion: body.conclusion, source: body.source as never, ...(body.status !== undefined ? { status: body.status as never } : {}),
-          ...(body.supersedes_diagnosis_id !== undefined ? { supersedes_diagnosis_id: body.supersedes_diagnosis_id } : {}),
-          ...(body.supporting_evidence_ids !== undefined ? { supporting_evidence_ids: body.supporting_evidence_ids } : {}),
-          ...(body.contradicting_evidence_ids !== undefined ? { contradicting_evidence_ids: body.contradicting_evidence_ids } : {})
-        });
+        const diagnosis = await diagnosisService.createDiagnosis(
+          authed.identity.tenant_id, authed.identity.memory_space_id, fieldString(authed.body, "incident_id"), {
+            conclusion: fieldString(authed.body, "conclusion"), source: fieldString(authed.body, "source") as never,
+            ...(status !== undefined ? { status: status as never } : {}),
+            ...(supersedes !== undefined ? { supersedes_diagnosis_id: supersedes } : {}),
+            ...(supporting !== undefined ? { supporting_evidence_ids: supporting } : {}),
+            ...(contradicting !== undefined ? { contradicting_evidence_ids: contradicting } : {})
+          }
+        );
         return json(res, 200, { diagnosis });
       } catch (err) {
-        return json(res, 400, { error: "diagnosis_rejected", message: (err as Error).message });
+        if (err instanceof HttpError) throw err;
+        return domainFailure(res, 400, "diagnosis_rejected", err);
       }
     }
 
     if (deps.incidents.diagnosis && req.method === "POST" && url.pathname === "/incidents/diagnosis/list") {
       const diagnosisService = deps.incidents.diagnosis;
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; memory_space: MemorySpace; incident_id: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const diagnoses = await diagnosisService.listDiagnoses(resolved.identity.tenant_id, body.memory_space, body.incident_id);
+      const authed = await authedRequest(req, res, deps, ["incident_id"]);
+      if (!authed) return;
+      const diagnoses = await diagnosisService.listDiagnoses(
+        authed.identity.tenant_id, authed.identity.memory_space_id, fieldString(authed.body, "incident_id")
+      );
       return json(res, 200, { diagnoses });
     }
 
     if (req.method === "POST" && url.pathname === "/infra/execution/mutate") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0];
-        target: string; action?: DockerMutationAction; target_image?: string; idempotency_key: string; incident_id?: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+      const authed = await authedRequest(req, res, deps, ["target", "action", "target_image", "idempotency_key", "incident_id"]);
+      if (!authed) return;
       // D-105 host-fix: `action` er valgfri - default `redeploy_container`
       // (bakoverkompatibelt med D105_INFRA_OPS_V2_HOST_ACCEPTANCE.md sine
       // eksisterende eksempler, som ikke sender `action`). Nye kall bruker
       // `stop_container`/`start_container` for produksjons-autorisert mutasjon.
-      const execution = await executeInfraMutation({ pool, gateway }, resolved.identity, {
-        tenant_id: resolved.identity.tenant_id, person_id: resolved.identity.person_id,
-        device_id: resolved.identity.device_id,
-        target: body.target, action: body.action ?? "redeploy_container", idempotency_key: body.idempotency_key,
-        ...(body.target_image !== undefined ? { target_image: body.target_image } : {}),
-        ...(body.incident_id !== undefined ? { incident_id: body.incident_id } : {})
+      const action = (fieldOptionalString(authed.body, "action") ?? "redeploy_container") as DockerMutationAction;
+      const targetImage = fieldOptionalString(authed.body, "target_image");
+      const incidentId = fieldOptionalString(authed.body, "incident_id");
+      const execution = await executeInfraMutation({ pool, gateway }, authed.identity, {
+        tenant_id: authed.identity.tenant_id, person_id: authed.identity.person_id,
+        device_id: authed.identity.device_id,
+        target: fieldString(authed.body, "target"), action, idempotency_key: fieldString(authed.body, "idempotency_key"),
+        ...(targetImage !== undefined ? { target_image: targetImage } : {}),
+        ...(incidentId !== undefined ? { incident_id: incidentId } : {})
       });
       return json(res, 200, { execution });
     }
 
     if (req.method === "POST" && url.pathname === "/infra/execution/get") {
-      const body = (await readBody(req)) as { identity: Parameters<IdentityService["resolveIdentity"]>[0]; execution_id: string };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const execution = await getInfraExecution(pool, resolved.identity.tenant_id, body.execution_id);
-      if (!execution) return json(res, 404, { error: "execution_not_found" });
+      const authed = await authedRequest(req, res, deps, ["execution_id"]);
+      if (!authed) return;
+      const execution = await getInfraExecution(pool, authed.identity.tenant_id, fieldString(authed.body, "execution_id"));
+      if (!execution) return json(res, 404, { error: "execution_not_found", request_id: requestIdOf(res) });
       return json(res, 200, { execution });
     }
 
     if (req.method === "POST" && url.pathname === "/observability/docker/status") {
-      const body = (await readBody(req)) as { identity: Parameters<IdentityService["resolveIdentity"]>[0] };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const status = await dockerProviderStatus(gateway, resolved.identity);
+      const authed = await authedRequest(req, res, deps, []);
+      if (!authed) return;
+      const status = await dockerProviderStatus(gateway, authed.identity);
       return json(res, 200, { status });
     }
 
     if (deps.tasks && req.method === "POST" && url.pathname === "/incidents/repair") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0] & { session_id: string };
-        memory_space: MemorySpace; incident_id: string; repo_url: string; goal: string;
-        test_command?: string[]; publish_pr?: boolean; model_budget_ore?: number;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
-      const incident = await service.getIncident(resolved.identity.tenant_id, body.memory_space, body.incident_id);
-      if (!incident) return json(res, 404, { error: "incident_not_found" });
+      const authed = await authedRequest(req, res, deps, [
+        "incident_id", "repo_url", "goal", "test_command", "publish_pr", "model_budget_ore"
+      ]);
+      if (!authed) return;
+      const incident = await service.getIncident(
+        authed.identity.tenant_id, authed.identity.memory_space_id, fieldString(authed.body, "incident_id")
+      );
+      if (!incident) return json(res, 404, { error: "incident_not_found", request_id: requestIdOf(res) });
+      const testCommand = fieldOptionalStringArray(authed.body, "test_command");
+      const publishPr = fieldOptionalBoolean(authed.body, "publish_pr");
+      const budget = fieldOptionalNumber(authed.body, "model_budget_ore");
       const result = await proposeRepairTask(
         { taskService: deps.tasks, pool, incidents: service },
-        resolved.identity, body.memory_space, incident,
+        authed.identity, authed.identity.memory_space_id, incident,
         {
-          repo_url: body.repo_url, goal: body.goal, ...(body.test_command !== undefined ? { test_command: body.test_command } : {}),
-          ...(body.publish_pr !== undefined ? { publishPr: body.publish_pr } : {}),
-          ...(body.model_budget_ore !== undefined ? { model_budget_ore: body.model_budget_ore } : {})
+          repo_url: fieldString(authed.body, "repo_url"), goal: fieldString(authed.body, "goal"),
+          ...(testCommand !== undefined ? { test_command: testCommand } : {}),
+          ...(publishPr !== undefined ? { publishPr } : {}),
+          ...(budget !== undefined ? { model_budget_ore: budget } : {})
         }
       );
-      if (!result.ok) return json(res, 400, { error: "repair_task_rejected", reason: result.reason });
+      if (!result.ok) return json(res, 400, { error: "repair_task_rejected", reason: result.reason, request_id: requestIdOf(res) });
       return json(res, 200, { task_id: result.task_id });
     }
 
     if (req.method === "POST" && url.pathname === "/infra/recovery/attempt") {
-      const body = (await readBody(req)) as {
-        identity: Parameters<IdentityService["resolveIdentity"]>[0]; tool_id: string; action: string;
-        idempotency_key: string; parameters: Record<string, never>; incident_id?: string; execution_id?: string;
-      };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+      const authed = await authedRequest(req, res, deps, [
+        "tool_id", "action", "idempotency_key", "parameters", "incident_id", "execution_id"
+      ]);
+      if (!authed) return;
+      const toolId = fieldString(authed.body, "tool_id");
+      const recoveryAction = fieldString(authed.body, "action");
       const decision = await deps.policy.authorize({
-        identity: resolved.identity,
-        toolCall: { tool_id: "infra", action: "attempt_recovery", capability_class: "B", parameters: { tool_id: body.tool_id, action: body.action } }
+        identity: authed.identity,
+        toolCall: { tool_id: "infra", action: "attempt_recovery", capability_class: "B", parameters: { tool_id: toolId, action: recoveryAction } }
       });
       if (decision.decision !== "ALLOW") return json(res, 403, { decision: decision.decision, reason: decision.reason });
-      const recovery = await attemptRecovery({ pool, gateway }, resolved.identity, {
-        tenant_id: resolved.identity.tenant_id, tool_id: body.tool_id, action: body.action,
-        idempotency_key: body.idempotency_key, parameters: body.parameters,
-        ...(body.incident_id !== undefined ? { incident_id: body.incident_id } : {}),
-        ...(body.execution_id !== undefined ? { execution_id: body.execution_id } : {})
+      const incidentId = fieldOptionalString(authed.body, "incident_id");
+      const executionId = fieldOptionalString(authed.body, "execution_id");
+      const recovery = await attemptRecovery({ pool, gateway }, authed.identity, {
+        tenant_id: authed.identity.tenant_id, tool_id: toolId, action: recoveryAction,
+        idempotency_key: fieldString(authed.body, "idempotency_key"),
+        parameters: (authed.body["parameters"] === undefined ? {} : fieldRecord(authed.body, "parameters")) as Record<string, never>,
+        ...(incidentId !== undefined ? { incident_id: incidentId } : {}),
+        ...(executionId !== undefined ? { execution_id: executionId } : {})
       });
       return json(res, 200, { recovery });
     }
 
     if (req.method === "POST" && (url.pathname === "/infra/pause" || url.pathname === "/infra/resume" || url.pathname === "/infra/degrade")) {
-      const body = (await readBody(req)) as { identity: Parameters<IdentityService["resolveIdentity"]>[0]; reason?: string };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+      const authed = await authedRequest(req, res, deps, ["reason"]);
+      if (!authed) return;
       const action = url.pathname.slice("/infra/".length);
       const decision = await deps.policy.authorize({
-        identity: resolved.identity,
+        identity: authed.identity,
         toolCall: { tool_id: "infra", action, capability_class: "B", parameters: {} }
       });
       if (decision.decision !== "ALLOW") return json(res, 403, { decision: decision.decision, reason: decision.reason });
-      if (action === "pause") infraGate.pause(body.reason ?? "owner_requested");
-      else if (action === "degrade") infraGate.degrade(body.reason ?? "owner_requested");
+      const reason = fieldOptionalString(authed.body, "reason");
+      if (action === "pause") infraGate.pause(reason ?? "owner_requested");
+      else if (action === "degrade") infraGate.degrade(reason ?? "owner_requested");
       else infraGate.resume();
       return json(res, 200, { state: infraGate.current() });
     }
 
     if (req.method === "POST" && url.pathname === "/infra/status") {
-      const body = (await readBody(req)) as { identity: Parameters<IdentityService["resolveIdentity"]>[0] };
-      const resolved = await deps.identity.resolveIdentity(body.identity);
-      if (!resolved.ok) return json(res, 403, { error: "identity_denied", reason: resolved.reason });
+      const authed = await authedRequest(req, res, deps, []);
+      if (!authed) return;
       return json(res, 200, {
         infra_mode: infraGate.current(),
         connector_health: Object.fromEntries(gateway.health),
@@ -1299,5 +1558,5 @@ async function route(req: IncomingMessage, res: ServerResponse, deps?: ApiDeps):
     }
   }
 
-  json(res, 404, { error: "not_found" });
+  json(res, 404, { error: "not_found", request_id: requestIdOf(res) });
 }

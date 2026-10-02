@@ -1755,22 +1755,22 @@ export function firstWaveTools(
     // hemmelighet finnes (Jarvis sin egen sideprosess), se
     // `browser-transport.ts`.
     {
-      tool_id: "browser", action: "navigate", description: "Naviger den delte nettleserfanen til en URL (http/https), returnerer den faktiske URL-en/tittelen etter lasting (untrusted)",
+      tool_id: "browser", action: "navigate", description: "Last en URL (http/https, KUN offentlige nettsteder - intern/privat adresse nektes) i en frisk, isolert nettleserkontekst og returner den faktiske URL-en/tittelen (untrusted)",
       input_schema: record({ url: z.string().max(2000) }), capability_class: "A",
       scopes: ["browser:read"], reversible: true, rollback_procedure: "ingen (ren navigering, ingen tilstand endres utenfor selve fanen)",
       idempotent_external: true, timeout_ms: 30_000, rate_limit_per_minute: 30,
       credential_ref: "JARVIS_BROWSER_GATEWAY_BASE_URL", output_trust: "untrusted", transport: transport("browser")
     },
     {
-      tool_id: "browser", action: "extract_text", description: "Les den synlige teksten fra den delte nettleserfanen sin GJELDENDE side (etter siste navigate, untrusted)",
-      input_schema: empty, capability_class: "A",
+      tool_id: "browser", action: "extract_text", description: "Last en URL (http/https, KUN offentlige nettsteder) i en frisk, isolert nettleserkontekst og les den synlige teksten (untrusted)",
+      input_schema: record({ url: z.string().max(2000) }), capability_class: "A",
       scopes: ["browser:read"], reversible: true, rollback_procedure: "ingen (ren lesing)",
       idempotent_external: true, timeout_ms: 15_000, rate_limit_per_minute: 30,
       credential_ref: "JARVIS_BROWSER_GATEWAY_BASE_URL", output_trust: "untrusted", transport: transport("browser")
     },
     {
-      tool_id: "browser", action: "screenshot", description: "Ta et skjermbilde (PNG, base64) av den delte nettleserfanen sin GJELDENDE side (etter siste navigate, untrusted)",
-      input_schema: empty, capability_class: "A",
+      tool_id: "browser", action: "screenshot", description: "Last en URL (http/https, KUN offentlige nettsteder) i en frisk, isolert nettleserkontekst og ta et skjermbilde (PNG, base64) (untrusted)",
+      input_schema: record({ url: z.string().max(2000) }), capability_class: "A",
       scopes: ["browser:read"], reversible: true, rollback_procedure: "ingen (ren lesing)",
       idempotent_external: true, timeout_ms: 15_000, rate_limit_per_minute: 30,
       credential_ref: "JARVIS_BROWSER_GATEWAY_BASE_URL", output_trust: "untrusted", transport: transport("browser")

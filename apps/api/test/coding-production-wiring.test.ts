@@ -17,6 +17,7 @@ import {
 } from "@jarvis/tasks";
 import type { ToolExecutionResult } from "@jarvis/tasks";
 import { createApiServer } from "../src/server.ts";
+import { generateDeviceKey, mintGrant } from "./support/grant-client.ts";
 import { ConversationEngine } from "../src/conversation.ts";
 import { MessageStore, ContextBuilder } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
@@ -48,6 +49,14 @@ let baseUrl: string;
 let server: ReturnType<typeof createApiServer>;
 let queue: PgTaskQueue;
 let bareRepo: string;
+
+// Remediering del 2: /tasks/submit tar KUN et grant (utstedt via enhetsbevis).
+const webKey = generateDeviceKey();
+let cachedGrant: string | undefined;
+async function ownerGrant(): Promise<string> {
+  cachedGrant ??= await mintGrant(baseUrl, ownerIdentity, webKey);
+  return cachedGrant;
+}
 
 const ownerIdentity = {
   person_id: "person-tobias", tenant_id: "tenant-personal", device_id: "dev-web",
@@ -113,9 +122,12 @@ beforeAll(async () => {
     INSERT INTO tenants (tenant_id, name, kind) VALUES ('tenant-personal','Tobias','person');
     INSERT INTO people (person_id, display_name) VALUES ('person-tobias','Tobias');
     INSERT INTO person_tenants (person_id, tenant_id) VALUES ('person-tobias','tenant-personal');
-    INSERT INTO devices (device_id, tenant_id, person_id, kind) VALUES ('dev-web','tenant-personal','person-tobias','web');
-    INSERT INTO memory_spaces (memory_space_id, tenant_id, space) VALUES ('sp-personal','tenant-personal','personal');
+        INSERT INTO memory_spaces (memory_space_id, tenant_id, space) VALUES ('sp-personal','tenant-personal','personal');
   `);
+  await adminPool.query(
+    "INSERT INTO devices (device_id, tenant_id, person_id, kind, public_key_pem) VALUES ('dev-web','tenant-personal','person-tobias','web',$1)",
+    [webKey.publicKeyPem]
+  );
   appPool = createPool({ host: "127.0.0.1", port: PORT, database: "jarvis_test", user: "jarvis_codingwiring", password: "pw2" });
 
   bareRepo = await mkdtemp(join(tmpdir(), "jarvis-codingwiring-origin-"));
@@ -172,6 +184,7 @@ beforeAll(async () => {
     // D-130/D-131: `ApiDeps.channelAuthority` og `ApiDeps.grants` er nå
     // påkrevde (ikke brukt av denne testens `/tasks/submit`-fokus, men
     // strukturelt nødvendige for å konstruere en gyldig `ApiDeps`).
+    devices: deviceService,
     grants: grantService,
     channelAuthority: new ChannelSessionAuthority({
       pool: appPool, devices: deviceService, sessions: sessionService, identity: identityService, grants: grantService
@@ -199,7 +212,7 @@ afterAll(async () => {
 async function submit(c: JobContract): Promise<{ status: number; body: Record<string, unknown> }> {
   const response = await fetch(`${baseUrl}/tasks/submit`, {
     method: "POST", headers: { "content-type": "application/json" },
-    body: JSON.stringify({ identity: ownerIdentity, contract: c })
+    body: JSON.stringify({ grant_token: await ownerGrant(), contract: c })
   });
   return { status: response.status, body: (await response.json()) as Record<string, unknown> };
 }
@@ -234,7 +247,7 @@ describe("D-102: EKTE produksjons-reachability - /tasks/submit -> PgTaskQueue ->
   it("C: en ugyldig kontrakt avvises av EKSISTERENDE TaskService.submit()-validering (ingen ny/svakere autorisasjon introdusert av ruten)", async () => {
     const response = await fetch(`${baseUrl}/tasks/submit`, {
       method: "POST", headers: { "content-type": "application/json" },
-      body: JSON.stringify({ identity: ownerIdentity, contract: { not: "a valid contract" } })
+      body: JSON.stringify({ grant_token: await ownerGrant(), contract: { not: "a valid contract" } })
     });
     expect(response.status).toBe(400);
     const body = (await response.json()) as Record<string, unknown>;

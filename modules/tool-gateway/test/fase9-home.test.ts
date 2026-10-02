@@ -1,11 +1,11 @@
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { approvalSigningBytes, type ApprovalPayload, type IdentityContext, type SignedApproval } from "@jarvis/contracts";
+import { signApproval, type IdentityContext, type JsonValue, type SignedApproval } from "@jarvis/contracts";
 import { createPool, fastRoute, PgApprovalStore, runMigrations } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { InMemoryDeviceRegistry, KillSwitch, PolicyGateway } from "@jarvis/policy";
@@ -30,12 +30,11 @@ const voiceIdentity: IdentityContext = {
 const secrets: SecretProvider = { name: "test", async get() { return "ha-token"; } };
 
 function approval(action: string, parameters: Record<string, unknown>): SignedApproval {
-  const payload: ApprovalPayload = {
-    action, parameters: parameters as ApprovalPayload["parameters"],
-    expires_at: new Date(Date.now() + 60_000).toISOString(),
+  return signApproval(watchKeys.privateKey, {
+    tool_id: "home-assistant", action, tenant_id: voiceIdentity.tenant_id, person_id: voiceIdentity.person_id,
+    approver_person_id: voiceIdentity.person_id, parameters: parameters as Record<string, JsonValue>,
     nonce: `nonce-${randomUUID()}`, approving_device_id: "watch-1"
-  };
-  return { ...payload, signature: sign(null, approvalSigningBytes(payload), watchKeys.privateKey).toString("base64") };
+  });
 }
 
 beforeAll(async () => {
@@ -60,7 +59,7 @@ beforeAll(async () => {
   `);
   appPool = createPool({ host: "127.0.0.1", port: PORT, database: "jarvis_test", user: "jarvis_test", password: "pw2" });
   const devices = new InMemoryDeviceRegistry();
-  devices.register("watch-1", watchKeys.publicKey);
+  devices.register("watch-1", watchKeys.publicKey, { tenant_id: "tenant-a", person_id: "person-tobias" });
   const policy = new PolicyGateway({ devices, nonces: new PgApprovalStore(appPool), killSwitch: new KillSwitch() });
   // Q-34 (D-130, lukket i modules/tool-gateway - `lock_set`/`alarm_set` har nå
   // `preflight_requires_target: true`): `read_state`-preflighten MÅ svare med

@@ -28,15 +28,17 @@ describe("A: GET / serverer nå apps/web/command.html (HUD-skallet), ikke lenger
   it('ruten sjekker GET og url.pathname === "/" FØR den leser WEB_COMMAND', () => {
     const routeIdx = serverSource.indexOf('url.pathname === "/"');
     expect(routeIdx).toBeGreaterThan(-1);
-    const readIdx = serverSource.indexOf("readFile(WEB_COMMAND", routeIdx);
+    const readIdx = serverSource.indexOf("sendStaticPage(res, WEB_COMMAND", routeIdx);
     expect(readIdx).toBeGreaterThan(routeIdx);
   });
 
   it("svarer med text/html; charset=utf-8 og no-cache, samme mønster som de andre sidene", () => {
     const routeIdx = serverSource.indexOf('url.pathname === "/"');
     const block = serverSource.slice(routeIdx, serverSource.indexOf("return;", routeIdx));
-    expect(block).toContain('"content-type": "text/html; charset=utf-8"');
-    expect(block).toContain('"cache-control": "no-cache"');
+    // Remediering del 2: headerne settes nå sentralt i `staticPageHeaders()` (CSP/nonce/rammebeskyttelse) for ALLE sider.
+    expect(block).toContain("sendStaticPage(");
+    expect(serverSource).toContain('"content-type": "text/html; charset=utf-8"');
+    expect(serverSource).toContain('"cache-control": "no-cache"');
   });
 });
 
@@ -44,7 +46,7 @@ describe("B: GET /chat serverer den uendrede, opprinnelige chat-siden (WEB_INDEX
   it('ny rute "/chat" leser WEB_INDEX (samme fil som FØR lå på /)', () => {
     const routeIdx = serverSource.indexOf('url.pathname === "/chat"');
     expect(routeIdx).toBeGreaterThan(-1);
-    const readIdx = serverSource.indexOf("readFile(WEB_INDEX", routeIdx);
+    const readIdx = serverSource.indexOf("sendStaticPage(res, WEB_INDEX", routeIdx);
     expect(readIdx).toBeGreaterThan(routeIdx);
     expect(readIdx).toBeLessThan(serverSource.indexOf("return;", routeIdx));
   });
@@ -59,11 +61,11 @@ describe("B: GET /chat serverer den uendrede, opprinnelige chat-siden (WEB_INDEX
 describe("C: GET /dashboard og GET /voice er UBERØRT av denne sliceen", () => {
   it("/dashboard-ruten finnes fortsatt og leser WEB_DASHBOARD", () => {
     expect(serverSource).toContain('url.pathname === "/dashboard"');
-    expect(serverSource).toContain("readFile(WEB_DASHBOARD");
+    expect(serverSource).toContain("sendStaticPage(res, WEB_DASHBOARD");
   });
   it("/voice-ruten finnes fortsatt og leser WEB_VOICE", () => {
     expect(serverSource).toContain('url.pathname === "/voice"');
-    expect(serverSource).toContain("readFile(WEB_VOICE");
+    expect(serverSource).toContain("sendStaticPage(res, WEB_VOICE");
   });
 });
 

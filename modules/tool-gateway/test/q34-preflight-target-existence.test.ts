@@ -209,7 +209,7 @@ beforeAll(async () => {
   `);
   appPool = createPool({ host: "127.0.0.1", port: PORT, database: "jarvis_test", user: "jarvis_q34", password: "pw2" });
   policy = new PolicyGateway({
-    devices: { publicKeyFor: () => undefined },
+    devices: { approverFor: async () => undefined },
     nonces: { consume: async () => true },
     killSwitch: new KillSwitch(),
     authority: { owner_person_id: "person-tobias", owner_tenants: ["tenant-a"] }

@@ -7,9 +7,17 @@ import type { JsonValue } from "@jarvis/contracts";
 export interface NonceConsumeContext {
   nonce: string;
   tenant_id: string;
+  tool_id: string;
   action: string;
   parameters: Record<string, JsonValue>;
+  /** SHA-256 av de kanoniske parametrene - det den signerte godkjenningen faktisk bandt seg til. */
+  parameters_hash: string;
+  /** Personen som ba om handlingen. */
+  requester_person_id: string;
+  /** Personen som godkjente (eier av den signerende enheten). */
+  approver_person_id: string;
   approving_device_id: string;
+  issued_at: string;
   expires_at: string;
 }
 

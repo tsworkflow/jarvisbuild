@@ -91,23 +91,70 @@ export const GIT_CREDENTIAL_ISOLATION_ARGS = ["-c", "credential.helper="] as con
  * ingen stdout for disse - Jarvis sin credential skal ALDRI persisteres av
  * git selv, kun leves i denne ene prosessens `extraEnv`).
  */
-export function generateCredentialHelperScriptContent(): string {
+export function generateCredentialHelperScriptContent(scope: GitCredentialScope): string {
+  assertScope(scope);
   return [
     "#!/usr/bin/env node",
+    // REMEDIERING DEL 2 (JARVIS-064): credential utleveres KUN til nøyaktig protokoll + vert + repo-sti.
+    // Scopet er innebakt (JSON-literal fra validert input) - ikke lesbart/overstyrbart fra jobb-miljøet.
+    `const SCOPE = ${JSON.stringify({ protocol: scope.protocol, host: scope.host.toLowerCase(), path: normalizeRepoPath(scope.path) })};`,
     "const operation = process.argv[2] || \"\";",
     "if (operation !== \"get\") {",
     "  process.stdin.resume();",
     "  process.stdin.on(\"end\", () => process.exit(0));",
     "  process.exit(0);",
     "}",
-    "process.stdin.resume();",
+    "let input = \"\";",
+    "process.stdin.setEncoding(\"utf8\");",
+    "process.stdin.on(\"data\", (chunk) => { input += chunk; });",
     "process.stdin.on(\"end\", () => {",
+    "  const req = {};",
+    "  for (const line of input.split(/\\r?\\n/)) {",
+    "    const idx = line.indexOf(\"=\");",
+    "    if (idx > 0) req[line.slice(0, idx)] = line.slice(idx + 1);",
+    "  }",
+    "  const path = String(req.path || \"\").replace(/^\\/+/, \"\").replace(/\\.git$/i, \"\").toLowerCase();",
+    "  const ok = req.protocol === SCOPE.protocol",
+    "    && String(req.host || \"\").toLowerCase() === SCOPE.host",
+    "    && path === SCOPE.path",
+    "    && !req.username_override;",
+    "  if (!ok) process.exit(0); // ingen svar = ingen credential til fremmed vert/repo",
     `  const token = process.env[${JSON.stringify(GIT_CREDENTIAL_TOKEN_ENV)}] || "";`,
+    "  if (!token) process.exit(0); // aldri et tomt passord - ingen credential er bedre enn en tom",
     "  process.stdout.write(\"username=x-access-token\\n\");",
     "  process.stdout.write(\"password=\" + token + \"\\n\");",
     "});",
     ""
   ].join("\n");
+}
+
+/**
+ * REMEDIERING DEL 2 (JARVIS-064): hvem credentialen er gyldig mot. `host` er git sitt `host=`-felt (inkl. port når
+ * den ikke er standard), `path` er `owner/repo` (uten `.git`). Credentialen utleveres ALDRI til noe annet.
+ */
+export interface GitCredentialScope {
+  readonly protocol: "https" | "http";
+  readonly host: string;
+  readonly path: string;
+}
+
+/** Produksjonsscope: eksakt github.com over https + ett eksakt `owner/repo`. */
+export function githubCredentialScope(repoSlug: string): GitCredentialScope {
+  return { protocol: "https", host: "github.com", path: repoSlug };
+}
+
+function normalizeRepoPath(path: string): string {
+  return path.replace(/^\/+/, "").replace(/\.git$/i, "").toLowerCase();
+}
+
+function assertScope(scope: GitCredentialScope): void {
+  if (
+    !scope || (scope.protocol !== "https" && scope.protocol !== "http") ||
+    typeof scope.host !== "string" || !/^[A-Za-z0-9.-]+(?::\d{1,5})?$/.test(scope.host) ||
+    typeof scope.path !== "string" || !/^[A-Za-z0-9._-]+(?:\/[A-Za-z0-9._-]+)?(?:\.git)?$/.test(scope.path)
+  ) {
+    throw new Error("git_credential_scope_invalid");
+  }
 }
 
 /**
@@ -186,15 +233,16 @@ export interface GitAuthHandle {
    * `env` bærer KUN dataene (token + terminal-prompt-sperre) helperen selv
    * leser ved kjøretid.
    */
-  readonly credentialHelperArgs: readonly [string, string];
+  readonly credentialHelperArgs: readonly [string, string, string, string];
   /** Fjerner det ephemere credential-helper-skriptet. MÅ kalles i `finally`, uavhengig av `sandbox.dispose()`. */
   cleanup(): Promise<void>;
 }
 
-export async function createGitAuthHandle(token: string): Promise<GitAuthHandle> {
+export async function createGitAuthHandle(token: string, scope: GitCredentialScope): Promise<GitAuthHandle> {
+  assertScope(scope);
   const dir = await mkdtemp(join(tmpdir(), "jarvis-git-cred-"));
   const scriptPath = join(dir, "credential-helper.cjs");
-  await writeFile(scriptPath, generateCredentialHelperScriptContent(), "utf8");
+  await writeFile(scriptPath, generateCredentialHelperScriptContent(scope), "utf8");
   // Ikke strengt nødvendig lenger (skriptet kjøres ALDRI direkte av OS-en -
   // kun lest som kildekode av en allerede kjørende `node`), men ufarlig
   // defense-in-depth på POSIX og en no-op-å-ignorere feil på Windows.
@@ -207,7 +255,8 @@ export async function createGitAuthHandle(token: string): Promise<GitAuthHandle>
       GIT_TERMINAL_PROMPT: "0",
       [GIT_CREDENTIAL_TOKEN_ENV]: token
     },
-    credentialHelperArgs: ["-c", `credential.helper=${configValue}`],
+    // `credential.useHttpPath=true`: git sender da `path=` til helperen, slik at scopet kan binde credentialen til ETT repo.
+    credentialHelperArgs: ["-c", `credential.helper=${configValue}`, "-c", "credential.useHttpPath=true"],
     cleanup: async () => {
       await rm(dir, { recursive: true, force: true });
     }

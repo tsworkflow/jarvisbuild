@@ -46,7 +46,8 @@ export async function proposeRepairTask(
   const task_id = `inc-repair-${incident.incident_id}-${Date.now().toString(36)}`;
   const contract: JobContract = {
     task_id,
-    owner_person_id: incident.owner_person_id ?? identity.person_id,
+    // Arkitekt-review (P1): jobbens eier er ALLTID den verifiserte innsenderen (TaskService.submit krever det), aldri en verdi fra incident-raden.
+    owner_person_id: identity.person_id,
     tenant_id: incident.tenant_id,
     goal: input.goal,
     acceptance_criteria: ["tester bestaar", "endring committet og pushet"],

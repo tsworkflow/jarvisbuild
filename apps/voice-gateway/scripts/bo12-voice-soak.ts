@@ -23,11 +23,14 @@ import { OpenAiTts } from "../src/tts.ts";
 import { HttpCoreClient } from "../src/server.ts";
 import { VoiceSession } from "../src/session.ts";
 import type { TurnMetrics, VoiceIdentity } from "../src/session.ts";
+import { loadOwnerConfig } from "@jarvis/contracts";
+// Remediering del 2 (JARVIS-065): eier fra validert konfig (JARVIS_TENANT_ID/JARVIS_OWNER_PERSON_ID/JARVIS_OWNER_NAME), ingen hardkoding.
+const owner = loadOwnerConfig();
 
 const API_URL = process.env["JARVIS_CORE_URL"] ?? "http://localhost:3010";
 const identity: VoiceIdentity = {
-  person_id: "person-tobias",
-  tenant_id: process.env["JARVIS_TENANT_ID"] ?? "tenant-personal",
+  person_id: owner.owner_person_id,
+  tenant_id: owner.tenant_id,
   device_id: "jarvis-voice-live",
   memory_space: "personal",
   channel: "voice"

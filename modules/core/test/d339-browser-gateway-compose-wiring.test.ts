@@ -45,7 +45,7 @@ describe("D-339: browser-gateway-tjenesten finnes i infra/local/docker-compose.y
 
   it("Remediering del 1 (JARVIS-008): INGEN host-publisering - uautentisert gateway nås kun via det interne Docker-nettverket", () => {
     expect(block).not.toMatch(/^\s{4}ports:/m);
-    expect(block).not.toMatch(/-\s*"[^"]*:[^"]*"/);
+    expect(block).not.toMatch(/^\s*-\s*"[\d.]+:\d+(:\d+)?"/m);
   });
 
   it("har helsesjekk mot /health, samme mønster som api-/voice-gateway-tjenestene", () => {

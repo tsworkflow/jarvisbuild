@@ -1,5 +1,5 @@
 import type pg from "pg";
-import type { MemorySpace } from "@jarvis/contracts";
+import { serializeMemorySpaces, type MemorySpace } from "@jarvis/contracts";
 
 /**
  * Transaksjon med BÅDE tenant- og space-kontekst for minne-RLS.
@@ -30,7 +30,7 @@ export async function withMemoryTransaction<T>(
     await client.query("BEGIN");
     await client.query("SELECT set_config('jarvis.tenant_id', $1, true), set_config('jarvis.memory_spaces', $2, true)", [
       tenantId,
-      spaces.join(",")
+      serializeMemorySpaces(spaces)
     ]);
     const result = await fn(client);
     await client.query("COMMIT");

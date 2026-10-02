@@ -42,7 +42,7 @@ import { randomUUID } from "node:crypto";
 import pg from "pg";
 import type { IdentityContext } from "@jarvis/contracts";
 import {
-  adminConfigFromEnv, assertRuntimeCredentialsConfigured, assertRuntimeRoleSafe, configFromEnv, createPool, PgApprovalStore, SessionGrantService,
+  adminConfigFromEnv, assertRuntimeCredentialsConfigured, assertRuntimeRoleSafe, configFromEnv, createPool, DeviceService, PgApprovalStore, SessionGrantService,
   withTenantTransaction
 } from "@jarvis/core";
 import { BUSINESS_INTERNAL_CREDENTIAL_REF, BusinessInternalSecretProvider } from "@jarvis/business";
@@ -161,7 +161,7 @@ async function buildStack(sidePool: pg.Pool): Promise<{
   const gateway = new ToolGateway(sidePool, policy, secrets, ownerControls);
 
   const grants = new SessionGrantService(sidePool);
-  const ownerControlsService = new OwnerControlsService(killSwitch, ownerControls, { pool: sidePool, grants, authority });
+  const ownerControlsService = new OwnerControlsService(killSwitch, ownerControls, { pool: sidePool, grants, devices: new DeviceService(sidePool), authority });
   for (const tool of ownerControlsToolDefinitions(new OwnerControlsTransport(ownerControlsService))) gateway.register(tool);
 
   // D-176 (arkitekt-review 5251073737, BLOKKER B5): `executive.get_control_surface_status`

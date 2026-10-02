@@ -83,3 +83,10 @@ b50bf5cd9177d344a91725badb962c35a5e7891b:modules/tool-gateway/src/integrations.t
 # rule); the fixture value was replaced by a low-entropy placeholder in the
 # next commit, so only the historical commit is ignored here.
 0e52d44c3aea5072ca256afd9e1e86952e88b420:modules/core/test/remediation-1-backup-restore.test.ts:generic-api-key:225
+
+# Remediering del 2: verifiserte falske positive (testfikstur-passord/miljønavnliste, ingen ekte hemmeligheter). Historikk er IKKE omskrevet.
+# - remediation-2-schema-invariants.test.ts: syntetiske passord for engangsroller i en flyktig embedded-Postgres-test.
+# - infra/local/service-env.mjs: liste over MILJØVARIABELNAVN (ikke verdier) - `..._API_BASE_URL`/`..._API_KEY` er navn.
+46440336f1473d8c4e857d058b553a26ff029d73:modules/core/test/remediation-2-schema-invariants.test.ts:generic-api-key:286
+46440336f1473d8c4e857d058b553a26ff029d73:modules/core/test/remediation-2-schema-invariants.test.ts:generic-api-key:298
+d350375fbe45d8f455e9c3eae7c6964213591182:infra/local/service-env.mjs:generic-api-key:202

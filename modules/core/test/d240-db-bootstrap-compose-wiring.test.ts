@@ -71,10 +71,10 @@ describe("D-240: bootstrap-databases.sql sitt idempotens-mønster (host-verifise
   const sql = readBootstrapSql();
 
   it("oppretter infisical KUN når den ikke allerede finnes (WHERE NOT EXISTS + \\gexec)", () => {
-    expect(sql).toMatch(/CREATE DATABASE infisical'\s+WHERE NOT EXISTS[^\n]*datname = 'infisical'\)\\gexec/);
+    expect(sql).toMatch(/CREATE DATABASE infisical OWNER infisical_app'\s+WHERE NOT EXISTS[^\n]*datname = 'infisical'\)\s*\\gexec/);
   });
 
   it("oppretter langfuse KUN når den ikke allerede finnes (WHERE NOT EXISTS + \\gexec)", () => {
-    expect(sql).toMatch(/CREATE DATABASE langfuse'\s+WHERE NOT EXISTS[^\n]*datname = 'langfuse'\)\\gexec/);
+    expect(sql).toMatch(/CREATE DATABASE langfuse OWNER langfuse_app'\s+WHERE NOT EXISTS[^\n]*datname = 'langfuse'\)\s*\\gexec/);
   });
 });

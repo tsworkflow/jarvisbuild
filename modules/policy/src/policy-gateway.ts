@@ -18,6 +18,14 @@ export interface AuthorizationResult {
   decision: Decision;
   /** Maskinlesbar årsak - logges alltid til audit. */
   reason: string;
+  /**
+   * Remediering del 2 (JARVIS-051): satt KUN når kalleren ba om utsatt nonce-forbruk
+   * (`deferNonceConsumption`) og en signert godkjenning ble verifisert. Kalleren MÅ
+   * kalle den (og kreve `ok: true`) rett FØR den irreversible handlingen - etter at alle
+   * andre porter (rate limit, frys, credential, preflight) har passert. En godkjenning
+   * som feiler en ortogonal port brenner dermed ikke engangs-noncen.
+   */
+  commit?: () => Promise<{ ok: true } | { ok: false; reason: string }>;
 }
 
 export interface AuthorizationRequest {
@@ -25,6 +33,8 @@ export interface AuthorizationRequest {
   toolCall: ToolCall;
   /** Kreves for klasse D. Ignoreres ikke for andre klasser hvis oppgitt, men er ikke påkrevd. */
   approval?: unknown;
+  /** Utsett forbruk av godkjenningens nonce til kalleren kaller `commit()` (se `AuthorizationResult.commit`). */
+  deferNonceConsumption?: boolean;
 }
 
 /** Audit-hendelse fra Policy Gateway. Append-only sink; ekstern lagring fra fase 2. */
@@ -192,39 +202,61 @@ export class PolicyGateway {
     if (request.approval === undefined) {
       return this.finish(request, "DENY", "class_d_missing_approval");
     }
-    const check = verifyApproval(
+    const check = await verifyApproval(
       request.approval,
-      { action: toolCall.action, parameters: toolCall.parameters },
+      {
+        tool_id: toolCall.tool_id,
+        action: toolCall.action,
+        parameters: toolCall.parameters,
+        tenant_id: request.identity.tenant_id,
+        person_id: request.identity.person_id
+      },
       this.devices,
       this.clock()
     );
     if (!check.valid) {
       return this.finish(request, "DENY", `class_d_${check.reason}`);
     }
-    // Alle kontroller OK - forbruk engangs-ID-en som aller siste steg (replay-vern).
-    // Feil i lageret er DENY (fail-closed): usikkerhet gir aldri ALLOW.
-    const approval = request.approval as {
-      nonce: string;
-      action: string;
-      parameters: Record<string, never>;
-      approving_device_id: string;
-      expires_at: string;
+    const approval = check.approval;
+    // Alle kontroller OK - forbruk engangs-ID-en (replay-vern). Feil i lageret er
+    // DENY (fail-closed): usikkerhet gir aldri ALLOW.
+    const consume = async (): Promise<{ ok: true } | { ok: false; reason: string }> => {
+      let firstUse: boolean;
+      try {
+        firstUse = await this.nonces.consume({
+          nonce: approval.nonce,
+          tenant_id: request.identity.tenant_id,
+          tool_id: approval.tool_id,
+          action: approval.action,
+          parameters: toolCall.parameters,
+          parameters_hash: approval.parameters_hash,
+          requester_person_id: approval.person_id,
+          approver_person_id: approval.approver_person_id,
+          approving_device_id: approval.approving_device_id,
+          issued_at: approval.issued_at,
+          expires_at: approval.expires_at
+        });
+      } catch {
+        return { ok: false, reason: "class_d_nonce_store_error" };
+      }
+      return firstUse ? { ok: true } : { ok: false, reason: "class_d_nonce_already_used" };
     };
-    let firstUse: boolean;
-    try {
-      firstUse = await this.nonces.consume({
-        nonce: approval.nonce,
-        tenant_id: request.identity.tenant_id,
-        action: approval.action,
-        parameters: approval.parameters,
-        approving_device_id: approval.approving_device_id,
-        expires_at: approval.expires_at
-      });
-    } catch {
-      return this.finish(request, "DENY", "class_d_nonce_store_error");
+    if (request.deferNonceConsumption === true) {
+      const decided = this.finish(request, "ALLOW", "class_d_valid_signed_approval_pending_commit");
+      return {
+        ...decided,
+        commit: async () => {
+          const result = await consume();
+          if (!result.ok) {
+            this.finish(request, "DENY", result.reason);
+          }
+          return result;
+        }
+      };
     }
-    if (!firstUse) {
-      return this.finish(request, "DENY", "class_d_nonce_already_used");
+    const consumed = await consume();
+    if (!consumed.ok) {
+      return this.finish(request, "DENY", consumed.reason);
     }
     return this.finish(request, "ALLOW", "class_d_valid_signed_approval");
   }

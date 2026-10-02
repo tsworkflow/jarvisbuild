@@ -1,3 +1,4 @@
+import { assertGithubRepoSlug, encodePathSegment, guardedFetch } from "./url-safety.ts";
 import { createHmac } from "node:crypto";
 import type { JsonValue } from "@jarvis/contracts";
 import type { ToolInvocationContext, ToolTransport } from "./gateway.ts";
@@ -172,7 +173,7 @@ export async function googleAccessToken(refreshToken: string): Promise<string> {
   // `classifyGoogleTokenEndpointError()` sin kontekst-bevisste
   // EMAIL_REAUTH_REQUIRED-gren (se dens toppkommentar).
   const provenDesktopClient = process.env["JARVIS_GOOGLE_OAUTH_CLIENT_TYPE"] === "desktop";
-  const response = await fetch("https://oauth2.googleapis.com/token", {
+  const response = await guardedFetch("https://oauth2.googleapis.com/token", {
     method: "POST",
     headers: { "content-type": "application/x-www-form-urlencoded" },
     body: new URLSearchParams({ client_id: clientId, client_secret: clientSecret, grant_type: "refresh_token", refresh_token: refreshToken })
@@ -304,7 +305,7 @@ export class GmailTransport implements ToolTransport {
       `Content-Transfer-Encoding: base64\r\n` +
       `\r\n${encodedBody}`;
     const raw = Buffer.from(message, "utf8").toString("base64url");
-    const res = await fetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
+    const res = await guardedFetch("https://gmail.googleapis.com/gmail/v1/users/me/messages/send", {
       method: "POST",
       headers: { ...auth, "content-type": "application/json" },
       body: JSON.stringify({ raw })
@@ -315,12 +316,12 @@ export class GmailTransport implements ToolTransport {
 
   private async readInbox(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
     const max = Number(parameters["max"] ?? 15);
-    const list = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${max}&q=newer_than:2d`, { headers: auth });
+    const list = await guardedFetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${max}&q=newer_than:2d`, { headers: auth });
     if (!list.ok) throw new Error(`gmail_error_${list.status}`);
     const ids = (((await list.json()) as { messages?: Array<{ id: string }> }).messages ?? []).slice(0, max);
     const messages: JsonValue[] = [];
     for (const { id } of ids) {
-      const m = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`, { headers: auth });
+      const m = await guardedFetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodePathSegment(id, "message_id")}?format=metadata&metadataHeaders=From&metadataHeaders=Subject&metadataHeaders=Date`, { headers: auth });
       if (!m.ok) continue;
       const msg = (await m.json()) as { id: string; threadId: string; labelIds?: string[]; internalDate?: string; payload?: { headers?: Array<{ name: string; value: string }> } };
       const h = (name: string) => msg.payload?.headers?.find((x) => x.name === name)?.value ?? "";
@@ -348,7 +349,7 @@ export class GmailTransport implements ToolTransport {
   private async listMessages(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
     const max = Number(parameters["max"] ?? 15);
     const query = parameters["query"] ? String(parameters["query"]) : "newer_than:14d";
-    const list = await fetch(
+    const list = await guardedFetch(
       `https://gmail.googleapis.com/gmail/v1/users/me/messages?maxResults=${max}&q=${encodeURIComponent(query)}`,
       { headers: auth }
     );
@@ -356,7 +357,7 @@ export class GmailTransport implements ToolTransport {
     const ids = (((await list.json()) as { messages?: Array<{ id: string }> }).messages ?? []).slice(0, max);
     const messages: JsonValue[] = [];
     for (const { id } of ids) {
-      const m = await fetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${id}?format=full`, { headers: auth });
+      const m = await guardedFetch(`https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodePathSegment(id, "message_id")}?format=full`, { headers: auth });
       if (!m.ok) continue;
       const msg = (await m.json()) as {
         id: string; threadId: string; internalDate?: string;
@@ -385,8 +386,8 @@ export class GmailTransport implements ToolTransport {
   private async readAttachment(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
     const messageId = String(parameters["message_id"]);
     const attachmentId = String(parameters["attachment_id"]);
-    const response = await fetch(
-      `https://gmail.googleapis.com/gmail/v1/users/me/messages/${messageId}/attachments/${attachmentId}`,
+    const response = await guardedFetch(
+      `https://gmail.googleapis.com/gmail/v1/users/me/messages/${encodePathSegment(messageId, "message_id")}/attachments/${encodePathSegment(attachmentId, "attachment_id")}`,
       { headers: auth }
     );
     if (response.status === 404) throw new Error(`gmail_attachment_not_found_${attachmentId}`);
@@ -418,7 +419,7 @@ export class GoogleCalendarTransport implements ToolTransport {
   private async readEvents(parameters: Record<string, JsonValue>, credential: string) {
     const token = await googleAccessToken(credential);
     const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(String(parameters["from"]))}&timeMax=${encodeURIComponent(String(parameters["to"]))}&maxResults=25`;
-    const response = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    const response = await guardedFetch(url, { headers: { authorization: `Bearer ${token}` } });
     if (!response.ok) throw new Error(`calendar_error_${response.status}`);
     const body = (await response.json()) as { items?: Array<{ id: string; summary?: string; description?: string; location?: string; hangoutLink?: string; attendees?: unknown[]; start?: { dateTime?: string; date?: string }; end?: { dateTime?: string } }> };
     const events: JsonValue[] = (body.items ?? []).map((e) => ({
@@ -445,7 +446,7 @@ export class GoogleCalendarTransport implements ToolTransport {
   private async listEvents(parameters: Record<string, JsonValue>, credential: string) {
     const token = await googleAccessToken(credential);
     const url = `https://www.googleapis.com/calendar/v3/calendars/primary/events?singleEvents=true&orderBy=startTime&timeMin=${encodeURIComponent(String(parameters["from"]))}&timeMax=${encodeURIComponent(String(parameters["to"]))}&maxResults=${Number(parameters["max"] ?? 25)}`;
-    const response = await fetch(url, { headers: { authorization: `Bearer ${token}` } });
+    const response = await guardedFetch(url, { headers: { authorization: `Bearer ${token}` } });
     if (!response.ok) throw new Error(`calendar_error_${response.status}`);
     const body = (await response.json()) as {
       items?: Array<{
@@ -542,9 +543,9 @@ export class GoogleDriveTransport implements ToolTransport {
   }
 
   private async getMetadata(fileId: string, auth: Record<string, string>): Promise<DriveMetadata> {
-    const url = new URL(`https://www.googleapis.com/drive/v3/files/${fileId}`);
+    const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}`);
     url.searchParams.set("fields", "id,name,mimeType,trashed,parents,headRevisionId,modifiedTime");
-    const response = await fetch(url, { headers: auth });
+    const response = await guardedFetch(url, { headers: auth });
     await this.assertOk(response, fileId);
     const body = (await response.json()) as Partial<DriveMetadata>;
     return {
@@ -560,7 +561,7 @@ export class GoogleDriveTransport implements ToolTransport {
     if (expected === undefined) return; // ingen precondition oppgitt - kalleren har bevisst ikke bedt om en
     const current = await this.getMetadata(fileId, auth);
     if (current.headRevisionId !== String(expected)) {
-      throw new Error(`drive_conflict_stale_version_${fileId}`);
+      throw new Error(`drive_conflict_stale_version_${encodePathSegment(fileId, "file_id")}`);
     }
   }
 
@@ -614,7 +615,7 @@ export class GoogleDriveTransport implements ToolTransport {
     url.searchParams.set("pageSize", "100");
     url.searchParams.set("spaces", "drive");
     if (pageToken) url.searchParams.set("pageToken", pageToken);
-    const response = await fetch(url, { headers: auth });
+    const response = await guardedFetch(url, { headers: auth });
     await this.assertOk(response);
     const body = (await response.json()) as {
       nextPageToken?: string;
@@ -635,8 +636,8 @@ export class GoogleDriveTransport implements ToolTransport {
     const documentId = String(parameters["document_id"]);
     const mimeType = String(parameters["mime_type"] ?? "");
     if (mimeType === GOOGLE_DOC_EXPORT_MIME) {
-      const response = await fetch(
-        `https://www.googleapis.com/drive/v3/files/${documentId}/export?mimeType=text%2Fplain`,
+      const response = await guardedFetch(
+        `https://www.googleapis.com/drive/v3/files/${encodePathSegment(documentId, "document_id")}/export?mimeType=text%2Fplain`,
         { headers: auth }
       );
       await this.assertOk(response, documentId);
@@ -646,16 +647,16 @@ export class GoogleDriveTransport implements ToolTransport {
       // Sheets/Slides/Forms/binærformater/bilder/PDF - eksplisitt utenfor P1A-scope (§14).
       throw new Error(`drive_unsupported_content_${mimeType || "unknown"}`);
     }
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${documentId}?alt=media`, { headers: auth });
+    const response = await guardedFetch(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(documentId, "document_id")}?alt=media`, { headers: auth });
     await this.assertOk(response, documentId);
     return { data: { content: await response.text(), content_type: mimeType } };
   }
 
   private async readPermissions(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
     const fileId = String(parameters["file_id"]);
-    const url = new URL(`https://www.googleapis.com/drive/v3/files/${fileId}/permissions`);
+    const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}/permissions`);
     url.searchParams.set("fields", "permissions(id,type,role,emailAddress,domain)");
-    const response = await fetch(url, { headers: auth });
+    const response = await guardedFetch(url, { headers: auth });
     await this.assertOk(response, fileId);
     const body = (await response.json()) as { permissions?: Array<{ id: string; type: string; role: string; emailAddress?: string; domain?: string }> };
     return { data: { permissions: (body.permissions ?? []) as unknown as JsonValue } };
@@ -675,7 +676,7 @@ export class GoogleDriveTransport implements ToolTransport {
     const metadata: Record<string, JsonValue> = { name, mimeType, ...(parentFolderId ? { parents: [parentFolderId] } : {}) };
 
     if (isFolder) {
-      const response = await fetch("https://www.googleapis.com/drive/v3/files?fields=id,name,mimeType,parents", {
+      const response = await guardedFetch("https://www.googleapis.com/drive/v3/files?fields=id,name,mimeType,parents", {
         method: "POST",
         headers: { ...auth, "content-type": "application/json" },
         body: JSON.stringify(metadata)
@@ -690,7 +691,7 @@ export class GoogleDriveTransport implements ToolTransport {
       `--${boundary}\r\ncontent-type: application/json; charset=UTF-8\r\n\r\n${JSON.stringify(metadata)}\r\n` +
       `--${boundary}\r\ncontent-type: ${mimeType}\r\n\r\n${content}\r\n` +
       `--${boundary}--`;
-    const response = await fetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,headRevisionId", {
+    const response = await guardedFetch("https://www.googleapis.com/upload/drive/v3/files?uploadType=multipart&fields=id,name,mimeType,headRevisionId", {
       method: "POST",
       headers: { ...auth, "content-type": `multipart/related; boundary=${boundary}` },
       body: multipartBody
@@ -705,7 +706,7 @@ export class GoogleDriveTransport implements ToolTransport {
     await this.assertNotStale(fileId, parameters, auth);
     const content = String(parameters["content"] ?? "");
     const mimeType = String(parameters["mime_type"] ?? "text/plain");
-    const response = await fetch(`https://www.googleapis.com/upload/drive/v3/files/${fileId}?uploadType=media&fields=id,name,headRevisionId`, {
+    const response = await guardedFetch(`https://www.googleapis.com/upload/drive/v3/files/${encodePathSegment(fileId, "file_id")}?uploadType=media&fields=id,name,headRevisionId`, {
       method: "PATCH",
       headers: { ...auth, "content-type": mimeType },
       body: content
@@ -719,7 +720,7 @@ export class GoogleDriveTransport implements ToolTransport {
     const fileId = String(parameters["file_id"]);
     await this.assertNotStale(fileId, parameters, auth);
     const newName = String(parameters["new_name"]);
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name`, {
+    const response = await guardedFetch(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}?fields=id,name`, {
       method: "PATCH",
       headers: { ...auth, "content-type": "application/json" },
       body: JSON.stringify({ name: newName })
@@ -734,11 +735,11 @@ export class GoogleDriveTransport implements ToolTransport {
     await this.assertNotStale(fileId, parameters, auth);
     const newParentId = String(parameters["new_parent_folder_id"]);
     const meta = await this.getMetadata(fileId, auth);
-    const url = new URL(`https://www.googleapis.com/drive/v3/files/${fileId}`);
+    const url = new URL(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}`);
     url.searchParams.set("addParents", newParentId);
     if (meta.parents.length > 0) url.searchParams.set("removeParents", meta.parents.join(","));
     url.searchParams.set("fields", "id,name,parents");
-    const response = await fetch(url, { method: "PATCH", headers: auth });
+    const response = await guardedFetch(url, { method: "PATCH", headers: auth });
     await this.assertOk(response, fileId);
     const body = (await response.json()) as { id: string; name: string; parents?: string[] };
     return { external_id: body.id, data: { id: body.id, name: body.name, parents: (body.parents ?? []) as unknown as JsonValue } };
@@ -747,7 +748,7 @@ export class GoogleDriveTransport implements ToolTransport {
   private async setTrashed(parameters: Record<string, JsonValue>, auth: Record<string, string>, trashed: boolean) {
     const fileId = String(parameters["file_id"]);
     await this.assertNotStale(fileId, parameters, auth);
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}?fields=id,name,trashed`, {
+    const response = await guardedFetch(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}?fields=id,name,trashed`, {
       method: "PATCH",
       headers: { ...auth, "content-type": "application/json" },
       body: JSON.stringify({ trashed })
@@ -760,7 +761,7 @@ export class GoogleDriveTransport implements ToolTransport {
   /** `files.delete` er PERMANENT (bekreftet mot Drive API v3-dokumentasjonen) - flytter IKKE til papirkurv. */
   private async deletePermanent(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
     const fileId = String(parameters["file_id"]);
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}`, { method: "DELETE", headers: auth });
+    const response = await guardedFetch(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}`, { method: "DELETE", headers: auth });
     if (response.status === 404) {
       // Allerede borte - idempotent utfall for en retry, ikke en feil.
       return { external_id: fileId, data: { id: fileId, already_deleted: "true" } };
@@ -776,7 +777,7 @@ export class GoogleDriveTransport implements ToolTransport {
     const body: Record<string, JsonValue> = { role, type };
     if (parameters["email_address"] !== undefined) body["emailAddress"] = String(parameters["email_address"]);
     if (parameters["domain"] !== undefined) body["domain"] = String(parameters["domain"]);
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/permissions?fields=id,type,role`, {
+    const response = await guardedFetch(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}/permissions?fields=id,type,role`, {
       method: "POST",
       headers: { ...auth, "content-type": "application/json" },
       body: JSON.stringify(body)
@@ -790,12 +791,12 @@ export class GoogleDriveTransport implements ToolTransport {
     const fileId = String(parameters["file_id"]);
     const permissionId = String(parameters["permission_id"]);
     const role = String(parameters["role"]);
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/permissions/${permissionId}?fields=id,role`, {
+    const response = await guardedFetch(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}/permissions/${encodePathSegment(permissionId, "permission_id")}?fields=id,role`, {
       method: "PATCH",
       headers: { ...auth, "content-type": "application/json" },
       body: JSON.stringify({ role })
     });
-    await this.assertOk(response, `${fileId}:${permissionId}`);
+    await this.assertOk(response, `${encodePathSegment(fileId, "file_id")}:${encodePathSegment(permissionId, "permission_id")}`);
     const body = (await response.json()) as { id: string; role: string };
     return { external_id: body.id, data: { id: body.id, role: body.role } };
   }
@@ -803,13 +804,13 @@ export class GoogleDriveTransport implements ToolTransport {
   private async deletePermission(parameters: Record<string, JsonValue>, auth: Record<string, string>) {
     const fileId = String(parameters["file_id"]);
     const permissionId = String(parameters["permission_id"]);
-    const response = await fetch(`https://www.googleapis.com/drive/v3/files/${fileId}/permissions/${permissionId}`, {
+    const response = await guardedFetch(`https://www.googleapis.com/drive/v3/files/${encodePathSegment(fileId, "file_id")}/permissions/${encodePathSegment(permissionId, "permission_id")}`, {
       method: "DELETE", headers: auth
     });
     if (response.status === 404) {
       return { external_id: permissionId, data: { id: permissionId, already_deleted: "true" } };
     }
-    await this.assertOk(response, `${fileId}:${permissionId}`);
+    await this.assertOk(response, `${encodePathSegment(fileId, "file_id")}:${encodePathSegment(permissionId, "permission_id")}`);
     return { external_id: permissionId, data: { id: permissionId, already_deleted: "false" } };
   }
 }
@@ -883,7 +884,7 @@ export class TelegramTransport implements ToolTransport {
       // boten sin egen token kreves, INGEN `chat_id`, INGEN sideeffekt.
       // Lagt til nettopp fordi `notify` under sender en EKTE melding og
       // derfor aldri kunne vært en trygg "virker credentialen?"-test.
-      const response = await fetch(`https://api.telegram.org/bot${credential}/getMe`);
+      const response = await guardedFetch(`https://api.telegram.org/bot${credential}/getMe`);
       if (!response.ok) throw new Error(`telegram_error_${response.status}`);
       const body = (await response.json()) as { result?: JsonValue };
       return { data: body.result ?? null };
@@ -891,7 +892,7 @@ export class TelegramTransport implements ToolTransport {
     if (action !== "notify") throw new Error(`telegram_unsupported_action_${action}`);
     const chatId = await this.resolveChatId();
     if (!chatId) throw new Error("telegram_chat_id_not_configured");
-    const response = await fetch(`https://api.telegram.org/bot${credential}/sendMessage`, {
+    const response = await guardedFetch(`https://api.telegram.org/bot${credential}/sendMessage`, {
       method: "POST", headers: { "content-type": "application/json" },
       body: JSON.stringify({ chat_id: chatId, text: String(parameters["message"]) })
     });
@@ -920,12 +921,12 @@ export class SlackTransport implements ToolTransport {
   ): Promise<{ ok: boolean; error?: string; [key: string]: JsonValue | boolean | string | undefined }> {
     const url = `https://slack.com/api/${method}`;
     const response = useJsonBody
-      ? await fetch(url, {
+      ? await guardedFetch(url, {
           method: "POST",
           headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
           body: JSON.stringify(params)
         })
-      : await fetch(`${url}?${new URLSearchParams(params as Record<string, string>).toString()}`, {
+      : await guardedFetch(`${url}?${new URLSearchParams(params as Record<string, string>).toString()}`, {
           headers: { authorization: `Bearer ${credential}` }
         });
     if (!response.ok) throw new Error(`slack_error_${response.status}`);
@@ -979,7 +980,7 @@ export class SlackTransport implements ToolTransport {
  */
 export class DiscordTransport implements ToolTransport {
   private async call(path: string, credential: string, init?: RequestInit): Promise<JsonValue> {
-    const response = await fetch(`https://discord.com/api/v10${path}`, {
+    const response = await guardedFetch(`https://discord.com/api/v10${path}`, {
       ...init,
       headers: { ...init?.headers, authorization: `Bot ${credential}` }
     });
@@ -1042,7 +1043,7 @@ export class TwilioTransport implements ToolTransport {
   private async call(path: string, credential: string, init?: RequestInit): Promise<JsonValue> {
     const accountSid = await this.accountSid();
     if (!accountSid) throw new Error("twilio_account_sid_not_configured");
-    const response = await fetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}${path}`, {
+    const response = await guardedFetch(`https://api.twilio.com/2010-04-01/Accounts/${accountSid}${path}`, {
       ...init,
       headers: { ...init?.headers, authorization: `Basic ${Buffer.from(`${accountSid}:${credential}`).toString("base64")}` }
     });
@@ -1094,7 +1095,7 @@ export class TwilioTransport implements ToolTransport {
  */
 export class BraveSearchTransport implements ToolTransport {
   private async call(path: string, credential: string, params: Record<string, string>): Promise<JsonValue> {
-    const response = await fetch(`https://api.search.brave.com/res/v1/${path}?${new URLSearchParams(params).toString()}`, {
+    const response = await guardedFetch(`https://api.search.brave.com/res/v1/${path}?${new URLSearchParams(params).toString()}`, {
       headers: { "x-subscription-token": credential, accept: "application/json" }
     });
     if (!response.ok) throw new Error(`brave_search_error_${response.status}`);
@@ -1149,7 +1150,7 @@ export class SentryTransport implements ToolTransport {
   private async call(path: string, credential: string, init?: RequestInit): Promise<JsonValue> {
     const orgSlug = await this.orgSlug();
     if (!orgSlug) throw new Error("sentry_org_slug_not_configured");
-    const response = await fetch(`https://sentry.io/api/0/organizations/${orgSlug}${path}`, {
+    const response = await guardedFetch(`https://sentry.io/api/0/organizations/${orgSlug}${path}`, {
       ...init,
       headers: { ...init?.headers, authorization: `Bearer ${credential}`, "content-type": "application/json" }
     });
@@ -1219,7 +1220,7 @@ export class SentryTransport implements ToolTransport {
 export class VercelTransport implements ToolTransport {
   async invoke(action: string, _parameters: Record<string, JsonValue>, credential: string) {
     if (action !== "read_deployments") throw new Error(`vercel_unsupported_action_${action}`);
-    const response = await fetch("https://api.vercel.com/v6/deployments?limit=20", {
+    const response = await guardedFetch("https://api.vercel.com/v6/deployments?limit=20", {
       headers: { authorization: `Bearer ${credential}` }
     });
     if (!response.ok) throw new Error(`vercel_error_${response.status}`);
@@ -1311,7 +1312,7 @@ async function githubFetchRaw(url: string, init: RequestInit, controller?: Githu
   const attemptAll = async (): Promise<Response> => {
     let lastError: GithubApiError | undefined;
     for (let attempt = 1; attempt <= GITHUB_MAX_ATTEMPTS; attempt++) {
-      const response = await fetch(url, init);
+      const response = await guardedFetch(url, init);
       if (response.ok) {
         if (controller) await controller.recordOutcome(mutation, response.status, response.headers, "");
         return response;
@@ -1397,7 +1398,7 @@ export class GithubTransport implements ToolTransport {
   constructor(private readonly rateLimitController?: GithubRateLimitController) {}
 
   async invoke(action: string, parameters: Record<string, JsonValue>, credential: string, _context?: ToolInvocationContext) {
-    const repo = ghRequireString(parameters, "repo");
+    const repo = assertGithubRepoSlug(ghRequireString(parameters, "repo"));
     const base = `https://api.github.com/repos/${repo}`;
     const headers = githubHeaders(credential);
     const writeHeaders = githubHeaders(credential, { "content-type": "application/json" });
@@ -1777,7 +1778,7 @@ export class TelegramCommandPoller {
     if (this.polling) return; // se §1 i klassekommentaren - aldri to samtidige poll
     this.polling = true;
     try {
-      const response = await fetch(`https://api.telegram.org/bot${this.token}/getUpdates?offset=${this.offset}&timeout=0`);
+      const response = await guardedFetch(`https://api.telegram.org/bot${this.token}/getUpdates?offset=${this.offset}&timeout=0`);
       if (!response.ok) return;
       const body = (await response.json()) as { result?: Array<{ update_id: number; message?: { chat: { id: number }; text?: string } }> };
       for (const update of body.result ?? []) {
@@ -1882,7 +1883,7 @@ export class TelegramCommandPoller {
  */
 export class GoogleMapsTransport implements ToolTransport {
   private async call(params: Record<string, string>, credential: string): Promise<JsonValue> {
-    const response = await fetch(`https://maps.googleapis.com/maps/api/geocode/json?${new URLSearchParams({ ...params, key: credential }).toString()}`);
+    const response = await guardedFetch(`https://maps.googleapis.com/maps/api/geocode/json?${new URLSearchParams({ ...params, key: credential }).toString()}`);
     if (!response.ok) throw new Error(`google_maps_error_${response.status}`);
     return (await response.json()) as JsonValue;
   }
@@ -1929,7 +1930,7 @@ export class GoogleSheetsTransport implements ToolTransport {
     const token = await googleAccessToken(credential);
     const spreadsheetId = String(parameters["spreadsheet_id"]);
     if (action === "list_sheets") {
-      const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}?fields=sheets.properties`, {
+      const response = await guardedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodePathSegment(spreadsheetId, "spreadsheet_id")}?fields=sheets.properties`, {
         headers: { authorization: `Bearer ${token}` }
       });
       if (!response.ok) throw new Error(`sheets_error_${response.status}`);
@@ -1938,7 +1939,7 @@ export class GoogleSheetsTransport implements ToolTransport {
     }
     if (action === "read_range") {
       const range = encodeURIComponent(String(parameters["range"]));
-      const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}`, {
+      const response = await guardedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodePathSegment(spreadsheetId, "spreadsheet_id")}/values/${range}`, {
         headers: { authorization: `Bearer ${token}` }
       });
       if (!response.ok) throw new Error(`sheets_error_${response.status}`);
@@ -1947,7 +1948,7 @@ export class GoogleSheetsTransport implements ToolTransport {
     }
     if (action === "update_range") {
       const range = encodeURIComponent(String(parameters["range"]));
-      const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}?valueInputOption=USER_ENTERED`, {
+      const response = await guardedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodePathSegment(spreadsheetId, "spreadsheet_id")}/values/${range}?valueInputOption=USER_ENTERED`, {
         method: "PUT",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
         body: JSON.stringify({ range: String(parameters["range"]), values: parameters["values"] })
@@ -1957,7 +1958,7 @@ export class GoogleSheetsTransport implements ToolTransport {
     }
     if (action === "append_row") {
       const range = encodeURIComponent(String(parameters["range"]));
-      const response = await fetch(`https://sheets.googleapis.com/v4/spreadsheets/${spreadsheetId}/values/${range}:append?valueInputOption=USER_ENTERED`, {
+      const response = await guardedFetch(`https://sheets.googleapis.com/v4/spreadsheets/${encodePathSegment(spreadsheetId, "spreadsheet_id")}/values/${range}:append?valueInputOption=USER_ENTERED`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}`, "content-type": "application/json" },
         body: JSON.stringify({ range: String(parameters["range"]), values: [parameters["row"]] })
@@ -1990,7 +1991,7 @@ export class TavilyTransport implements ToolTransport {
   private async call(topic: "general" | "news", parameters: Record<string, JsonValue>, credential: string): Promise<JsonValue> {
     const body: Record<string, JsonValue> = { api_key: credential, query: String(parameters["query"]), topic };
     if (parameters["max_results"] !== undefined) body["max_results"] = parameters["max_results"];
-    const response = await fetch("https://api.tavily.com/search", {
+    const response = await guardedFetch("https://api.tavily.com/search", {
       method: "POST",
       headers: { "content-type": "application/json" },
       body: JSON.stringify(body)
@@ -2028,7 +2029,7 @@ export class TavilyTransport implements ToolTransport {
  */
 export class ExaTransport implements ToolTransport {
   private async post(path: string, body: Record<string, JsonValue>, credential: string): Promise<JsonValue> {
-    const response = await fetch(`https://api.exa.ai${path}`, {
+    const response = await guardedFetch(`https://api.exa.ai${path}`, {
       method: "POST",
       headers: { "content-type": "application/json", "x-api-key": credential },
       body: JSON.stringify(body)
@@ -2068,7 +2069,7 @@ export class ExaTransport implements ToolTransport {
  */
 export class GooglePlacesTransport implements ToolTransport {
   private async call(path: string, params: Record<string, string>, credential: string): Promise<JsonValue> {
-    const response = await fetch(`https://maps.googleapis.com/maps/api/place/${path}/json?${new URLSearchParams({ ...params, key: credential }).toString()}`);
+    const response = await guardedFetch(`https://maps.googleapis.com/maps/api/place/${path}/json?${new URLSearchParams({ ...params, key: credential }).toString()}`);
     if (!response.ok) throw new Error(`google_places_error_${response.status}`);
     return (await response.json()) as JsonValue;
   }
@@ -2101,7 +2102,7 @@ export class GooglePlacesTransport implements ToolTransport {
  */
 export class GoogleRoutesTransport implements ToolTransport {
   private async call(path: string, params: Record<string, string>, credential: string): Promise<JsonValue> {
-    const response = await fetch(`https://maps.googleapis.com/maps/api/${path}/json?${new URLSearchParams({ ...params, key: credential }).toString()}`);
+    const response = await guardedFetch(`https://maps.googleapis.com/maps/api/${path}/json?${new URLSearchParams({ ...params, key: credential }).toString()}`);
     if (!response.ok) throw new Error(`google_routes_error_${response.status}`);
     return (await response.json()) as JsonValue;
   }
@@ -2137,7 +2138,7 @@ export class GrafanaTransport implements ToolTransport {
   private async call(path: string, credential: string): Promise<JsonValue> {
     const baseUrl = await this.baseUrl();
     if (!baseUrl) throw new Error("grafana_base_url_not_configured");
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
+    const response = await guardedFetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
       headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" }
     });
     if (!response.ok) throw new Error(`grafana_error_${response.status}`);
@@ -2176,7 +2177,7 @@ export class PrometheusTransport implements ToolTransport {
   private async call(path: string, params: Record<string, string>, credential: string): Promise<JsonValue> {
     const baseUrl = await this.baseUrl();
     if (!baseUrl) throw new Error("prometheus_base_url_not_configured");
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}${path}?${new URLSearchParams(params).toString()}`, {
+    const response = await guardedFetch(`${baseUrl.replace(/\/$/, "")}${path}?${new URLSearchParams(params).toString()}`, {
       headers: { authorization: `Bearer ${credential}` }
     });
     if (!response.ok) throw new Error(`prometheus_error_${response.status}`);
@@ -2217,7 +2218,7 @@ export class PrometheusTransport implements ToolTransport {
  */
 export class DropboxTransport implements ToolTransport {
   private async call(path: string, body: Record<string, JsonValue>, credential: string): Promise<JsonValue> {
-    const response = await fetch(`https://api.dropboxapi.com/2/files/${path}`, {
+    const response = await guardedFetch(`https://api.dropboxapi.com/2/files/${path}`, {
       method: "POST",
       headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
       body: JSON.stringify(body)
@@ -2241,7 +2242,7 @@ export class DropboxTransport implements ToolTransport {
 
 export class NotionTransport implements ToolTransport {
   private async call(method: "POST", path: string, body: Record<string, JsonValue>, credential: string): Promise<JsonValue> {
-    const response = await fetch(`https://api.notion.com/v1/${path}`, {
+    const response = await guardedFetch(`https://api.notion.com/v1/${path}`, {
       method,
       headers: {
         authorization: `Bearer ${credential}`,
@@ -2274,7 +2275,7 @@ export class NotionTransport implements ToolTransport {
 
 export class OneDriveTransport implements ToolTransport {
   private async call(method: "GET" | "POST", path: string, body: Record<string, JsonValue> | undefined, credential: string): Promise<JsonValue> {
-    const response = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
+    const response = await guardedFetch(`https://graph.microsoft.com/v1.0${path}`, {
       method,
       headers: {
         authorization: `Bearer ${credential}`,
@@ -2308,7 +2309,7 @@ export class OneDriveTransport implements ToolTransport {
 
 export class MicrosoftOutlookTransport implements ToolTransport {
   private async call(method: "GET" | "POST", path: string, body: Record<string, JsonValue> | undefined, credential: string): Promise<JsonValue | null> {
-    const response = await fetch(`https://graph.microsoft.com/v1.0${path}`, {
+    const response = await guardedFetch(`https://graph.microsoft.com/v1.0${path}`, {
       method,
       headers: {
         authorization: `Bearer ${credential}`,
@@ -2347,7 +2348,7 @@ export class N8nTransport implements ToolTransport {
   private async call(method: "GET" | "POST", path: string, credential: string): Promise<JsonValue> {
     const baseUrl = await this.baseUrl();
     if (!baseUrl) throw new Error("n8n_base_url_not_configured");
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
+    const response = await guardedFetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
       method,
       headers: { "X-N8N-API-KEY": credential, "content-type": "application/json" }
     });
@@ -2378,7 +2379,7 @@ async function spotifyAccessToken(refreshToken: string): Promise<string> {
   const clientId = process.env["JARVIS_SPOTIFY_CLIENT_ID"];
   const clientSecret = process.env["JARVIS_SPOTIFY_CLIENT_SECRET"];
   if (!clientId || !clientSecret) throw new Error("spotify_oauth_client_not_configured");
-  const response = await fetch("https://accounts.spotify.com/api/token", {
+  const response = await guardedFetch("https://accounts.spotify.com/api/token", {
     method: "POST",
     headers: {
       "content-type": "application/x-www-form-urlencoded",
@@ -2394,7 +2395,7 @@ export class SpotifyTransport implements ToolTransport {
   async invoke(action: string, parameters: Record<string, JsonValue>, credential: string) {
     const token = await spotifyAccessToken(credential);
     if (action === "get_currently_playing") {
-      const response = await fetch("https://api.spotify.com/v1/me/player/currently-playing", {
+      const response = await guardedFetch("https://api.spotify.com/v1/me/player/currently-playing", {
         headers: { authorization: `Bearer ${token}` }
       });
       if (response.status === 204) return { data: null };
@@ -2403,7 +2404,7 @@ export class SpotifyTransport implements ToolTransport {
     }
     if (action === "add_to_queue") {
       const uri = encodeURIComponent(String(parameters["uri"]));
-      const response = await fetch(`https://api.spotify.com/v1/me/player/queue?uri=${uri}`, {
+      const response = await guardedFetch(`https://api.spotify.com/v1/me/player/queue?uri=${uri}`, {
         method: "POST",
         headers: { authorization: `Bearer ${token}` }
       });
@@ -2429,7 +2430,7 @@ export class WhatsAppTransport implements ToolTransport {
     const phoneNumberId = await this.phoneNumberId();
     if (!phoneNumberId) throw new Error("whatsapp_phone_number_id_not_configured");
     if (action === "get_phone_number_info") {
-      const response = await fetch(
+      const response = await guardedFetch(
         `https://graph.facebook.com/v20.0/${phoneNumberId}?fields=display_phone_number,verified_name`,
         { headers: { authorization: `Bearer ${credential}` } }
       );
@@ -2437,7 +2438,7 @@ export class WhatsAppTransport implements ToolTransport {
       return { data: (await response.json()) as JsonValue };
     }
     if (action === "notify") {
-      const response = await fetch(`https://graph.facebook.com/v20.0/${phoneNumberId}/messages`, {
+      const response = await guardedFetch(`https://graph.facebook.com/v20.0/${phoneNumberId}/messages`, {
         method: "POST",
         headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
         body: JSON.stringify({
@@ -2467,7 +2468,7 @@ export class MakeTransport implements ToolTransport {
   private async call(method: "GET" | "POST", path: string, credential: string): Promise<JsonValue> {
     const baseUrl = await this.baseUrl();
     if (!baseUrl) throw new Error("make_base_url_not_configured");
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
+    const response = await guardedFetch(`${baseUrl.replace(/\/$/, "")}${path}`, {
       method,
       headers: { authorization: `Token ${credential}`, "content-type": "application/json" }
     });
@@ -2500,7 +2501,7 @@ export class MakeTransport implements ToolTransport {
 export class OpenAIImagesTransport implements ToolTransport {
   async invoke(action: string, parameters: Record<string, JsonValue>, credential: string) {
     if (action === "list_models") {
-      const response = await fetch("https://api.openai.com/v1/models", {
+      const response = await guardedFetch("https://api.openai.com/v1/models", {
         headers: { authorization: `Bearer ${credential}` }
       });
       if (!response.ok) throw new Error(`openai_images_error_${response.status}`);
@@ -2508,7 +2509,7 @@ export class OpenAIImagesTransport implements ToolTransport {
       return { data: body.data ?? null };
     }
     if (action === "generate_image") {
-      const response = await fetch("https://api.openai.com/v1/images/generations", {
+      const response = await guardedFetch("https://api.openai.com/v1/images/generations", {
         method: "POST",
         headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
         body: JSON.stringify({
@@ -2554,7 +2555,7 @@ export class TelnyxTransport implements ToolTransport {
   constructor(private readonly fromNumber: () => Promise<string | null>) {}
 
   private async call(path: string, credential: string, init?: RequestInit): Promise<JsonValue> {
-    const response = await fetch(`https://api.telnyx.com/v2${path}`, {
+    const response = await guardedFetch(`https://api.telnyx.com/v2${path}`, {
       ...init,
       headers: { ...init?.headers, authorization: `Bearer ${credential}` }
     });
@@ -2611,7 +2612,7 @@ export class TelnyxTransport implements ToolTransport {
  */
 export class RunwayTransport implements ToolTransport {
   private async call(path: string, credential: string, init?: RequestInit): Promise<JsonValue> {
-    const response = await fetch(`https://api.dev.runwayml.com/v1${path}`, {
+    const response = await guardedFetch(`https://api.dev.runwayml.com/v1${path}`, {
       ...init,
       headers: { ...init?.headers, authorization: `Bearer ${credential}`, "X-Runway-Version": "2024-11-06" }
     });
@@ -2695,7 +2696,7 @@ export class KlingTransport implements ToolTransport {
     const accessKey = await this.accessKey();
     if (!accessKey) throw new Error("kling_access_key_not_configured");
     const token = encodeKlingJwt(accessKey, credential);
-    const response = await fetch(`https://api.klingai.com${path}`, {
+    const response = await guardedFetch(`https://api.klingai.com${path}`, {
       ...init,
       headers: { ...init?.headers, authorization: `Bearer ${token}` }
     });
@@ -2759,7 +2760,7 @@ export class KlingTransport implements ToolTransport {
  */
 export class GoogleVeoTransport implements ToolTransport {
   private async call(path: string, credential: string, init?: RequestInit): Promise<JsonValue> {
-    const response = await fetch(`https://generativelanguage.googleapis.com${path}`, {
+    const response = await guardedFetch(`https://generativelanguage.googleapis.com${path}`, {
       ...init,
       headers: { ...init?.headers, "x-goog-api-key": credential }
     });
@@ -2842,7 +2843,7 @@ export class HiggsfieldTransport implements ToolTransport {
   private async call(path: string, credential: string, init?: RequestInit): Promise<JsonValue> {
     const keyId = await this.keyId();
     if (!keyId) throw new Error("higgsfield_key_id_not_configured");
-    const response = await fetch(`https://api.higgsfield.ai${path}`, {
+    const response = await guardedFetch(`https://api.higgsfield.ai${path}`, {
       ...init,
       headers: { ...init?.headers, authorization: `Key ${keyId}:${credential}` }
     });
@@ -2891,7 +2892,7 @@ export class HiggsfieldTransport implements ToolTransport {
  */
 export class TodoistTransport implements ToolTransport {
   private async call(method: "GET" | "POST", path: string, body: Record<string, JsonValue> | undefined, credential: string): Promise<JsonValue | null> {
-    const response = await fetch(`https://api.todoist.com/api/v1${path}`, {
+    const response = await guardedFetch(`https://api.todoist.com/api/v1${path}`, {
       method,
       headers: {
         authorization: `Bearer ${credential}`,
@@ -2967,7 +2968,7 @@ export class TrelloTransport implements ToolTransport {
     const key = await this.apiKey();
     if (!key) throw new Error("trello_api_key_not_configured");
     const separator = path.includes("?") ? "&" : "?";
-    const response = await fetch(`https://api.trello.com/1${path}${separator}key=${encodeURIComponent(key)}&token=${encodeURIComponent(credential)}`, {
+    const response = await guardedFetch(`https://api.trello.com/1${path}${separator}key=${encodeURIComponent(key)}&token=${encodeURIComponent(credential)}`, {
       method,
       headers: { "content-type": "application/json" },
       ...(body ? { body: JSON.stringify(body) } : {})
@@ -3046,7 +3047,7 @@ export class JiraTransport implements ToolTransport {
     if (!baseUrl) throw new Error("jira_base_url_not_configured");
     const email = await this.email();
     if (!email) throw new Error("jira_email_not_configured");
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/rest/api/3${path}`, {
+    const response = await guardedFetch(`${baseUrl.replace(/\/$/, "")}/rest/api/3${path}`, {
       method,
       headers: {
         authorization: `Basic ${Buffer.from(`${email}:${credential}`).toString("base64")}`,
@@ -3120,7 +3121,7 @@ export class JiraTransport implements ToolTransport {
  */
 export class LinearTransport implements ToolTransport {
   private async call(query: string, variables: Record<string, JsonValue>, credential: string): Promise<JsonValue> {
-    const response = await fetch("https://api.linear.app/graphql", {
+    const response = await guardedFetch("https://api.linear.app/graphql", {
       method: "POST",
       headers: { authorization: credential, "content-type": "application/json" },
       body: JSON.stringify({ query, variables })
@@ -3201,7 +3202,7 @@ export class LinearTransport implements ToolTransport {
  */
 export class HubSpotTransport implements ToolTransport {
   private async call(method: "GET" | "POST" | "PATCH", path: string, body: Record<string, JsonValue> | undefined, credential: string): Promise<JsonValue> {
-    const response = await fetch(`https://api.hubapi.com/crm/v3${path}`, {
+    const response = await guardedFetch(`https://api.hubapi.com/crm/v3${path}`, {
       method,
       headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
       ...(body ? { body: JSON.stringify(body) } : {})
@@ -3271,7 +3272,7 @@ export class PipedriveTransport implements ToolTransport {
   private async call(method: "GET" | "POST" | "PATCH", path: string, body: Record<string, JsonValue> | undefined, credential: string): Promise<JsonValue> {
     const baseUrl = await this.baseUrl();
     if (!baseUrl) throw new Error("pipedrive_base_url_not_configured");
-    const response = await fetch(`${baseUrl.replace(/\/$/, "")}/api/v2${path}`, {
+    const response = await guardedFetch(`${baseUrl.replace(/\/$/, "")}/api/v2${path}`, {
       method,
       headers: { "x-api-token": credential, "content-type": "application/json" },
       ...(body ? { body: JSON.stringify(body) } : {})

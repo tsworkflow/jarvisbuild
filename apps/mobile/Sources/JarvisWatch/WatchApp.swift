@@ -73,18 +73,20 @@ final class WatchModel: ObservableObject {
     func approve() async {
         do {
             let key = try DeviceKeys.loadOrCreate()
-            let approval = try ApprovalSigner.sign(action: "critical_demo", parameters: ["confirm": "true"],
+            let approval = try ApprovalSigner.sign(toolId: "demo", action: "critical_demo", parameters: ["confirm": "true"],
+                                                   tenantId: "tenant-personal", personId: "person-tobias",
+                                                   approverPersonId: "person-tobias",
                                                    deviceId: deviceId, validSeconds: 60, key: key)
             struct Decision: Codable { let decision: String }
             let result: Decision = try await client.post("tools/critical-demo", body: [
-                "identity": ["person_id": "person-tobias", "tenant_id": "tenant-personal",
-                             "memory_space": "personal", "session_id": "sess-watch",
-                             "device_id": deviceId, "channel": "watch", "auth_strength": "signed"],
+                 "grant_token": try await client.currentGrantToken(),
                 "parameters": ["confirm": "true"],
-                "approval": ["action": approval.action, "parameters": approval.parameters,
-                             "expires_at": approval.expires_at, "nonce": approval.nonce,
+                "approval": ["tool_id": approval.tool_id, "action": approval.action,
+                             "parameters_hash": approval.parameters_hash, "tenant_id": approval.tenant_id,
+                             "person_id": approval.person_id, "approver_person_id": approval.approver_person_id,
                              "approving_device_id": approval.approving_device_id,
-                             "signature": approval.signature]
+                             "issued_at": approval.issued_at, "expires_at": approval.expires_at,
+                             "nonce": approval.nonce, "signature": approval.signature]
             ])
             status = "Godkjenning: \(result.decision)"
         } catch { status = "Avvist: \(error.localizedDescription)" }

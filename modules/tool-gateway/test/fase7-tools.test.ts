@@ -1,11 +1,11 @@
-import { generateKeyPairSync, randomUUID, sign } from "node:crypto";
+import { generateKeyPairSync, randomUUID } from "node:crypto";
 import { mkdtemp } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import EmbeddedPostgres from "embedded-postgres";
 import pg from "pg";
 import { afterAll, beforeAll, describe, expect, it } from "vitest";
-import { approvalSigningBytes, type ApprovalPayload, type IdentityContext, type SignedApproval } from "@jarvis/contracts";
+import { signApproval, type ApprovalPayload, type IdentityContext, type SignedApproval } from "@jarvis/contracts";
 import { createPool, PgApprovalStore, runMigrations } from "@jarvis/core";
 import { startLeasedEmbeddedPostgres } from "@jarvis/core/testing";
 import { LocalHashEmbedding, MemoryRetriever, MemoryWriter, RuleBasedExtractor } from "@jarvis/memory";
@@ -40,16 +40,12 @@ const testSecrets: SecretProvider = {
   }
 };
 
-function approval(overrides: Partial<ApprovalPayload> = {}): SignedApproval {
-  const payload: ApprovalPayload = {
-    action: "send",
+function approval(overrides: Partial<Omit<ApprovalPayload, "parameters_hash">> = {}): SignedApproval {
+  return signApproval(watchKeys.privateKey, {
+    tool_id: "email", action: "send", tenant_id: "tenant-a", person_id: "person-tobias", approver_person_id: "person-tobias",
     parameters: { to: "kunde@example.com", subject: "Tilbud", body: "Hei" },
-    expires_at: new Date(Date.now() + 60_000).toISOString(),
-    nonce: `nonce-${randomUUID()}`,
-    approving_device_id: "watch-1",
-    ...overrides
-  };
-  return { ...payload, signature: sign(null, approvalSigningBytes(payload), watchKeys.privateKey).toString("base64") };
+    nonce: `nonce-${randomUUID()}`, approving_device_id: "watch-1", ...overrides
+  });
 }
 
 beforeAll(async () => {
@@ -75,7 +71,7 @@ beforeAll(async () => {
   appPool = createPool({ host: "127.0.0.1", port: PORT, database: "jarvis_test", user: "jarvis_test", password: "pw2" });
 
   const devices = new InMemoryDeviceRegistry();
-  devices.register("watch-1", watchKeys.publicKey);
+  devices.register("watch-1", watchKeys.publicKey, { tenant_id: "tenant-a", person_id: "person-tobias" });
   killSwitch = new KillSwitch();
   policy = new PolicyGateway({
     devices, nonces: new PgApprovalStore(appPool), killSwitch,

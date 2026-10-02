@@ -142,5 +142,9 @@ ENV JARVIS_WHISPER_MODEL=/opt/whisper/ggml-small.bin
 ENV JARVIS_PIPER_BIN=/opt/piper/piper
 ENV JARVIS_PIPER_MODEL=/opt/piper/voices/no_NO-talesyntese-medium.onnx
 
+# REMEDIERING DEL 2 (JARVIS-010): IKKE-ROOT (`node`, uid 1000 i node-imaget). Modeller/binærer under /opt er
+# lesbare/kjørbare for alle (lastet ned som root); whisper skriver kun midlertidige filer til tmpfs (/tmp).
+USER node
+
 EXPOSE 3020
 CMD ["node", "--experimental-transform-types", "apps/voice-gateway/src/main.ts"]

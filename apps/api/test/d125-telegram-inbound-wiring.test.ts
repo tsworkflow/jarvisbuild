@@ -71,16 +71,19 @@ describe("D-125 B: identitet/tenant/space/sesjon bindes KUN fra betrodd server-s
 
   it("B2: hver autoritetsverdi kommer fra env/seed-konstanter - ingen fra en melding", () => {
     expect(authorityConstruction).toContain('owner_chat_id: process.env["JARVIS_TELEGRAM_CHAT_ID"]');
-    expect(authorityConstruction).toContain('tenant_id: process.env["JARVIS_TENANT_ID"]');
-    expect(authorityConstruction).toContain('person_id: process.env["JARVIS_OWNER_PERSON_ID"]');
+    // Remediering del 2 (JARVIS-065): tenant/person kommer fra den ENE validerte eier-konfigen (`owner`), ikke fra env-defaults.
+    expect(authorityConstruction).toContain("tenant_id: owner.tenant_id");
+    expect(authorityConstruction).toContain("person_id: owner.owner_person_id");
     expect(authorityConstruction).toContain('device_id: "jarvis-core"');
     expect(authorityConstruction).toContain('memory_space: "personal"');
   });
 
-  it("B3: person-ID-en utledes med SAMME uttrykk som seedOwner() bruker", () => {
+  it("B3: person-ID-en utledes fra SAMME validerte eier-konfig som seedOwner() bruker (ingen hardkodet default)", () => {
     const seed = readFileSync(fileURLToPath(new URL("../src/seed.ts", import.meta.url)), "utf8");
-    expect(seed).toContain('process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias"');
-    expect(authorityConstruction).toContain('process.env["JARVIS_OWNER_PERSON_ID"] ?? "person-tobias"');
+    expect(seed).toContain("owner.owner_person_id");
+    expect(authorityConstruction).toContain("owner.owner_person_id");
+    expect(seed).not.toContain("person-tobias");
+    expect(authorityConstruction).not.toContain("person-tobias");
   });
 
   it("B4: autoriteten kalles med KUN chat_id - meldingsteksten er aldri et argument", () => {

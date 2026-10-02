@@ -80,7 +80,8 @@ const pem = (pair: KeyPair): string => pair.publicKey.export({ type: "spki", for
 beforeAll(async () => {
   const databaseDir = await mkdtemp(join(tmpdir(), "jarvis-pg-d131-"));
   const leasedPostgres = await startLeasedEmbeddedPostgres((port) =>
-    new EmbeddedPostgres({ databaseDir, user: "postgres", password: "test-superuser-pw", port, persistent: false }),
+    new EmbeddedPostgres({ databaseDir, user: "postgres", password: "test-superuser-pw", port, persistent: false })
+,
     // D-141 B: proben maa bruke instansens EGNE credentials.
     { identity: { user: "postgres", password: "test-superuser-pw", database: "postgres" } }
   );
@@ -281,7 +282,7 @@ describe("A (funn 1): samtalen deles på tvers av kanaler, autoriteten gjør det
     // Et forsøk på å oppgi memory_space i kroppen er ikke «ignorert» - det er avvist.
     const res = await post("/chat", { grant_token: grant.grant_token, message: "hei", memory_space: "health" });
     expect(res.status).toBe(400);
-    expect(res.body["error"]).toBe("malformed_request");
+    expect(res.body["error"]).toBe("identity_field_forbidden");
   });
 });
 
@@ -355,11 +356,11 @@ describe("C (funn 1): en rå sesjons-ID - også fra en annen transport - kan ALD
       session_id: grant.session_id, tenant_id: TENANT_A, memory_space: "personal", channel: "web", message: "hei"
     });
     expect(chat.status).toBe(400);
-    expect(chat.body["error"]).toBe("malformed_request");
+    expect(chat.body["error"]).toBe("identity_field_forbidden");
 
     const brief = await post("/brief", { session_id: grant.session_id, tenant_id: TENANT_A, memory_space: "personal", channel: "api" });
     expect(brief.status).toBe(400);
-    expect(brief.body["error"]).toBe("malformed_request");
+    expect(brief.body["error"]).toBe("identity_field_forbidden");
   });
 
   it("REGRESJON: en transport UTEN enhetsbevis (bot-token-stien) kan ikke skaffe seg et grant", async () => {

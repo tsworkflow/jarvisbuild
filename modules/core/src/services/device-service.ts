@@ -1,7 +1,7 @@
 import { createHash, createPublicKey, randomUUID, verify, type KeyObject } from "node:crypto";
 import type pg from "pg";
 import type { IdentityContext } from "@jarvis/contracts";
-import type { DeviceRegistry } from "@jarvis/policy";
+import type { ApproverDevice, DeviceRegistry } from "@jarvis/policy";
 import { withTenantTransaction } from "../db/pool.ts";
 import { writeAudit } from "./audit-writer.ts";
 
@@ -18,11 +18,52 @@ export function fingerprintPem(pem: string): string {
 }
 
 /**
+ * JARVIS-051: eneste nøkkeltype verifikatoren faktisk kan verifisere er Ed25519. Tidligere
+ * ble enhver gyldig PEM akseptert ved innrullering, og en RSA-enhet leste senere som en
+ * «ugyldig signatur» - en feil som først viste seg ved bruk. Validert nå, ved innrullering.
+ */
+export class UnsupportedDeviceKeyError extends Error {
+  constructor(readonly keyType: string | undefined) {
+    super(`unsupported_key_type:${keyType ?? "unknown"}`);
+    this.name = "UnsupportedDeviceKeyError";
+  }
+}
+
+/** Kastes når en tidligere tilbakekalt nøkkel forsøkes rullet inn på nytt (under hvilken som helst device_id). */
+export class RevokedDeviceKeyError extends Error {
+  constructor() {
+    super("key_revoked");
+    this.name = "RevokedDeviceKeyError";
+  }
+}
+
+export function assertEd25519PublicKeyPem(pem: string): KeyObject {
+  const key = createPublicKey(pem); // kaster på ugyldig PEM
+  if (key.type !== "public" || key.asymmetricKeyType !== "ed25519") {
+    throw new UnsupportedDeviceKeyError(key.asymmetricKeyType);
+  }
+  return key;
+}
+
+/**
  * Enhetsidentitet (fase 8-fundament): enheter registreres server-side med
  * offentlig nøkkel (genereres på enheten - Secure Enclave på iPhone/Watch).
  * Klient-sendt device_id alene stoles aldri på: forhøyet auth_strength og
  * klasse D-godkjenninger krever signatur fra REGISTRERT enhetsnøkkel.
  */
+/** Kastes av `issueChallenge()` når antallet utestående nonces er over grensen (JARVIS-063). */
+export class ChallengeLimitError extends Error {
+  constructor(readonly scope: "global") {
+    super(`challenge_limit_exceeded:${scope}`);
+    this.name = "ChallengeLimitError";
+  }
+}
+
+/** Øvre grenser for utestående (ikke-forbrukte, ikke-utløpte) nonces. Minnet er aldri ubegrenset. */
+const MAX_OUTSTANDING_CHALLENGES = 5_000;
+const MAX_OUTSTANDING_CHALLENGES_PER_DEVICE = 10;
+const CHALLENGE_TTL_MS = 60_000;
+
 export class DeviceService {
   private readonly challenges = new Map<string, { device_id: string; expires: number }>();
 
@@ -48,7 +89,10 @@ export class DeviceService {
     principal: { tenant_id: string; person_id: string },
     device: { device_id: string; kind: string; public_key_pem: string }
   ): Promise<boolean> {
-    createPublicKey(device.public_key_pem); // valider PEM før lagring
+    assertEd25519PublicKeyPem(device.public_key_pem); // valider PEM OG nøkkeltype før lagring
+    if (await this.isKeyRevokedOn(client, principal.tenant_id, device.public_key_pem)) {
+      throw new RevokedDeviceKeyError();
+    }
     let result;
     try {
       result = await client.query(
@@ -57,6 +101,7 @@ export class DeviceService {
          ON CONFLICT (device_id) DO UPDATE
            SET public_key_pem = EXCLUDED.public_key_pem, kind = EXCLUDED.kind
          WHERE devices.tenant_id = EXCLUDED.tenant_id AND devices.person_id = EXCLUDED.person_id
+           AND devices.revoked_at IS NULL
          RETURNING device_id`,
         [device.device_id, principal.tenant_id, principal.person_id, device.kind, device.public_key_pem]
       );
@@ -108,10 +153,87 @@ export class DeviceService {
     }
   }
 
+  /**
+   * JARVIS-050: PERMANENT tilbakekalling av en enhet, på en eksisterende transaksjonsklient.
+   * Raden låses (`FOR UPDATE`), nøkkelen fjernes OG fingerprinten lagres i `revoked_device_keys`
+   * (samme nøkkel kan ikke rulles inn igjen under en ny device_id), og `revoked_at` settes
+   * (`registerDeviceOn()` nekter å skrive en revokert rad på nytt). Returnerer `false` når enheten
+   * ikke finnes i tenanten; er den allerede revokert er kallet idempotent (`true`).
+   */
+  async revokeDeviceKeyOn(
+    client: pg.PoolClient,
+    principal: { tenant_id: string; device_id: string },
+    reason: string
+  ): Promise<boolean> {
+    const row = await client.query(
+      "SELECT public_key_pem, revoked_at FROM devices WHERE device_id = $1 AND tenant_id = $2 FOR UPDATE",
+      [principal.device_id, principal.tenant_id]
+    );
+    const device = row.rows[0] as { public_key_pem: string | null; revoked_at: Date | null } | undefined;
+    if (!device) {
+      return false;
+    }
+    if (device.revoked_at !== null) {
+      return true;
+    }
+    const fingerprint = device.public_key_pem ? fingerprintPem(device.public_key_pem) : null;
+    await client.query(
+      `UPDATE devices SET revoked_at = now(), revoked_key_fingerprint = $3, revoked_reason = $4, public_key_pem = NULL
+        WHERE device_id = $1 AND tenant_id = $2`,
+      [principal.device_id, principal.tenant_id, fingerprint, reason]
+    );
+    if (fingerprint) {
+      await client.query(
+        `INSERT INTO revoked_device_keys (tenant_id, key_fingerprint, device_id, reason)
+         VALUES ($1, $2, $3, $4) ON CONFLICT (tenant_id, key_fingerprint) DO NOTHING`,
+        [principal.tenant_id, fingerprint, principal.device_id, reason]
+      );
+    }
+    return true;
+  }
+
+  /** `true` hvis nøkkelen (fingerprint) tidligere er tilbakekalt i denne tenanten. */
+  async isKeyRevokedOn(client: pg.PoolClient, tenantId: string, publicKeyPem: string): Promise<boolean> {
+    const result = await client.query(
+      "SELECT 1 FROM revoked_device_keys WHERE tenant_id = $1 AND key_fingerprint = $2",
+      [tenantId, fingerprintPem(publicKeyPem)]
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
+  /** `true` hvis `device_id` finnes i tenanten og er tilbakekalt. */
+  async isDeviceRevokedOn(client: pg.PoolClient, tenantId: string, deviceId: string): Promise<boolean> {
+    const result = await client.query(
+      "SELECT 1 FROM devices WHERE device_id = $1 AND tenant_id = $2 AND revoked_at IS NOT NULL",
+      [deviceId, tenantId]
+    );
+    return (result.rowCount ?? 0) > 0;
+  }
+
   /** Challenge-respons: klienten signerer en engangs-nonce med enhetsnøkkelen. */
   issueChallenge(deviceId: string): string {
+    const now = Date.now();
+    // Utløpte nonces ryddes FØR grensen sjekkes - ellers ville en rolig periode
+    // etter et flom-forsøk fortsatt vært avvist.
+    const mine: string[] = [];
+    for (const [nonce, entry] of this.challenges) {
+      if (entry.expires < now) {
+        this.challenges.delete(nonce);
+      } else if (entry.device_id === deviceId) {
+        mine.push(nonce);
+      }
+    }
+    // Per enhet EVIKTES den eldste i stedet for å avvise: ellers kunne en
+    // uautentisert klient som kjenner en device_id låse eieren ute fra å få
+    // en nonce (DoS). Map bevarer innsettingsrekkefølgen, så `mine[0]` er eldst.
+    while (mine.length >= MAX_OUTSTANDING_CHALLENGES_PER_DEVICE) {
+      this.challenges.delete(mine.shift() as string);
+    }
+    if (this.challenges.size >= MAX_OUTSTANDING_CHALLENGES) {
+      throw new ChallengeLimitError("global");
+    }
     const challenge = `chal-${randomUUID()}`;
-    this.challenges.set(challenge, { device_id: deviceId, expires: Date.now() + 60_000 });
+    this.challenges.set(challenge, { device_id: deviceId, expires: now + CHALLENGE_TTL_MS });
     return challenge;
   }
 
@@ -175,7 +297,8 @@ export class DeviceService {
     principal: { tenant_id: string; person_id: string; device_id: string }
   ): Promise<{ fingerprint: string } | null> {
     const result = await client.query(
-      "SELECT public_key_pem FROM devices WHERE device_id = $1 AND tenant_id = $2 AND person_id = $3 FOR UPDATE",
+      `SELECT public_key_pem FROM devices
+        WHERE device_id = $1 AND tenant_id = $2 AND person_id = $3 AND revoked_at IS NULL FOR UPDATE`,
       [principal.device_id, principal.tenant_id, principal.person_id]
     );
     const pem = (result.rows[0] as { public_key_pem: string | null } | undefined)?.public_key_pem;
@@ -193,8 +316,8 @@ export class DeviceService {
     // bevise seg. En enhet uten `public_key_pem` (tilbakekalt) gir `null`.
     const result = await withTenantTransaction(this.pool, tenantId, (client) =>
       personId === undefined
-        ? client.query("SELECT public_key_pem FROM devices WHERE device_id = $1", [deviceId])
-        : client.query("SELECT public_key_pem FROM devices WHERE device_id = $1 AND person_id = $2", [
+        ? client.query("SELECT public_key_pem FROM devices WHERE device_id = $1 AND revoked_at IS NULL", [deviceId])
+        : client.query("SELECT public_key_pem FROM devices WHERE device_id = $1 AND person_id = $2 AND revoked_at IS NULL", [
             deviceId,
             personId
           ])
@@ -205,30 +328,47 @@ export class DeviceService {
 }
 
 /**
- * DB-basert enhetsregister for Policy Gateway: godkjenninger verifiseres mot
- * registrerte nøkler i devices-tabellen (tenant-RLS gjelder). Synkron
- * oppslags-cache med eksplisitt refresh (policy-grensesnittet er synkront).
+ * DB-basert enhetsregister for Policy Gateway (tenant-RLS gjelder).
+ *
+ * JARVIS-050/051: oppslaget gjøres MOT DATABASEN ved HVER verifisering - ingen cache. En revokert
+ * enhet slutter dermed å kunne godkjenne umiddelbart, i ALLE prosesser (api og worker), uten at
+ * noen må huske å kalle `refresh()`. `tenantId`-argumentet beholdes kun for bakoverkompatibilitet;
+ * oppslaget er alltid bundet til tenanten i selve forespørselen (flertenant).
  */
 export class PgDeviceRegistry implements DeviceRegistry {
-  private readonly cache = new Map<string, KeyObject>();
-
   constructor(
     private readonly pool: pg.Pool,
-    private readonly tenantId: string
+    _legacyTenantId?: string
   ) {}
 
+  /** Bakoverkompatibel no-op: det finnes ingen cache å friske opp. */
   async refresh(): Promise<void> {
-    const result = await withTenantTransaction(this.pool, this.tenantId, (client) =>
-      client.query("SELECT device_id, public_key_pem FROM devices WHERE public_key_pem IS NOT NULL")
-    );
-    this.cache.clear();
-    for (const row of result.rows as Array<{ device_id: string; public_key_pem: string }>) {
-      this.cache.set(row.device_id, createPublicKey(row.public_key_pem));
-    }
+    return;
   }
 
-  publicKeyFor(deviceId: string): KeyObject | undefined {
-    return this.cache.get(deviceId);
+  async approverFor(deviceId: string, tenantId: string): Promise<ApproverDevice | undefined> {
+    const result = await withTenantTransaction(this.pool, tenantId, (client) =>
+      client.query(
+        `SELECT d.public_key_pem, d.tenant_id, d.person_id, (pt.role = 'owner') AS is_owner
+           FROM devices d
+           JOIN person_tenants pt ON pt.person_id = d.person_id AND pt.tenant_id = d.tenant_id
+          WHERE d.device_id = $1 AND d.tenant_id = $2 AND d.revoked_at IS NULL AND d.public_key_pem IS NOT NULL`,
+        [deviceId, tenantId]
+      )
+    );
+    const row = result.rows[0] as
+      | { public_key_pem: string; tenant_id: string; person_id: string; is_owner: boolean }
+      | undefined;
+    if (!row) {
+      return undefined;
+    }
+    let key: KeyObject;
+    try {
+      key = assertEd25519PublicKeyPem(row.public_key_pem);
+    } catch {
+      return undefined;
+    }
+    return { key, tenant_id: row.tenant_id, person_id: row.person_id, is_owner: row.is_owner };
   }
 }
 

@@ -342,7 +342,9 @@ export const CONNECTOR_REGISTRY: ConnectorDefinition[] = [
     live_test: { tool_id: "telegram", action: "get_bot_info", parameters: () => ({}) }
   },
   {
-    id: "vercel", display_name: "Vercel", category: "tool_gateway", credential_refs: ["JARVIS_VERCEL_TOKEN"],
+    // D-388: full D-41-kapabilitet (prosjekter, deployment, env-nøkler, upsert_env, promote/rollback/cancel).
+    // `JARVIS_VERCEL_TEAM_ID` er valgfri team-kontekst (ikke en secret, men listet så dashbordet kan sette den).
+    id: "vercel", display_name: "Vercel", category: "tool_gateway", credential_refs: ["JARVIS_VERCEL_TOKEN", "JARVIS_VERCEL_TEAM_ID"],
     live_test: { tool_id: "vercel", action: "read_deployments", parameters: () => ({}) }
   },
   { id: "anthropic", display_name: "Anthropic API", category: "model_provider", credential_refs: ["ANTHROPIC_API_KEY"] },
@@ -426,7 +428,10 @@ export const CONNECTOR_REGISTRY: ConnectorDefinition[] = [
     // ikke kunstig innsnevret til read-only. Oppdatert i place (var en
     // D-232 backlog-plassholder) - ALDRI en ny, separat oppføring med samme
     // id (D-293-disiplinen).
-    id: "onedrive", display_name: "OneDrive", category: "tool_gateway", credential_refs: ["JARVIS_ONEDRIVE_TOKEN"],
+    // D-388: Graph-tokens utløper etter ~1 t - `JARVIS_MICROSOFT_REFRESH_TOKEN` + app-registrering gir automatisk
+    // fornyelse (delt med Outlook); `JARVIS_ONEDRIVE_TOKEN` er fortsatt gyldig som statisk fallback.
+    id: "onedrive", display_name: "OneDrive", category: "tool_gateway",
+    credential_refs: ["JARVIS_ONEDRIVE_TOKEN", "JARVIS_MICROSOFT_REFRESH_TOKEN", "JARVIS_MICROSOFT_CLIENT_ID", "JARVIS_MICROSOFT_CLIENT_SECRET", "JARVIS_MICROSOFT_TENANT_ID"],
     live_test: { tool_id: "onedrive", action: "list_folder", parameters: () => ({}) }
   },
   {
@@ -437,8 +442,10 @@ export const CONNECTOR_REGISTRY: ConnectorDefinition[] = [
     // ikke kunstig innsnevret til read-only. Oppdatert i place (var en
     // D-232 backlog-plassholder) - ALDRI en ny, separat oppføring med samme
     // id (D-293-lærdommen).
+    // D-388: Dropbox-tokens er kortlivede (4 t) - `JARVIS_DROPBOX_REFRESH_TOKEN` + app-nøkkel/-hemmelighet gir
+    // automatisk fornyelse; `JARVIS_DROPBOX_TOKEN` er fortsatt gyldig som statisk fallback. Pluss upload/download.
     id: "dropbox", display_name: "Dropbox", category: "tool_gateway",
-    credential_refs: ["JARVIS_DROPBOX_TOKEN"],
+    credential_refs: ["JARVIS_DROPBOX_TOKEN", "JARVIS_DROPBOX_REFRESH_TOKEN", "JARVIS_DROPBOX_APP_KEY", "JARVIS_DROPBOX_APP_SECRET"],
     live_test: { tool_id: "dropbox", action: "list_folder", parameters: () => ({ path: "" }) }
   },
   {
@@ -467,7 +474,9 @@ export const CONNECTOR_REGISTRY: ConnectorDefinition[] = [
     // klasse D (samme begrunnelse som Gmail sin `email.send`) - ikke
     // reverserbar. Oppdatert i place (var en D-232 backlog-plassholder) -
     // ALDRI en ny, separat oppføring med samme id (D-293-disiplinen).
-    id: "microsoft_outlook", display_name: "Microsoft Outlook", category: "tool_gateway", credential_refs: ["JARVIS_OUTLOOK_TOKEN"],
+    // D-388: samme Microsoft-refresh-konfig som OneDrive (én app-registrering, ett refresh-token for Graph).
+    id: "microsoft_outlook", display_name: "Microsoft Outlook", category: "tool_gateway",
+    credential_refs: ["JARVIS_OUTLOOK_TOKEN", "JARVIS_MICROSOFT_REFRESH_TOKEN", "JARVIS_MICROSOFT_CLIENT_ID", "JARVIS_MICROSOFT_CLIENT_SECRET", "JARVIS_MICROSOFT_TENANT_ID"],
     live_test: { tool_id: "microsoft_outlook", action: "list_messages", parameters: () => ({ max: 5 }) }
   },
   // D-318: "Microsoft 365" fjernet som egen backlog-plassholder (var her som
@@ -859,6 +868,15 @@ export const CONNECTOR_REGISTRY: ConnectorDefinition[] = [
   { id: "apple_shortcuts", display_name: "Apple Shortcuts", category: "backlog", credential_refs: ["JARVIS_APPLE_SHORTCUTS_TOKEN"] },
 
   // §4.10 Smart hjem
+  {
+    // D-388 (lukker JARVIS-061/D-336): ekte `HomeAssistantTransport` bak `homeAssistantTools()` (tool_id
+    // "home-assistant"). `JARVIS_HA_BASE_URL` (f.eks. http://homeassistant.local:8123) og romkartet `JARVIS_HA_ROOMS`
+    // (JSON: site_id → room_id → {light, climate, lock, alarm} entity-id-er) er konfig, ikke hemmeligheter, men listes
+    // så dashbordet kan sette dem. `list_states` er en ren lesing og trygg tilkoblingstest.
+    id: "home_assistant", display_name: "Home Assistant", category: "tool_gateway",
+    credential_refs: ["JARVIS_HA_TOKEN", "JARVIS_HA_BASE_URL", "JARVIS_HA_ROOMS"],
+    live_test: { tool_id: "home-assistant", action: "list_states", parameters: () => ({ domain: "light" }) }
+  },
   { id: "homekit", display_name: "HomeKit", category: "backlog", credential_refs: ["JARVIS_HOMEKIT_TOKEN"] },
   // D-336: 'philips_hue' sin plassholder FJERNET HELT - ALLEREDE_DEKKET.
   // Enhetsstyring går via Home Assistant (INTEGRATIONS.md §5, CLAUDE.md regel

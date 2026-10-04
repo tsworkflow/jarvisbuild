@@ -47,6 +47,7 @@ export const CHAT_ACT_TIER: ReadonlyArray<{ readonly tool_id: string; readonly a
   { tool_id: "drive", action: "trash" },
   { tool_id: "drive", action: "update_content" },
   { tool_id: "dropbox", action: "create_folder" },
+  { tool_id: "dropbox", action: "upload_file" },
   { tool_id: "finance_neonomics", action: "complete_consent_callback" },
   { tool_id: "finance_neonomics", action: "create_consent" },
   { tool_id: "finance_neonomics", action: "reconcile_bank_transactions" },
@@ -111,6 +112,8 @@ export const CHAT_ACT_TIER: ReadonlyArray<{ readonly tool_id: string; readonly a
   { tool_id: "growth", action: "set_budget" },
   { tool_id: "growth", action: "set_campaign_status" },
   { tool_id: "growth", action: "set_experiment_status" },
+  { tool_id: "home-assistant", action: "climate_set" },
+  { tool_id: "home-assistant", action: "light_set" },
   { tool_id: "hubspot", action: "create_object" },
   { tool_id: "hubspot", action: "update_object" },
   { tool_id: "jira", action: "create_issue" },
@@ -122,6 +125,7 @@ export const CHAT_ACT_TIER: ReadonlyArray<{ readonly tool_id: string; readonly a
   { tool_id: "metaads", action: "sync_campaigns" },
   { tool_id: "metaads", action: "sync_spend" },
   { tool_id: "n8n", action: "activate_workflow" },
+  { tool_id: "n8n", action: "deactivate_workflow" },
   { tool_id: "notion", action: "create_page" },
   { tool_id: "onedrive", action: "create_folder" },
   { tool_id: "operations", action: "create_runbook" },
@@ -163,7 +167,11 @@ export const CHAT_ACT_TIER: ReadonlyArray<{ readonly tool_id: string; readonly a
   { tool_id: "trello", action: "close_card" },
   { tool_id: "trello", action: "create_card" },
   { tool_id: "trello", action: "reopen_card" },
-  { tool_id: "trello", action: "update_card" }
+  { tool_id: "trello", action: "update_card" },
+  { tool_id: "vercel", action: "cancel_deployment" },
+  { tool_id: "vercel", action: "promote_deployment" },
+  { tool_id: "vercel", action: "rollback_deployment" },
+  { tool_id: "vercel", action: "upsert_env" }
 ];
 
 /** `tool_id.action`-nøkler for rask oppslag. */

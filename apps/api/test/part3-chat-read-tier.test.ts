@@ -15,6 +15,7 @@ import {
   bindScopeFields,
   buildToolManifest,
   firstWaveTools,
+  homeAssistantTools,
   memoryToolDefinitions,
   resolveModelToolSurface,
   selectSurfaceTools,
@@ -27,6 +28,8 @@ function productionDefinitions(): ToolDefinition[] {
   const fakeGw = { list: () => [], health: new Map(), hasSecret: async () => true } as unknown as ToolGateway;
   return firstWaveTools({}, {
     additionalTools: [
+      // D-388: Home Assistant registreres i produksjon via additionalTools (main.ts/worker-main.ts) - speiles her.
+      ...homeAssistantTools({ invoke: async () => ({}) } as never),
       ...executiveToolDefinitions(new ExecutiveTransport(new ExecutiveService(fakeGw))),
       ...ownerControlsToolDefinitions(new OwnerControlsTransport({} as never, fakeGw)),
       ...governanceToolDefinitions(new GovernanceTransport({} as never)),

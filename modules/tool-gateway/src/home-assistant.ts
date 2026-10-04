@@ -22,6 +22,14 @@ export function homeAssistantTools(transport: ToolTransport = new UnconfiguredHt
   };
   return [
     {
+      // D-388: oversikt over alle entiteter (valgfritt filtrert på domene, f.eks. "light") - brukes som tilkoblingstest
+      // (`live_test`) og for at Charlie kan finne riktig entity_id før en romkart-oppføring lages.
+      ...base, action: "list_states", description: "List alle enheter i Home Assistant med nåværende tilstand (GET /api/states, valgfritt domene-filter)",
+      input_schema: record({ domain: z.string().regex(/^[a-z_]+$/).optional() }), capability_class: "A",
+      scopes: ["states:read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, rate_limit_per_minute: 30, output_trust: "untrusted"
+    },
+    {
       ...base, action: "read_state", description: "Les enhets-/romtilstand",
       input_schema: record({ ...room, entity: z.string().optional() }), capability_class: "A",
       scopes: ["states:read"], reversible: true, rollback_procedure: "ingen (lesing)",

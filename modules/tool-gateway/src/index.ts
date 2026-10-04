@@ -2,6 +2,8 @@ export * from "./gateway.ts";
 export * from "./class-d-pipeline.ts";
 export * from "./integrations.ts";
 export * from "./home-assistant.ts";
+export * from "./home-assistant-transport.ts";
+export * from "./oauth-refresh.ts";
 export * from "./daily-brief.ts";
 export * from "./live-transports.ts";
 export * from "./docker-transport.ts";

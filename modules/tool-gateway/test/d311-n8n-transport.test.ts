@@ -81,7 +81,7 @@ describe("C: en ukjent handling kaster 'n8n_unsupported_action_<action>'", () =>
 describe("D: firstWaveTools() registrerer n8n.list_workflows som klasse A og n8n.activate_workflow som klasse B", () => {
   it("list_workflows er klasse A (ren lesing), activate_workflow er klasse B (ekte skrivehandling, D-41)", () => {
     const tools = firstWaveTools().filter((t) => t.tool_id === "n8n");
-    expect(tools.map((t) => t.action).sort()).toEqual(["activate_workflow", "list_workflows"]);
+    expect(tools.map((t) => t.action).sort()).toEqual(["activate_workflow", "deactivate_workflow", "list_workflows"]);
     const listWorkflows = tools.find((t) => t.action === "list_workflows")!;
     expect(listWorkflows.capability_class).toBe("A");
     expect(listWorkflows.credential_ref).toBe("JARVIS_N8N_API_KEY");

@@ -58,7 +58,7 @@ import {
   DailyBrief, DockerTransport, EnvSecretProvider, FallbackSecretProvider, GceTransport, McpZapierTransport, BrowserGatewayTransport, GithubRateLimitController, GithubTransport,
   CHAT_ACT_TIER, CHAT_READ_TIER, GmailTransport, GoogleCalendarTransport, InfisicalSecretProvider, MemorySearchTransport, MeshToolExecutor, assertManifestInvariants, buildToolManifest, describeSurfaceCatalog, memoryToolDefinitions, selectSurfaceTools,
   MODEL_SURFACE_ALLOWLIST, MODEL_SURFACE_QUARANTINE_WRITES, resolveModelToolSurface, PgGithubRateLimitStore,
-  PgTelegramOffsetStore, TelegramCommandPoller, createTurnContext, jobIdentityFor, telegramClassDNotifier, TelegramTransport, SlackTransport, DiscordTransport, TwilioTransport, BraveSearchTransport, SentryTransport, GoogleMapsTransport, GoogleSheetsTransport, TavilyTransport, ExaTransport, GooglePlacesTransport, GoogleRoutesTransport, GrafanaTransport, PrometheusTransport, DropboxTransport, NotionTransport, OneDriveTransport, MicrosoftOutlookTransport, N8nTransport, SpotifyTransport, WhatsAppTransport, MakeTransport, OpenAIImagesTransport, TelnyxTransport, RunwayTransport, KlingTransport, GoogleVeoTransport, HiggsfieldTransport, TodoistTransport, TrelloTransport, JiraTransport, LinearTransport, HubSpotTransport, PipedriveTransport, ToolGateway, VercelTransport, buildStatusSource, calendarSource, driveTransportsIfConfigured,
+  PgTelegramOffsetStore, TelegramCommandPoller, createTurnContext, jobIdentityFor, telegramClassDNotifier, TelegramTransport, SlackTransport, DiscordTransport, TwilioTransport, BraveSearchTransport, SentryTransport, GoogleMapsTransport, GoogleSheetsTransport, TavilyTransport, ExaTransport, GooglePlacesTransport, GoogleRoutesTransport, GrafanaTransport, PrometheusTransport, DropboxTransport, NotionTransport, OneDriveTransport, MicrosoftOutlookTransport, N8nTransport, SpotifyTransport, WhatsAppTransport, MakeTransport, OpenAIImagesTransport, TelnyxTransport, RunwayTransport, KlingTransport, GoogleVeoTransport, HiggsfieldTransport, TodoistTransport, TrelloTransport, JiraTransport, LinearTransport, HubSpotTransport, PipedriveTransport, ToolGateway, VercelTransport, HomeAssistantTransport, MicrosoftGraphAuth, homeAssistantTools, buildStatusSource, calendarSource, driveTransportsIfConfigured,
   emailSource, firstWaveTools, parseDockerMutationTargets, parseGceMutationTargets, tasksSource, DailyScheduler, runConnectorHealthSweep
 } from "@jarvis/tool-gateway";
 import {
@@ -584,6 +584,14 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
   // startes IKKE, `self_modification.*` registreres IKKE i ToolGateway og
   // Telegram-kommandoene `/godkjenn`/`/avvis` har ingen handler. Modulen
   // `@jarvis/self-modification` ligger urørt og dormant i repoet.
+  // D-388: én delt Microsoft Graph-auth for OneDrive + Outlook (se wiring under).
+  const microsoftGraphAuth = new MicrosoftGraphAuth({
+    refreshToken: () => readSecretProvider.get("JARVIS_MICROSOFT_REFRESH_TOKEN"),
+    clientId: () => readSecretProvider.get("JARVIS_MICROSOFT_CLIENT_ID"),
+    clientSecret: () => readSecretProvider.get("JARVIS_MICROSOFT_CLIENT_SECRET"),
+    tenant: () => readSecretProvider.get("JARVIS_MICROSOFT_TENANT_ID"),
+    persist: (value) => toolGateway.setSecret("JARVIS_MICROSOFT_REFRESH_TOKEN", value)
+  });
   for (const tool of firstWaveTools({
     email: new GmailTransport(), calendar: new GoogleCalendarTransport(),
     github: new GithubTransport(githubRateLimitController),
@@ -659,7 +667,13 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     // over - Dropbox sender `path` som et vanlig handlingsparameter per
     // kall, ingen resolver-closure nødvendig (ETT fast access-token, INGEN
     // OAuth-refresh-flyt som Google-familien).
-    dropbox: new DropboxTransport(),
+    // D-388: Dropbox-tokens er kortlivede - refresh-token + app-nøkkel/-hemmelighet via secret-kjeden gir automatisk
+    // fornyelse (cachet i minnet); uten refresh-konfig brukes `JARVIS_DROPBOX_TOKEN` statisk som før.
+    dropbox: new DropboxTransport({
+      refreshToken: () => readSecretProvider.get("JARVIS_DROPBOX_REFRESH_TOKEN"),
+      appKey: () => readSecretProvider.get("JARVIS_DROPBOX_APP_KEY"),
+      appSecret: () => readSecretProvider.get("JARVIS_DROPBOX_APP_SECRET")
+    }),
     // D-308: ren tom-konstruktør, samme mønster som Dropbox over - Notion
     // sender `Notion-Version` som en FAST header inni transporten selv
     // (ingen resolver-closure nødvendig, ETT fast integrasjonstoken).
@@ -667,17 +681,22 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     // D-309: ren tom-konstruktør, samme mønster som Dropbox/Notion over -
     // OneDrive sender `path`/`name` som vanlige handlingsparametere per
     // kall, ingen resolver-closure nødvendig.
-    onedrive: new OneDriveTransport(),
-    // D-310: ren tom-konstruktør, samme mønster som OneDrive over -
-    // Microsoft Outlook sender parametere per handling, ingen
-    // resolver-closure nødvendig.
-    microsoft_outlook: new MicrosoftOutlookTransport(),
+    // D-388: OneDrive og Outlook deler ÉN Microsoft Graph-auth (refresh-token + app-registrering + tenant via
+    // secret-kjeden). Microsoft roterer refresh-tokenet i hvert svar - det nye skrives tilbake via
+    // `toolGateway.setSecret()` (Infisical). Uten refresh-konfig brukes de statiske tokenene som før.
+    onedrive: new OneDriveTransport(microsoftGraphAuth),
+    microsoft_outlook: new MicrosoftOutlookTransport(microsoftGraphAuth),
     // D-311: SAMME resolver-mot-readSecretProvider-mønster som Grafana/
     // Prometheus - n8n er også typisk selv-hostet.
     n8n: new N8nTransport(() => readSecretProvider.get("JARVIS_N8N_API_BASE_URL")),
     // D-313: tom konstruktør - `client_id`/`client_secret` leses direkte fra
     // env inne i `spotifyAccessToken()` (delt app-konfig, ikke en resolver).
-    spotify: new SpotifyTransport(),
+    // D-388: client_id/secret via secret-kjeden (ikke fryst fra env), access-token cachet, rotert refresh-token persisteres.
+    spotify: new SpotifyTransport({
+      clientId: () => readSecretProvider.get("JARVIS_SPOTIFY_CLIENT_ID"),
+      clientSecret: () => readSecretProvider.get("JARVIS_SPOTIFY_CLIENT_SECRET"),
+      persist: (value) => toolGateway.setSecret("JARVIS_SPOTIFY_REFRESH_TOKEN", value)
+    }),
     // D-314: `phone_number_id` er Jarvis sin egen avsenderidentitet - SAMME
     // resolver-mot-readSecretProvider-mønster som Telegram sin chat_id.
     whatsapp: new WhatsAppTransport(() => readSecretProvider.get("JARVIS_WHATSAPP_PHONE_NUMBER_ID")),
@@ -742,7 +761,10 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     // (ubetinget `vercel_not_configured`), uansett credential-tilstand (se
     // `live-transports.ts` sin `VercelTransport`-doc-kommentar for full
     // begrunnelse).
-    vercel: new VercelTransport(),
+    // D-388: valgfri team-kontekst (`teamId` på alle kall) via secret-kjeden.
+    vercel: new VercelTransport(() => readSecretProvider.get("JARVIS_VERCEL_TEAM_ID")),
+    // D-388 (JARVIS-061): ekte Home Assistant-transport - base-URL + romkart via secret-kjeden, token via credential_ref.
+    "home-assistant": new HomeAssistantTransport(() => readSecretProvider.get("JARVIS_HA_BASE_URL"), () => readSecretProvider.get("JARVIS_HA_ROOMS")),
     // D-90 (UA-4 NESTE SLICE): Business OS × Marketing Memory-integrasjon -
     // `marketingMemoryBriefSource(growthService)` injiseres her (app-laget,
     // som allerede har BEGGE tjenestene) i stedet for at `@jarvis/business`
@@ -853,6 +875,9 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     // selv bruker - IKKE en kopi. Registrert i SAMME liste/løkke som
     // `situations`/`executive`, ingen parallell registreringsvei.
     additionalTools: [
+      // D-388 (JARVIS-061): Home Assistant-verktøyene (definert siden fase 9, aldri registrert) registreres nå med den
+      // ekte transporten fra `transports`-recorden over - samme ene register-løkke som resten.
+      ...homeAssistantTools(new HomeAssistantTransport(() => readSecretProvider.get("JARVIS_HA_BASE_URL"), () => readSecretProvider.get("JARVIS_HA_ROOMS"))),
       ...situationsToolDefinitions(new SituationsTransport(situationEngine, situationDomainPauses)),
       ...executiveToolDefinitions(new ExecutiveTransport(new ExecutiveService(toolGateway, { modelSurface: [...MODEL_SURFACE_ALLOWLIST, ...MODEL_SURFACE_QUARANTINE_WRITES, ...CHAT_READ_TIER, ...CHAT_ACT_TIER] }))),
       // D-174 (B2): tredje konstruktør-argument kobler `owner_controls.revoke_device`

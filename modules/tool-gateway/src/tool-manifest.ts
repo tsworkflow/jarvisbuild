@@ -65,8 +65,8 @@ export const OWNER_ONLY_NAMESPACES: ReadonlySet<string> = new Set([
 const PAID_MEDIA = new Set(["openai_images", "runway", "kling", "google_veo", "higgsfield"]);
 const SMS_LIKE = new Set(["twilio", "telnyx", "whatsapp"]);
 const METERED = new Set(["brave_search", "tavily", "exa", "google_maps", "google_places", "google_routes"]);
-const OWNER_CONFIGURED_URL = new Set(["jira", "pipedrive", "grafana", "prometheus", "n8n", "make", "finance_wallester"]);
-const PRIVATE_NAMESPACES = new Set(["email", "calendar", "drive", "gmail", "microsoft_outlook", "memory", "dropbox", "onedrive", "notion", "slack", "discord", "telegram", "whatsapp", "twilio", "telnyx", "google_sheets", "spotify"]);
+const OWNER_CONFIGURED_URL = new Set(["jira", "pipedrive", "grafana", "prometheus", "n8n", "make", "finance_wallester", "home-assistant"]);
+const PRIVATE_NAMESPACES = new Set(["email", "calendar", "drive", "gmail", "microsoft_outlook", "memory", "dropbox", "onedrive", "notion", "slack", "discord", "telegram", "whatsapp", "twilio", "telnyx", "google_sheets", "spotify", "home-assistant"]);
 
 const READ_VERB = /^(read|get|list|search|query|find|fetch|lookup|describe|inspect|check|status|test|health|count|summar|show|view|browse|explain|rank|evaluate|resolve|upcoming|due|overdue|cancellable|campaign_performance|geocode|reverse_geocode|web_search|news_search|extract|screenshot|navigate)/;
 const SEND_VERB = /(^|_)(send|notify|reply|forward|publish|broadcast|invite|call_tool|run_scenario|activate_workflow|dispatch_workflow|comment_on_issue|rerun_workflow_run|cancel_workflow_run)(_|$)/;
@@ -79,6 +79,8 @@ const EFFECT_OVERRIDES: Record<string, Effect> = {
   [k("memory", "propose")]: "write",
   [k("memory", "search")]: "read",
   [k("memory", "list_proposals")]: "read",
+  // D-388: nedlasting er lesing av innhold (ingen ekstern effekt).
+  [k("dropbox", "download_file")]: "read",
   [k("tasks", "create_task")]: "write",
   [k("github", "create_branch")]: "write",
   [k("github", "merge_pr")]: "control",

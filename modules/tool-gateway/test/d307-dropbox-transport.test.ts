@@ -69,16 +69,16 @@ describe("B: DropboxTransport.invoke('create_folder', ...) - POST /2/files/creat
 });
 
 describe("C: en ukjent handling kaster 'dropbox_unsupported_action_<action>'", () => {
-  it("invoke('upload', ...) kaster (bevisst utenfor scope - binær filinnhold-overføring, se D-307-notat)", async () => {
+  it("invoke('move', ...) kaster (D-388: upload_file/download_file er nå bygget, se d388-connectors-v2.test.ts)", async () => {
     const transport = new DropboxTransport();
-    await expect(transport.invoke("upload", { path: "/f.txt" }, "tok")).rejects.toThrow("dropbox_unsupported_action_upload");
+    await expect(transport.invoke("move", { path: "/f.txt" }, "tok")).rejects.toThrow("dropbox_unsupported_action_move");
   });
 });
 
 describe("D: firstWaveTools() registrerer dropbox.list_folder som klasse A og dropbox.create_folder som klasse B", () => {
   it("list_folder er klasse A (ren lesing), create_folder er klasse B (ekte skrivehandling, D-41)", () => {
     const tools = firstWaveTools().filter((t) => t.tool_id === "dropbox");
-    expect(tools.map((t) => t.action).sort()).toEqual(["create_folder", "list_folder"]);
+    expect(tools.map((t) => t.action).sort()).toEqual(["create_folder", "download_file", "list_folder", "upload_file"]);
     const listFolder = tools.find((t) => t.action === "list_folder")!;
     expect(listFolder.capability_class).toBe("A");
     expect(listFolder.credential_ref).toBe("JARVIS_DROPBOX_TOKEN");

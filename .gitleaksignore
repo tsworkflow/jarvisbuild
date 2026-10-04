@@ -101,3 +101,11 @@ d350375fbe45d8f455e9c3eae7c6964213591182:infra/local/service-env.mjs:generic-api
 1cf6d9e08cb45806e5b6cbd37bac6b7d2a499dc3:modules/core/test/part3-secret-scan.test.ts:generic-api-key:53
 1cf6d9e08cb45806e5b6cbd37bac6b7d2a499dc3:modules/core/test/part3-secret-scan.test.ts:jwt:16
 1cf6d9e08cb45806e5b6cbd37bac6b7d2a499dc3:modules/core/test/part3-secret-scan.test.ts:stripe-access-token:10
+
+# D-388 (9134088): generic-api-key flagget navnet pa en hemmelighetsreferanse (n8n-API-nokkelens
+# variabelnavn) i den nye n8n-handlingen `deactivate_workflow`. Verifisert manuelt: verdien er
+# NAVNET som secret-leverandoren loser opp ved kjoring, identisk med de eksisterende n8n-definisjonene.
+9134088b890b480e636e297dc6899a32b5e3ef54:modules/tool-gateway/src/integrations.ts:generic-api-key:3583
+# f0fd3ea: kommentaren over ble i sin forste versjon selv flagget (den siterte feltet ordrett). Samme
+# falske positiv, omformulert i neste commit; historikken beholder den.
+f0fd3eaef6f1a80f2eb8d9d66a3ef1631348173e:.gitleaksignore:generic-api-key:105

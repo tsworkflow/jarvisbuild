@@ -10,6 +10,7 @@ import {
 } from "./url-safety.ts";
 import { createHash, createHmac } from "node:crypto";
 import type pg from "pg";
+import { AccessTokenCache, bearerFor, dropboxRefreshExchange, microsoftRefreshExchange, spotifyRefreshExchange } from "./oauth-refresh.ts";
 import type { JsonValue } from "@jarvis/contracts";
 import type { ToolInvocationContext, ToolTransport } from "./gateway.ts";
 import { GithubRateLimitedError, GithubRateLimitController } from "./github-rate-limit-controller.ts";
@@ -1230,10 +1231,83 @@ export class SentryTransport implements ToolTransport {
  * kapabilitetsvurdering (skriv/redeploy/env vars) er BEVISST en egen,
  * separat oppgave, ikke del av denne bug-fiksen.
  */
+/**
+ * D-388 (D-41 full kapabilitet for Vercel - den «bredere vurderingen» D-248 utsatte). Endepunkter verifisert
+ * 2026-10-04 mot Vercel sin REST-API-dokumentasjon (via Vercel sitt eget dokumentasjonssøk):
+ *   - `GET /v6/deployments` (list, `projectId`/`limit`/`teamId`), `GET /v13/deployments/{id}` (én),
+ *   - `GET /v9/projects` (list), `GET /v9/projects/{idOrName}/env` (env-nøkler; VERDIER returneres ALDRI til modellen),
+ *   - `POST /v10/projects/{idOrName}/env?upsert=true` (opprett/oppdater env, klasse C),
+ *   - `POST /v10/projects/{projectId}/promote/{deploymentId}` (promoter til produksjon, bygger ikke på nytt, klasse C),
+ *   - `POST /v1/projects/{projectId}/rollback/{deploymentId}` (rull tilbake produksjon, klasse C),
+ *   - `PATCH /v12/deployments/{id}/cancel` (avbryt pågående bygg, klasse B).
+ * `teamId` legges på alle kall når `JARVIS_VERCEL_TEAM_ID` er konfigurert (resolver-closure). `redeploy` (nytt bygg
+ * fra git) er BEVISST DEFERRED - det er en infra-mutasjon med egen vurdering, ikke en promotering.
+ */
 export class VercelTransport implements ToolTransport {
-  async invoke(action: string, _parameters: Record<string, JsonValue>, credential: string) {
+  constructor(private readonly teamId: () => Promise<string | null> = async () => null) {}
+
+  private async url(path: string, query: Record<string, string> = {}): Promise<string> {
+    const params = new URLSearchParams(query);
+    const team = (await this.teamId())?.trim();
+    if (team) params.set("teamId", team);
+    const qs = params.toString();
+    return `https://api.vercel.com${path}${qs ? `?${qs}` : ""}`;
+  }
+
+  private async call(method: "GET" | "POST" | "PATCH", path: string, credential: string, query: Record<string, string> = {}, body?: JsonValue): Promise<JsonValue | null> {
+    const response = await guardedFetch(await this.url(path, query), {
+      method,
+      headers: { authorization: `Bearer ${credential}`, ...(body !== undefined ? { "content-type": "application/json" } : {}) },
+      ...(body !== undefined ? { body: JSON.stringify(body) } : {})
+    });
+    if (!response.ok) throw new Error(`vercel_error_${response.status}`);
+    const text = await response.text();
+    return text ? (JSON.parse(text) as JsonValue) : null;
+  }
+
+  async invoke(action: string, parameters: Record<string, JsonValue>, credential: string) {
+    if (action === "list_projects") {
+      const body = (await this.call("GET", "/v9/projects", credential, { limit: "50" })) as { projects?: Array<{ id: string; name: string; framework?: string | null; updatedAt?: number; link?: { type?: string; repo?: string } }> } | null;
+      return { data: { projects: (body?.projects ?? []).map((p) => ({ id: p.id, name: p.name, framework: p.framework ?? null, repo: p.link?.repo ?? null, updated_at: p.updatedAt ? new Date(p.updatedAt).toISOString() : null })) } };
+    }
+    if (action === "read_deployment") {
+      const id = String(parameters["deployment_id"]);
+      const d = (await this.call("GET", `/v13/deployments/${encodeURIComponent(id)}`, credential)) as { id?: string; uid?: string; name?: string; url?: string; readyState?: string; state?: string; target?: string | null; createdAt?: number; created?: number; meta?: Record<string, JsonValue> } | null;
+      if (!d) return { data: null };
+      return { data: { id: d.id ?? d.uid ?? id, name: d.name ?? null, url: d.url ?? null, state: d.readyState ?? d.state ?? "unknown", target: d.target ?? null, created_at: new Date(d.createdAt ?? d.created ?? 0).toISOString(), meta: d.meta ?? {} } };
+    }
+    if (action === "list_env") {
+      const project = String(parameters["project"]);
+      const body = (await this.call("GET", `/v9/projects/${encodeURIComponent(project)}/env`, credential)) as { envs?: Array<{ id: string; key: string; type?: string; target?: string[] | string; updatedAt?: number }> } | null;
+      // Verdier (også `plain`) returneres ALDRI - kun nøkkel/type/mål (D-41: lesing uten å eksponere hemmeligheter til modellen).
+      return { data: { envs: (body?.envs ?? []).map((e) => ({ id: e.id, key: e.key, type: e.type ?? null, target: Array.isArray(e.target) ? e.target : e.target ? [e.target] : [], updated_at: e.updatedAt ? new Date(e.updatedAt).toISOString() : null })) } };
+    }
+    if (action === "upsert_env") {
+      const project = String(parameters["project"]);
+      const target = Array.isArray(parameters["target"]) ? (parameters["target"] as string[]) : ["production", "preview", "development"];
+      const body = await this.call("POST", `/v10/projects/${encodeURIComponent(project)}/env`, credential, { upsert: "true" }, {
+        key: String(parameters["key"]), value: String(parameters["value"]), type: parameters["sensitive"] === false ? "plain" : "encrypted", target
+      });
+      const created = (body as { created?: { id?: string } | Array<{ id?: string }> } | null)?.created;
+      const id = Array.isArray(created) ? created[0]?.id : created?.id;
+      return { external_id: id ?? `${project}:${String(parameters["key"])}`, data: { key: String(parameters["key"]), target } };
+    }
+    if (action === "promote_deployment") {
+      await this.call("POST", `/v10/projects/${encodeURIComponent(String(parameters["project"]))}/promote/${encodeURIComponent(String(parameters["deployment_id"]))}`, credential);
+      return { external_id: `promote:${String(parameters["deployment_id"])}` };
+    }
+    if (action === "rollback_deployment") {
+      await this.call("POST", `/v1/projects/${encodeURIComponent(String(parameters["project"]))}/rollback/${encodeURIComponent(String(parameters["deployment_id"]))}`, credential);
+      return { external_id: `rollback:${String(parameters["deployment_id"])}` };
+    }
+    if (action === "cancel_deployment") {
+      const body = await this.call("PATCH", `/v12/deployments/${encodeURIComponent(String(parameters["deployment_id"]))}/cancel`, credential);
+      return { external_id: `cancel:${String(parameters["deployment_id"])}`, data: body };
+    }
     if (action !== "read_deployments") throw new Error(`vercel_unsupported_action_${action}`);
-    const response = await guardedFetch("https://api.vercel.com/v6/deployments?limit=20", {
+    const query: Record<string, string> = { limit: "20" };
+    if (typeof parameters["project"] === "string" && parameters["project"] !== "") query["projectId"] = parameters["project"];
+    const response = await guardedFetch(await this.url("/v6/deployments", query), {
       headers: { authorization: `Bearer ${credential}` }
     });
     if (!response.ok) throw new Error(`vercel_error_${response.status}`);
@@ -2349,11 +2423,50 @@ export class PrometheusTransport implements ToolTransport {
  * `Dropbox-API-Arg`-headere - en strukturelt ulik kallform, se D-307 i
  * DECISIONS_AND_ASSUMPTIONS.md).
  */
+/**
+ * D-388 (Tilkoblinger v2): (1) Dropbox sine access-tokens er KORTLIVEDE (4 t) - med `JARVIS_DROPBOX_REFRESH_TOKEN` +
+ * app-nøkkel/-hemmelighet konfigurert byttes refresh-tokenet til et cachet access-token (`oauth-refresh.ts`); uten
+ * refresh-konfig brukes `JARVIS_DROPBOX_TOKEN` statisk som før (bakoverkompatibelt). (2) D-307 sin DEFERRED
+ * filinnhold-overføring er bygget: `upload_file` (`POST content.dropboxapi.com/2/files/upload`, `Dropbox-API-Arg`-
+ * header med `{path, mode, autorename, mute}`, `application/octet-stream`-kropp) og `download_file`
+ * (`POST .../2/files/download`, metadata i `Dropbox-API-Result`-svarheaderen, bytes i kroppen). Innhold går som
+ * UTF-8-tekst eller base64 (`encoding`), begrenset til 1 MiB per kall (Dropbox sin egen enkeltkallsgrense er 150 MB;
+ * større filer er en egen upload-session-flyt og BEVISST utenfor scope).
+ */
+const DROPBOX_MAX_CONTENT_BYTES = 1_048_576;
+
+/** Kontrolltegn utenom tab/LF/CR/FF (0x09-0x0D) tyder på binært innhold - sjekkes per tegnkode (no-control-regex-lint, samme som `isAscii`). */
+function hasBinaryControlChars(value: string): boolean {
+  for (let i = 0; i < value.length; i++) {
+    const code = value.charCodeAt(i);
+    if (code <= 8 || (code >= 14 && code <= 31)) return true;
+  }
+  return false;
+}
+
+export interface DropboxTransportOptions {
+  refreshToken?: () => Promise<string | null>;
+  appKey?: () => Promise<string | null>;
+  appSecret?: () => Promise<string | null>;
+}
+
 export class DropboxTransport implements ToolTransport {
+  private readonly cache: AccessTokenCache | undefined;
+
+  constructor(private readonly options: DropboxTransportOptions = {}) {
+    this.cache = options.appKey && options.appSecret
+      ? new AccessTokenCache(dropboxRefreshExchange(options.appKey, options.appSecret), { label: "dropbox" })
+      : undefined;
+  }
+
+  private async token(credential: string): Promise<string> {
+    return (await bearerFor(credential, this.options.refreshToken, this.cache)).token;
+  }
+
   private async call(path: string, body: Record<string, JsonValue>, credential: string): Promise<JsonValue> {
     const response = await guardedFetch(`https://api.dropboxapi.com/2/files/${path}`, {
       method: "POST",
-      headers: { authorization: `Bearer ${credential}`, "content-type": "application/json" },
+      headers: { authorization: `Bearer ${await this.token(credential)}`, "content-type": "application/json" },
       body: JSON.stringify(body)
     });
     if (!response.ok) throw new Error(`dropbox_error_${response.status}`);
@@ -2368,6 +2481,45 @@ export class DropboxTransport implements ToolTransport {
     if (action === "create_folder") {
       const body = await this.call("create_folder_v2", { path: String(parameters["path"]) }, credential);
       return { data: body };
+    }
+    if (action === "upload_file") {
+      const path = String(parameters["path"]);
+      const encoding = parameters["encoding"] === "base64" ? "base64" : "utf8";
+      const bytes = Buffer.from(String(parameters["content"] ?? ""), encoding);
+      if (bytes.byteLength > DROPBOX_MAX_CONTENT_BYTES) throw new Error("dropbox_content_too_large");
+      const mode = parameters["overwrite"] === true ? "overwrite" : "add";
+      const response = await guardedFetch("https://content.dropboxapi.com/2/files/upload", {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${await this.token(credential)}`,
+          "content-type": "application/octet-stream",
+          "Dropbox-API-Arg": JSON.stringify({ path, mode, autorename: mode === "add", mute: false })
+        },
+        body: bytes
+      });
+      if (!response.ok) throw new Error(`dropbox_error_${response.status}`);
+      const meta = (await response.json()) as { id?: string; path_display?: string; size?: number };
+      return { external_id: meta.id ?? path, data: { path: meta.path_display ?? path, size: meta.size ?? bytes.byteLength } };
+    }
+    if (action === "download_file") {
+      const path = String(parameters["path"]);
+      const response = await guardedFetch("https://content.dropboxapi.com/2/files/download", {
+        method: "POST",
+        headers: { authorization: `Bearer ${await this.token(credential)}`, "Dropbox-API-Arg": JSON.stringify({ path }) }
+      });
+      if (!response.ok) throw new Error(`dropbox_error_${response.status}`);
+      const buffer = Buffer.from(await response.arrayBuffer());
+      if (buffer.byteLength > DROPBOX_MAX_CONTENT_BYTES) throw new Error("dropbox_content_too_large");
+      let meta: { name?: string; size?: number } = {};
+      try { meta = JSON.parse(response.headers.get("Dropbox-API-Result") ?? "{}") as { name?: string; size?: number }; } catch { /* metadata er valgfri */ }
+      const text = buffer.toString("utf8");
+      const isText = !text.includes("�") && !hasBinaryControlChars(text);
+      return {
+        data: {
+          name: meta.name ?? path.split("/").pop() ?? path, size: meta.size ?? buffer.byteLength,
+          encoding: isText ? "utf8" : "base64", content: isText ? text : buffer.toString("base64")
+        }
+      };
     }
     throw new Error(`dropbox_unsupported_action_${action}`);
   }
@@ -2406,12 +2558,45 @@ export class NotionTransport implements ToolTransport {
   }
 }
 
+/**
+ * D-388: Microsoft Graph sine access-tokens lever ~1 time - OneDrive og Outlook deler én `MicrosoftGraphAuth`
+ * (refresh-token + app-registrering + tenant, `oauth-refresh.ts`). Microsoft ROTERER refresh-tokenet i hvert svar;
+ * det nye persisteres via `persist` (ToolGateway.setSecret → Infisical). Uten refresh-konfig brukes den gamle
+ * statiske `JARVIS_ONEDRIVE_TOKEN`/`JARVIS_OUTLOOK_TOKEN` som før.
+ */
+export interface MicrosoftGraphAuthOptions {
+  refreshToken?: () => Promise<string | null>;
+  clientId?: () => Promise<string | null>;
+  clientSecret?: () => Promise<string | null>;
+  tenant?: () => Promise<string | null>;
+  persist?: (newRefreshToken: string) => Promise<void>;
+}
+
+export const MICROSOFT_GRAPH_SCOPE = "offline_access https://graph.microsoft.com/.default";
+
+export class MicrosoftGraphAuth {
+  private readonly cache: AccessTokenCache | undefined;
+  constructor(private readonly options: MicrosoftGraphAuthOptions = {}) {
+    this.cache = options.clientId
+      ? new AccessTokenCache(
+          microsoftRefreshExchange(options.clientId, options.clientSecret ?? (async () => null), options.tenant ?? (async () => null), MICROSOFT_GRAPH_SCOPE),
+          { label: "microsoft", ...(options.persist ? { persist: options.persist } : {}) }
+        )
+      : undefined;
+  }
+  async token(credential: string): Promise<string> {
+    return (await bearerFor(credential, this.options.refreshToken, this.cache)).token;
+  }
+}
+
 export class OneDriveTransport implements ToolTransport {
+  constructor(private readonly auth: MicrosoftGraphAuth = new MicrosoftGraphAuth()) {}
+
   private async call(method: "GET" | "POST", path: string, body: Record<string, JsonValue> | undefined, credential: string): Promise<JsonValue> {
     const response = await guardedFetch(`https://graph.microsoft.com/v1.0${path}`, {
       method,
       headers: {
-        authorization: `Bearer ${credential}`,
+        authorization: `Bearer ${await this.auth.token(credential)}`,
         "content-type": "application/json"
       },
       ...(body ? { body: JSON.stringify(body) } : {})
@@ -2441,11 +2626,13 @@ export class OneDriveTransport implements ToolTransport {
 }
 
 export class MicrosoftOutlookTransport implements ToolTransport {
+  constructor(private readonly auth: MicrosoftGraphAuth = new MicrosoftGraphAuth()) {}
+
   private async call(method: "GET" | "POST", path: string, body: Record<string, JsonValue> | undefined, credential: string): Promise<JsonValue | null> {
     const response = await guardedFetch(`https://graph.microsoft.com/v1.0${path}`, {
       method,
       headers: {
-        authorization: `Bearer ${credential}`,
+        authorization: `Bearer ${await this.auth.token(credential)}`,
         "content-type": "application/json"
       },
       ...(body ? { body: JSON.stringify(body) } : {})
@@ -2498,35 +2685,39 @@ export class N8nTransport implements ToolTransport {
       const body = await this.call("POST", `/api/v1/workflows/${encodeURIComponent(String(parameters["id"]))}/activate`, credential);
       return { data: body };
     }
+    if (action === "deactivate_workflow") {
+      // D-388: D-311 sin DEFERRED motsats til activate_workflow - `POST /api/v1/workflows/{id}/deactivate` (n8n Public API v1).
+      const body = await this.call("POST", `/api/v1/workflows/${encodeURIComponent(String(parameters["id"]))}/deactivate`, credential);
+      return { data: body };
+    }
     throw new Error(`n8n_unsupported_action_${action}`);
   }
 }
 
 /**
- * D-312: Spotify sitt Accounts-API krever en OAuth2 `refresh_token`-utveksling
- * (SAMME mønster som `googleAccessToken()` over) - `client_id`/`client_secret`
- * er DELT app-konfig (ikke per-bruker secret), lest direkte fra env, IKKE via
- * `credential_ref` (kun refresh-tokenet er den faktiske, roterte secreten).
+ * D-312: Spotify sitt Accounts-API krever en OAuth2 `refresh_token`-utveksling. D-388 (JARVIS-090 «Spotify rotated
+ * refresh ignored»): utvekslingen går nå via `AccessTokenCache` (`oauth-refresh.ts`) - access-tokenet caches til
+ * utløp (ett Accounts-kall per time, ikke per verktøykall), og et ROTERT refresh-token persisteres via `persist`.
+ * `client_id`/`client_secret` leses via resolver-closures (secret-kjeden, Infisical primær) - ikke lenger fryst fra
+ * `process.env` (JARVIS-056); uten resolvere faller den tilbake til env for bakoverkompatibilitet.
  */
-async function spotifyAccessToken(refreshToken: string): Promise<string> {
-  const clientId = process.env["JARVIS_SPOTIFY_CLIENT_ID"];
-  const clientSecret = process.env["JARVIS_SPOTIFY_CLIENT_SECRET"];
-  if (!clientId || !clientSecret) throw new Error("spotify_oauth_client_not_configured");
-  const response = await guardedFetch("https://accounts.spotify.com/api/token", {
-    method: "POST",
-    headers: {
-      "content-type": "application/x-www-form-urlencoded",
-      authorization: `Basic ${Buffer.from(`${clientId}:${clientSecret}`).toString("base64")}`
-    },
-    body: new URLSearchParams({ grant_type: "refresh_token", refresh_token: refreshToken })
-  });
-  if (!response.ok) throw new Error(`spotify_auth_failed_${response.status}`);
-  return ((await response.json()) as { access_token: string }).access_token;
+export interface SpotifyTransportOptions {
+  clientId?: () => Promise<string | null>;
+  clientSecret?: () => Promise<string | null>;
+  persist?: (newRefreshToken: string) => Promise<void>;
 }
 
 export class SpotifyTransport implements ToolTransport {
+  private readonly cache: AccessTokenCache;
+
+  constructor(options: SpotifyTransportOptions = {}) {
+    const clientId = options.clientId ?? (async () => process.env["JARVIS_SPOTIFY_CLIENT_ID"] || null);
+    const clientSecret = options.clientSecret ?? (async () => process.env["JARVIS_SPOTIFY_CLIENT_SECRET"] || null);
+    this.cache = new AccessTokenCache(spotifyRefreshExchange(clientId, clientSecret), { label: "spotify", ...(options.persist ? { persist: options.persist } : {}) });
+  }
+
   async invoke(action: string, parameters: Record<string, JsonValue>, credential: string) {
-    const token = await spotifyAccessToken(credential);
+    const token = await this.cache.get(credential);
     if (action === "get_currently_playing") {
       const response = await guardedFetch("https://api.spotify.com/v1/me/player/currently-playing", {
         headers: { authorization: `Bearer ${token}` }

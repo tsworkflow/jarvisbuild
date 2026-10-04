@@ -39,9 +39,9 @@ describe("A: apps/api/src/main.ts sprer driveTransportsIfConfigured() inn i firs
     // D-247: telegram sin chatId sendes nå som en resolver mot readSecretProvider -
     // ikke lenger en bokstavelig tom konstruktør her.
     expect(callBlock).toMatch(/telegram: new TelegramTransport\(\(\) => readSecretProvider\.get\("JARVIS_TELEGRAM_CHAT_ID"\)\)/);
-    // D-248: VercelTransport fantes aldri - lagt til som en ubetinget tom-konstruktør,
+    // D-248: VercelTransport fantes aldri. D-388: tar nå en teamId-resolver (prefiks-match under);
     // samme mønster som email/calendar/docker.
-    expect(callBlock).toContain("vercel: new VercelTransport()");
+    expect(callBlock).toContain("vercel: new VercelTransport(");
     // UA-3 P0 (D-49): femte ubetingede transport - Business OS har ingen ekstern credential
     // aa vaere "konfigurert" av, saa den registreres alltid, samme mønster som de fire over.
     // UA-3 next slice (D-53): BusinessTransport tar naa ogsaa OpenLoopService + pool.
@@ -78,7 +78,7 @@ describe("B: apps/api/src/worker-main.ts speiler NØYAKTIG samme wiring som main
     expect(callBlock).toContain("telegram: telegramTransport");
     expect(callBlock).not.toContain("telegram: new TelegramTransport()");
     // D-248: identisk VercelTransport-wiring som main.ts.
-    expect(callBlock).toContain("vercel: new VercelTransport()");
+    expect(callBlock).toContain("vercel: new VercelTransport(");
     // UA-3 business-event-linkage (D-57): BusinessTransport tar naa ogsaa toolGateway
     // (sync_business_events maa kunne kalle email/calendar via SAMME gateway-instans).
     // UA-3 profiling/scoring-slice (D-61): BusinessTransport tar naa ogsaa ScoringService.
@@ -121,13 +121,15 @@ describe("I: eksisterende Google Calendar/Gmail (+ GitHub/Telegram/Docker) wirin
     const callIdx = mainSource.indexOf("firstWaveTools({");
     const callBlock = mainSource.slice(callIdx, mainSource.indexOf("})) toolGateway.register(tool);", callIdx));
     const unconditionalConstructions = [...callBlock.matchAll(/:\s*new \w+Transport\(\)/g)];
-    expect(unconditionalConstructions).toHaveLength(26);
+    // D-388: dropbox/onedrive/microsoft_outlook/spotify/vercel tar nå refresh-/auth-/teamId-argumenter
+    // (resolver-form, samme som telegram) - teller ikke lenger som tomme konstruktører: 26→21.
+    expect(unconditionalConstructions).toHaveLength(21);
     expect(callBlock).toContain("github: new GithubTransport(githubRateLimitController)");
     expect(callBlock).toContain("docker: new DockerTransport()");
     expect(callBlock).toContain("gce: new GceTransport()");
     expect(callBlock).toContain("mcp_zapier: new McpZapierTransport()");
     expect(callBlock).toContain('browser: new BrowserGatewayTransport(process.env["JARVIS_BROWSER_GATEWAY_TOKEN_SECRET"] ?? "")');
-    expect(callBlock).toContain("vercel: new VercelTransport()");
+    expect(callBlock).toContain("vercel: new VercelTransport(");
     expect(callBlock).toContain("slack: new SlackTransport()");
     expect(callBlock).toContain("discord: new DiscordTransport()");
     expect(callBlock).toContain("brave_search: new BraveSearchTransport()");
@@ -137,11 +139,11 @@ describe("I: eksisterende Google Calendar/Gmail (+ GitHub/Telegram/Docker) wirin
     expect(callBlock).toContain("exa: new ExaTransport()");
     expect(callBlock).toContain("google_places: new GooglePlacesTransport()");
     expect(callBlock).toContain("google_routes: new GoogleRoutesTransport()");
-    expect(callBlock).toContain("dropbox: new DropboxTransport()");
+    expect(callBlock).toContain("dropbox: new DropboxTransport({");
     expect(callBlock).toContain("notion: new NotionTransport()");
-    expect(callBlock).toContain("onedrive: new OneDriveTransport()");
-    expect(callBlock).toContain("microsoft_outlook: new MicrosoftOutlookTransport()");
-    expect(callBlock).toContain("spotify: new SpotifyTransport()");
+    expect(callBlock).toContain("onedrive: new OneDriveTransport(microsoftGraphAuth)");
+    expect(callBlock).toContain("microsoft_outlook: new MicrosoftOutlookTransport(microsoftGraphAuth)");
+    expect(callBlock).toContain("spotify: new SpotifyTransport({");
     expect(callBlock).toMatch(/telegram: new TelegramTransport\(\(\) => readSecretProvider\.get\("JARVIS_TELEGRAM_CHAT_ID"\)\)/);
     expect(callBlock).toMatch(/twilio: new TwilioTransport\(\s*\(\) => readSecretProvider\.get\("JARVIS_TWILIO_ACCOUNT_SID"\),\s*\(\) => readSecretProvider\.get\("JARVIS_TWILIO_FROM_NUMBER"\)\s*\)/);
     expect(callBlock).toMatch(/sentry: new SentryTransport\(\(\) => readSecretProvider\.get\("JARVIS_SENTRY_ORG_SLUG"\)\)/);
@@ -180,7 +182,8 @@ describe("I: eksisterende Google Calendar/Gmail (+ GitHub/Telegram/Docker) wirin
     // D-295/D-297/D-305/D-311/D-314/D-315/D-321/D-323/D-330/D-331/D-334:
     // twilio/sentry/grafana/prometheus/n8n/whatsapp/make/telnyx/kling/trello/jira/pipedrive har
     // SAMME resolver-argument-form som telegram - teller heller ikke med her.
-    expect(unconditionalConstructions).toHaveLength(26);
+    // D-388: dropbox/onedrive/microsoft_outlook/spotify/vercel har nå også resolver-/auth-argumenter: 26→21.
+    expect(unconditionalConstructions).toHaveLength(21);
     expect(callBlock).toContain("email: new GmailTransport()");
     expect(callBlock).toContain("calendar: new GoogleCalendarTransport()");
     expect(callBlock).toContain("github: new GithubTransport(githubRateLimitController)");
@@ -188,7 +191,7 @@ describe("I: eksisterende Google Calendar/Gmail (+ GitHub/Telegram/Docker) wirin
     expect(callBlock).toContain("gce: new GceTransport()");
     expect(callBlock).toContain("mcp_zapier: new McpZapierTransport()");
     expect(callBlock).toContain('browser: new BrowserGatewayTransport(process.env["JARVIS_BROWSER_GATEWAY_TOKEN_SECRET"] ?? "")');
-    expect(callBlock).toContain("vercel: new VercelTransport()");
+    expect(callBlock).toContain("vercel: new VercelTransport(");
     expect(callBlock).toContain("slack: new SlackTransport()");
     expect(callBlock).toContain("brave_search: new BraveSearchTransport()");
     expect(callBlock).toContain("google_maps: new GoogleMapsTransport()");
@@ -197,11 +200,11 @@ describe("I: eksisterende Google Calendar/Gmail (+ GitHub/Telegram/Docker) wirin
     expect(callBlock).toContain("exa: new ExaTransport()");
     expect(callBlock).toContain("google_places: new GooglePlacesTransport()");
     expect(callBlock).toContain("google_routes: new GoogleRoutesTransport()");
-    expect(callBlock).toContain("dropbox: new DropboxTransport()");
+    expect(callBlock).toContain("dropbox: new DropboxTransport({");
     expect(callBlock).toContain("notion: new NotionTransport()");
-    expect(callBlock).toContain("onedrive: new OneDriveTransport()");
-    expect(callBlock).toContain("microsoft_outlook: new MicrosoftOutlookTransport()");
-    expect(callBlock).toContain("spotify: new SpotifyTransport()");
+    expect(callBlock).toContain("onedrive: new OneDriveTransport(microsoftGraphAuth)");
+    expect(callBlock).toContain("microsoft_outlook: new MicrosoftOutlookTransport(microsoftGraphAuth)");
+    expect(callBlock).toContain("spotify: new SpotifyTransport({");
     expect(callBlock).toMatch(/n8n: new N8nTransport\(\(\) => toolSecretProvider\.get\("JARVIS_N8N_API_BASE_URL"\)\)/);
     expect(callBlock).toMatch(/twilio: new TwilioTransport\(\s*\(\) => toolSecretProvider\.get\("JARVIS_TWILIO_ACCOUNT_SID"\),\s*\(\) => toolSecretProvider\.get\("JARVIS_TWILIO_FROM_NUMBER"\)\s*\)/);
     expect(callBlock).toMatch(/sentry: new SentryTransport\(\(\) => toolSecretProvider\.get\("JARVIS_SENTRY_ORG_SLUG"\)\)/);

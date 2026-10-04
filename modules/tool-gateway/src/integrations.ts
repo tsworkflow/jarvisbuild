@@ -173,11 +173,74 @@ export function firstWaveTools(
       credential_ref: "JARVIS_TELEGRAM_TOKEN", output_trust: "internal", transport: transport("telegram")
     },
     {
-      tool_id: "vercel", action: "read_deployments", description: "Les deploy-status",
-      input_schema: empty, capability_class: "A", scopes: ["deployments:read"],
+      tool_id: "vercel", action: "read_deployments", description: "Les deploy-status (GET /v6/deployments, valgfritt filtrert på prosjekt)",
+      input_schema: record({ project: z.string().max(200).optional() }), capability_class: "A", scopes: ["deployments:read"],
       reversible: true, rollback_procedure: "ingen (lesing)", idempotent_external: true,
       timeout_ms: 10_000, rate_limit_per_minute: 20, credential_ref: "JARVIS_VERCEL_TOKEN",
       output_trust: "untrusted", transport: transport("vercel")
+    },
+    /**
+     * D-388 (D-41 full kapabilitet for Vercel, den bredere vurderingen D-248 utsatte). Endepunkter verifisert mot
+     * Vercel sin egen REST-API-dokumentasjon 2026-10-04, se `VercelTransport` sin doc-kommentar. Lesing (A): prosjekter,
+     * én deployment, env-NØKLER (aldri verdier). Skriving: `upsert_env` (C - endrer kjørende konfig ved neste bygg),
+     * `promote_deployment`/`rollback_deployment` (C - flytter produksjonstrafikk, reversibelt med motsatt handling),
+     * `cancel_deployment` (B). `redeploy` (nytt bygg) er BEVISST DEFERRED.
+     */
+    {
+      tool_id: "vercel", action: "list_projects", description: "List Vercel-prosjekter (GET /v9/projects)",
+      input_schema: empty, capability_class: "A", scopes: ["projects:read"],
+      reversible: true, rollback_procedure: "ingen (lesing)", idempotent_external: true,
+      timeout_ms: 10_000, rate_limit_per_minute: 20, credential_ref: "JARVIS_VERCEL_TOKEN",
+      output_trust: "untrusted", transport: transport("vercel")
+    },
+    {
+      tool_id: "vercel", action: "read_deployment", description: "Les én deployment (GET /v13/deployments/{id}): tilstand, URL, mål, git-meta",
+      input_schema: record({ deployment_id: z.string().min(1).max(200) }), capability_class: "A", scopes: ["deployments:read"],
+      reversible: true, rollback_procedure: "ingen (lesing)", idempotent_external: true,
+      timeout_ms: 10_000, rate_limit_per_minute: 20, credential_ref: "JARVIS_VERCEL_TOKEN",
+      output_trust: "untrusted", transport: transport("vercel")
+    },
+    {
+      tool_id: "vercel", action: "list_env", description: "List miljøvariabel-NØKLER for et prosjekt (GET /v9/projects/{id}/env) - verdier returneres aldri",
+      input_schema: record({ project: z.string().min(1).max(200) }), capability_class: "A", scopes: ["env:read"],
+      reversible: true, rollback_procedure: "ingen (lesing)", idempotent_external: true,
+      timeout_ms: 10_000, rate_limit_per_minute: 20, credential_ref: "JARVIS_VERCEL_TOKEN",
+      output_trust: "untrusted", transport: transport("vercel")
+    },
+    {
+      tool_id: "vercel", action: "upsert_env", description: "Opprett/oppdater en miljøvariabel for et prosjekt (POST /v10/projects/{id}/env?upsert=true) - virker ved neste bygg",
+      input_schema: record({
+        project: z.string().min(1).max(200), key: z.string().regex(/^[A-Z][A-Z0-9_]{0,127}$/), value: z.string().max(65_536),
+        target: z.array(z.enum(["production", "preview", "development"])).min(1).optional(), sensitive: z.boolean().optional()
+      }),
+      capability_class: "C", scopes: ["env:write"], reversible: true,
+      rollback_procedure: "sett forrige verdi på nytt via upsert_env (forrige verdi må hentes fra Vercel-dashbordet)", idempotent_external: true,
+      timeout_ms: 15_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_VERCEL_TOKEN",
+      output_trust: "internal", transport: transport("vercel")
+    },
+    {
+      tool_id: "vercel", action: "promote_deployment", description: "Promoter en eksisterende deployment til produksjon (POST /v10/projects/{id}/promote/{deploymentId}) - bygger ikke på nytt",
+      input_schema: record({ project: z.string().min(1).max(200), deployment_id: z.string().min(1).max(200) }),
+      capability_class: "C", scopes: ["deployments:write"], reversible: true,
+      rollback_procedure: "promoter forrige produksjonsdeployment på nytt, eller bruk rollback_deployment", idempotent_external: true,
+      timeout_ms: 15_000, rate_limit_per_minute: 5, credential_ref: "JARVIS_VERCEL_TOKEN",
+      output_trust: "internal", transport: transport("vercel")
+    },
+    {
+      tool_id: "vercel", action: "rollback_deployment", description: "Rull produksjon tilbake til en tidligere deployment (POST /v1/projects/{id}/rollback/{deploymentId})",
+      input_schema: record({ project: z.string().min(1).max(200), deployment_id: z.string().min(1).max(200) }),
+      capability_class: "C", scopes: ["deployments:write"], reversible: true,
+      rollback_procedure: "promoter den nyere deploymenten igjen via promote_deployment", idempotent_external: true,
+      timeout_ms: 15_000, rate_limit_per_minute: 5, credential_ref: "JARVIS_VERCEL_TOKEN",
+      output_trust: "internal", transport: transport("vercel")
+    },
+    {
+      tool_id: "vercel", action: "cancel_deployment", description: "Avbryt en pågående deployment/bygg (PATCH /v12/deployments/{id}/cancel)",
+      input_schema: record({ deployment_id: z.string().min(1).max(200) }),
+      capability_class: "B", scopes: ["deployments:write"], reversible: false,
+      rollback_procedure: "start et nytt bygg fra git (redeploy er ikke bygget her - gjøres i Vercel-dashbordet)", idempotent_external: true,
+      timeout_ms: 15_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_VERCEL_TOKEN",
+      output_trust: "internal", transport: transport("vercel")
     },
     {
       // UA-2 P0: repo-metadata for kunnskaps-ingestion (samme scope som read_issues).
@@ -3377,6 +3440,29 @@ export function firstWaveTools(
       output_trust: "internal", transport: transport("dropbox")
     },
     /**
+     * D-388: D-307 sin DEFERRED filinnhold-overføring (content.dropboxapi.com, `Dropbox-API-Arg`-header) er bygget -
+     * tekst eller base64, maks 1 MiB per kall. `upload_file` med `overwrite:false` (default) feiler aldri stille over
+     * en eksisterende fil (Dropbox `mode: add` + `autorename`).
+     */
+    {
+      tool_id: "dropbox", action: "download_file", description: "Last ned en fil (POST content.dropboxapi.com/2/files/download, maks 1 MiB) - tekst som utf8, ellers base64",
+      input_schema: record({ path: z.string().min(1).max(1000) }),
+      capability_class: "A", scopes: ["files.content.read"], reversible: true, rollback_procedure: "ingen (lesing)",
+      idempotent_external: true, timeout_ms: 20_000, rate_limit_per_minute: 20,
+      credential_ref: "JARVIS_DROPBOX_TOKEN", output_trust: "untrusted", transport: transport("dropbox")
+    },
+    {
+      tool_id: "dropbox", action: "upload_file", description: "Last opp en fil (POST content.dropboxapi.com/2/files/upload, maks 1 MiB) - `content` som utf8-tekst eller base64 (`encoding`)",
+      input_schema: record({
+        path: z.string().min(1).max(1000), content: z.string().max(1_400_000),
+        encoding: z.enum(["utf8", "base64"]).optional(), overwrite: z.boolean().optional()
+      }),
+      capability_class: "B", scopes: ["files.content.write"], reversible: true,
+      rollback_procedure: "slett/gjenopprett filen i Dropbox (versjonshistorikk finnes i Dropbox)", idempotent_external: false,
+      timeout_ms: 20_000, rate_limit_per_minute: 10, credential_ref: "JARVIS_DROPBOX_TOKEN",
+      output_trust: "internal", transport: transport("dropbox")
+    },
+    /**
      * D-308 (bygget parallelt mens D-307 sin CI kjørte - femtende slice,
      * Tobias direkte i chat gjentatt, niende gang: "fortsett og jobbe ikke
      * vent på ci"). `Authorization: Bearer`-header + fast `Notion-Version`-
@@ -3492,7 +3578,16 @@ export function firstWaveTools(
       tool_id: "n8n", action: "activate_workflow", description: "Aktiver en workflow (POST /api/v1/workflows/{id}/activate)",
       input_schema: record({ id: z.string() }),
       capability_class: "C", scopes: ["workflow:write"], reversible: true,
-      rollback_procedure: "deaktiver workflowen manuelt i n8n sitt UI (deactivate_workflow ikke bygget ennå)",
+      rollback_procedure: "deaktiver workflowen via deactivate_workflow",
+      idempotent_external: true, timeout_ms: 10_000, rate_limit_per_minute: 20,
+      credential_ref: "JARVIS_N8N_API_KEY", output_trust: "internal", transport: transport("n8n")
+    },
+    {
+      // D-388: D-311 sin DEFERRED motsats - gjør activate_workflow reversibel i kode, ikke bare «manuelt i UI».
+      tool_id: "n8n", action: "deactivate_workflow", description: "Deaktiver en workflow (POST /api/v1/workflows/{id}/deactivate)",
+      input_schema: record({ id: z.string() }),
+      capability_class: "C", scopes: ["workflow:write"], reversible: true,
+      rollback_procedure: "aktiver workflowen igjen via activate_workflow",
       idempotent_external: true, timeout_ms: 10_000, rate_limit_per_minute: 20,
       credential_ref: "JARVIS_N8N_API_KEY", output_trust: "internal", transport: transport("n8n")
     },

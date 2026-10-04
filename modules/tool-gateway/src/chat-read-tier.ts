@@ -52,6 +52,7 @@ export const CHAT_READ_TIER: ReadonlyArray<{ readonly tool_id: string; readonly 
   { tool_id: "drive", action: "list_files" },
   { tool_id: "drive", action: "read_document" },
   { tool_id: "drive", action: "read_permissions" },
+  { tool_id: "dropbox", action: "download_file" },
   { tool_id: "dropbox", action: "list_folder" },
   { tool_id: "email", action: "list_messages" },
   { tool_id: "email", action: "read_attachment" },
@@ -121,6 +122,8 @@ export const CHAT_READ_TIER: ReadonlyArray<{ readonly tool_id: string; readonly 
   { tool_id: "growth", action: "list_spend_events" },
   { tool_id: "growth", action: "resolve_campaign_from_tracking" },
   { tool_id: "growth", action: "search_campaigns" },
+  { tool_id: "home-assistant", action: "list_states" },
+  { tool_id: "home-assistant", action: "read_state" },
   { tool_id: "hubspot", action: "get_object" },
   { tool_id: "hubspot", action: "list_objects" },
   { tool_id: "hubspot", action: "search_objects" },
@@ -177,6 +180,9 @@ export const CHAT_READ_TIER: ReadonlyArray<{ readonly tool_id: string; readonly 
   { tool_id: "trello", action: "list_cards" },
   { tool_id: "twilio", action: "get_account_info" },
   { tool_id: "twilio", action: "read_messages" },
+  { tool_id: "vercel", action: "list_env" },
+  { tool_id: "vercel", action: "list_projects" },
+  { tool_id: "vercel", action: "read_deployment" },
   { tool_id: "vercel", action: "read_deployments" },
   { tool_id: "whatsapp", action: "get_phone_number_info" }
 ];

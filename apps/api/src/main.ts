@@ -1040,8 +1040,9 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
       ),
       // D-383: Charlie vet alltid hvilke tjenester som finnes på flaten (ikke bare de skjemaene som er vedlagt denne runden).
       catalog: (surface) => describeSurfaceCatalog(modelToolSurface, surface).text,
-      select: ({ surface, text }) => {
-        const selection = selectSurfaceTools(surface, text, modelToolSurface);
+      select: ({ surface, text, recent_owner_messages }) => {
+        // D-389: eierens forrige meldinger gir kontekst til utvalget (oppfølgingsspørsmål beholder tjenesten).
+        const selection = selectSurfaceTools(surface, text, modelToolSurface, { recent_owner_messages: recent_owner_messages ?? [] });
         return {
           definitions: selection.selected.map((m) => m.def),
           limits: selection.limits,

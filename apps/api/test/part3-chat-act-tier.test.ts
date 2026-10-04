@@ -146,7 +146,8 @@ describe("D-383: katalogen Charlie alltid ser", () => {
   it("web_chat: tjenester med lese/handle; tale: uten finans og uten handlinger; Telegram: minimum", () => {
     const chat = describeSurfaceCatalog(surface, "web_chat");
     expect(chat.services.find((s) => s.tool_id === "todoist")).toMatchObject({ reads: 2, acts: 4 });
-    expect(chat.text).toContain("Todoist (lese + handle)");
+    // D-389: hverdagsord i klammer etter etiketten.
+    expect(chat.text).toContain("Todoist [gjøremål, huskeliste] (lese + handle)");
     expect(chat.text).toContain("bank (Neonomics");
     const voice = describeSurfaceCatalog(surface, "voice");
     expect(voice.services.some((s) => /^finance/.test(s.tool_id))).toBe(false);

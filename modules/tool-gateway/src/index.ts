@@ -19,6 +19,7 @@ export * from "./model-tool-surface.ts";
 export * from "./chat-read-tier.ts";
 export * from "./chat-act-tier.ts";
 export * from "./tool-catalog.ts";
+export * from "./tool-failure.ts";
 export * from "./memory-transport.ts";
 export * from "./connector-registry.ts";
 export * from "./connector-health-sweep.ts";

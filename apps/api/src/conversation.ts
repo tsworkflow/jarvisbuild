@@ -67,7 +67,7 @@ export interface ConversationDeps {
      * Del 3 (JARVIS-002/028): deterministisk per-flate utvalg av verktøy for DENNE turen (hard allowlist per flate + intensjon + grenser).
      * Når satt brukes den i stedet for `definitions` (som da kun er referansen/øvre grense). Tomt utvalg => ingen verktøy i runden.
      */
-    select?(input: { surface: Surface; text: string }): { definitions: ToolDefinition[]; limits: SurfaceLimits; min_sensitivity?: "SECRET_RESTRICTED" };
+    select?(input: { surface: Surface; text: string; recent_owner_messages?: string[] }): { definitions: ToolDefinition[]; limits: SurfaceLimits; min_sensitivity?: "SECRET_RESTRICTED" };
     /** D-383: kompakt katalog over tjenestene modellen kan bruke på flaten (settes i systemprompten hver tur). */
     catalog?(surface: Surface): string;
   };
@@ -158,12 +158,18 @@ function buildSystemPrompt(personality: PersonalityConfig, context: { surface: S
     ? "Dette er en TALESAMTALE: svar kort (1-3 setninger), naturlig muntlig norsk, ingen lister, markdown, lenker, kodeblokker eller ID-er. "
     : "";
   // D-383: katalog + spilleregler for verktøy - alltid med, uavhengig av hvilke skjema som er vedlagt akkurat denne runden.
+  // D-389: tydeligere spilleregler - bruk verktøy aktivt (handlinger er trygge fordi de alltid går via bekreftelse), følg opp
+  // verktøyresultater med neste steg, og gjengi feilforklaringen (`message`) når noe feiler i stedet for å gjette.
   const capabilities = context.catalog
-    ? `Tjenester du kan bruke i denne samtalen (lese = hente informasjon, handle = opprette/oppdatere/sende/synkronisere): ${context.catalog}. ` +
-      "Verktøyskjemaene vedlagt denne runden er valgt ut fra Tobias sin melding - trenger du en annen tjeneste fra listen, si hvilken " +
-      "og be om presisering i stedet for å påstå at du mangler tilgang. " +
+    ? `Tjenester du kan bruke i denne samtalen (lese = hente informasjon, handle = opprette/oppdatere/sende/synkronisere; i klammer står hverdagsord Tobias bruker om dem): ${context.catalog}. ` +
+      "Verktøyskjemaene vedlagt denne runden er valgt ut fra Tobias sin melding (og tjenestene fra meldingene like før) - trenger du en annen tjeneste fra listen, " +
+      "si hvilken og be om presisering i stedet for å påstå at du mangler tilgang. " +
+      "Bruk verktøyene aktivt: ber Tobias om noe en tjeneste kan gjøre, kall verktøyet med en gang i stedet for å spørre om lov eller beskrive hva du kunne gjort; " +
+      "trenger du en id (sak, fil, enhet, rom), hent den med en liste-/søkehandling først og gå så videre i samme svar. " +
       "Alle handlinger som endrer noe utføres KUN etter at Tobias har godkjent en bekreftelse i chatten/dashbordet: når et verktøy svarer " +
       "confirmation_required, forklar kort hva som vil skje og be ham godkjenne - kall IKKE verktøyet på nytt. " +
+      "Feiler et verktøy, får du en forklaring i feltet message (hva som gikk galt og hva Tobias kan gjøre, f.eks. legge inn en nøkkel under Integrasjoner): " +
+      "gjengi den kort på vanlig norsk, og følg retry-feltet (never = ikke prøv igjen, later = ikke i denne turen, with_corrected_parameters = én gang til med rettede felt). " +
       "Du kan ALDRI: betale, slette permanent, slå sammen kode (merge), styre servere, endre sikkerhets-/eierinnstillinger eller handle via Telegram - " +
       "slike ting gjør Tobias selv i dashbordet. "
     : "";
@@ -433,7 +439,10 @@ export class ConversationEngine {
         override?.providerPreference === undefined &&
         override?.mode === undefined;
       // Del 3: per-flate utvalg + grenser (runder/kall per runde). Uten `select` brukes hele `definitions` (legacy/test).
-      const selection = this.deps.tools?.select?.({ surface, text });
+      // D-389: eierens egne forrige meldinger (aldri modell-/verktøytekst) følger med, så et oppfølgingsspørsmål beholder tjenesten.
+      const ownerTurns = fullHistory.filter((m) => m.role === "user").map((m) => m.content);
+      if (ownerTurns.length > 0 && ownerTurns[ownerTurns.length - 1] === text) ownerTurns.pop();
+      const selection = this.deps.tools?.select?.({ surface, text, recent_owner_messages: ownerTurns.slice(-3) });
       const toolDefinitions = selection ? selection.definitions : this.deps.tools?.definitions ?? [];
       const useTools = this.deps.tools !== undefined && toolDefinitions.length > 0;
       // Del 3 (JARVIS-016/035): sensitivitet utledes av INNHOLDET (minne, historikk, melding, verktøykilder) - ikke lenger hardkodet «public».

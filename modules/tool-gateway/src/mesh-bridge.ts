@@ -6,6 +6,7 @@ import type { JobContract, JsonValue } from "@jarvis/contracts";
 import { SURFACE_TOOL_GRANTS, requiresConfirmationWhenTainted, scopeFieldsOf, type ToolManifest } from "./tool-manifest.ts";
 import type { TurnContext } from "./turn-context.ts";
 import { CHAT_ACT_TIER_KEYS } from "./chat-act-tier.ts";
+import { explainToolFailure, type ToolFailureContext } from "./tool-failure.ts";
 
 /**
  * UA-1 P1A (§13, §16-§17): trusted bro mellom AI Mesh og Tool Gateway.
@@ -420,6 +421,34 @@ export class MeshToolExecutor {
     private readonly guards?: MeshToolGuards
   ) {}
 
+  /**
+   * D-389: ethvert avslag/feil bærer en deterministisk forklaring (`output.message`) til modellen - hva som skjedde og hva Tobias kan
+   * gjøre - så Charlie kan si det på vanlig norsk i stedet for å gjette eller prøve blindt på nytt. Kategorien er uendret.
+   */
+  private failure(
+    call: ToolCallRequest,
+    category: string,
+    at: string,
+    context: ToolFailureContext,
+    execution_id = "none"
+  ): ToolResultMessage {
+    const explained = explainToolFailure(category, context);
+    return {
+      tool_call_id: call.tool_call_id, tool_name: call.tool_name, execution_id,
+      success: false, output: { ...explained }, error_category: category, at, trust: "internal",
+      ...(context.tool_id && context.action ? { source: `${context.tool_id}.${context.action}` } : {})
+    };
+  }
+
+  /** Tjenestene som faktisk finnes på turens flate (til «verktøyet finnes ikke»-forklaringen). */
+  private availableServices(): string[] {
+    const surface = this.turn?.surface;
+    const granted = surface ? new Set(SURFACE_TOOL_GRANTS[surface].map((g) => `${g.tool_id}.${g.action}`)) : null;
+    const ids = new Set<string>();
+    for (const t of this.tools) if (!granted || granted.has(`${t.tool_id}.${t.action}`)) ids.add(t.tool_id);
+    return [...ids].sort();
+  }
+
   async execute(
     call: ToolCallRequest,
     ctx: { tenant_id: string; session_id?: string; task_id?: string; idempotency_key: string }
@@ -427,10 +456,7 @@ export class MeshToolExecutor {
     const at = new Date().toISOString();
     const mapped = this.tools.find((t) => t.def.name === call.tool_name);
     if (!mapped) {
-      return {
-        tool_call_id: call.tool_call_id, tool_name: call.tool_name, execution_id: "none",
-        success: false, output: null, error_category: "TOOL_NOT_FOUND", at
-      };
+      return this.failure(call, "TOOL_NOT_FOUND", at, { ...(this.turn?.surface ? { surface: this.turn.surface } : {}), available_services: this.availableServices() });
     }
     let parameters = (mapped.parameters ? mapped.parameters(call.arguments) : call.arguments) as Record<string, unknown>;
     if (mapped.tool_id === "memory" && mapped.action === "propose") {
@@ -447,20 +473,15 @@ export class MeshToolExecutor {
     }
     const key = `${mapped.tool_id}.${mapped.action}`;
     const turn = this.turn;
+    const failCtx: ToolFailureContext = { tool_id: mapped.tool_id, action: mapped.action, ...(turn?.surface ? { surface: turn.surface } : {}) };
     // 1. Hard flate-allowlist (forsvar i dybden - utvalget skal allerede ha filtrert): et verktøy utenfor flaten utføres ALDRI.
     if (turn?.surface && !SURFACE_TOOL_GRANTS[turn.surface].some((g) => `${g.tool_id}.${g.action}` === key)) {
-      return {
-        tool_call_id: call.tool_call_id, tool_name: call.tool_name, execution_id: "none",
-        success: false, output: null, error_category: "TOOL_NOT_ON_SURFACE", at
-      };
+      return this.failure(call, "TOOL_NOT_ON_SURFACE", at, failCtx);
     }
     // 2. Kallgrenser per tur (JARVIS-028): aldri ubegrenset verktøy-fan-out.
     if (turn?.limits && turn.calls) {
       if (turn.calls.total >= turn.limits.max_total_calls) {
-        return {
-          tool_call_id: call.tool_call_id, tool_name: call.tool_name, execution_id: "none",
-          success: false, output: null, error_category: "TOOL_CALL_LIMIT", at
-        };
+        return this.failure(call, "TOOL_CALL_LIMIT", at, failCtx);
       }
       turn.calls.total += 1;
     }
@@ -468,10 +489,7 @@ export class MeshToolExecutor {
     if (this.guards) {
       const entry = this.guards.manifest.get(key);
       if (!entry) {
-        return {
-          tool_call_id: call.tool_call_id, tool_name: call.tool_name, execution_id: "none",
-          success: false, output: null, error_category: "TOOL_NOT_IN_MANIFEST", at
-        };
+        return this.failure(call, "TOOL_NOT_IN_MANIFEST", at, failCtx);
       }
       // D-382: handlingsnivået krever ALLTID eierens bundne bekreftelse (ikke bare i en tainted tur) - godkjenningen utfører kallet
       // i trusted lag (/confirmations), så modellen skal aldri kalle verktøyet på nytt.
@@ -514,10 +532,7 @@ export class MeshToolExecutor {
       servingModel: { provider: call.provider, model: call.model }
     });
     if (!result.ok) {
-      return {
-        tool_call_id: call.tool_call_id, tool_name: call.tool_name, execution_id: ctx.idempotency_key,
-        success: false, output: null, error_category: result.reason, at
-      };
+      return this.failure(call, result.reason, at, failCtx, ctx.idempotency_key);
     }
     let output: unknown = result.data ?? null;
     const serialized = JSON.stringify(output);

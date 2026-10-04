@@ -337,7 +337,9 @@ export interface SurfaceLimits {
 
 export const SURFACE_LIMITS: Readonly<Record<Surface, SurfaceLimits>> = {
   // D-382: skjemaene for handlinger (opprett/oppdater) er større enn lese-skjemaene - rommet er hevet, utvalget er fortsatt per melding.
-  web_chat: { max_tools_per_round: 10, max_schema_tokens: 3000, max_rounds: 4, max_calls_per_round: 4, max_total_calls: 8 },
+  // D-389: 10/3000/4/8 → 12/4000/5/12 - rom for én hel tjeneste (lese + handle) pluss minne/kalender i samme runde, og en ekstra
+  // runde til å følge opp et verktøyresultat (f.eks. list → read → handle). Tale/Telegram er uendret (latens/kort svar).
+  web_chat: { max_tools_per_round: 12, max_schema_tokens: 4000, max_rounds: 5, max_calls_per_round: 4, max_total_calls: 12 },
   voice: { max_tools_per_round: 6, max_schema_tokens: 1500, max_rounds: 3, max_calls_per_round: 3, max_total_calls: 5 },
   telegram: { max_tools_per_round: 5, max_schema_tokens: 1000, max_rounds: 3, max_calls_per_round: 3, max_total_calls: 5 },
   background: { max_tools_per_round: 8, max_schema_tokens: 1500, max_rounds: 6, max_calls_per_round: 4, max_total_calls: 16 },

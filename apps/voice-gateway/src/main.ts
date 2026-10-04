@@ -43,7 +43,22 @@ function numericEnvOrDefault(name: string, fallback: number): number {
 
 const vadThreshold = numericEnvOrDefault("JARVIS_VOICE_VAD_THRESHOLD", 0.05);
 const vadHangoverMs = numericEnvOrDefault("JARVIS_VOICE_VAD_HANGOVER_MS", 700);
-const vad = new EnergyVad(vadThreshold, vadHangoverMs);
+/**
+ * D-390: adaptiv terskel (støygulv) er PÅ som standard (`JARVIS_VOICE_VAD_ADAPTIVE=false` slår av) - D-353 fant at én fast
+ * terskel var det mest sannsynlige hinderet for både «hører meg dårlig» og manglende avbrudd. Terskelen starter på
+ * `vadThreshold` og flytter seg kun innenfor [0.012, 2x] etter hva rommet faktisk måler. ÉN VAD PER SESJON (fabrikk) - JARVIS-079.
+ */
+const vadAdaptive = (process.env["JARVIS_VOICE_VAD_ADAPTIVE"] ?? "true") !== "false";
+const vad = (): EnergyVad => new EnergyVad(vadThreshold, vadHangoverMs, { adaptive: vadAdaptive });
+/**
+ * D-390: pre-roll (ordets begynnelse før VAD-en trigget), fyllord når modellen er treg til første token, og talt verktøystatus.
+ * Alle styres fra miljøet; 0/false slår av.
+ */
+const sessionOptions = {
+  preRollMs: numericEnvOrDefault("JARVIS_VOICE_PREROLL_MS", 300),
+  fillerMs: numericEnvOrDefault("JARVIS_VOICE_FILLER_MS", 1500),
+  speakToolActivity: (process.env["JARVIS_VOICE_SPEAK_TOOL_ACTIVITY"] ?? "true") !== "false"
+};
 
 // Leverandørvalg skjer i stop/go-porten (D-10/D-29); inntil da brukes første
 // tilgjengelige adapter, med deterministisk fallback uten nettverk.
@@ -70,7 +85,7 @@ function selectOrExit() {
 const { stt, tts } = selectOrExit();
 const health = new VoiceHealth();
 
-const server = createVoiceGateway({ core: new HttpCoreClient(coreUrl), stt, tts, health, vad });
+const server = createVoiceGateway({ core: new HttpCoreClient(coreUrl), stt, tts, health, vad, session: sessionOptions });
 server.listen(port, () => {
   console.log(
     JSON.stringify({
@@ -78,8 +93,11 @@ server.listen(port, () => {
       port,
       stt: stt.name,
       tts: tts.name,
+      tts_sample_rate: tts.sampleRate ?? 24_000,
       vad_threshold: vadThreshold,
-      vad_hangover_ms: vadHangoverMs
+      vad_hangover_ms: vadHangoverMs,
+      vad_adaptive: vadAdaptive,
+      ...sessionOptions
     })
   );
 });

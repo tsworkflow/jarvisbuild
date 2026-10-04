@@ -110,6 +110,8 @@ export interface TurnMetrics {
   barge_in_ms?: number;
   /** §19 hovedmål: end-of-user-speech → første Jarvis-lyd. */
   end_of_speech_to_first_audio_ms?: number;
+  /** D-390: et kort fyllord ble talt fordi modellen brukte lenger enn `fillerMs` på første token. */
+  filler_spoken?: boolean;
   /** §20: separat usage-grunnlag for STT-/TTS-kost (aldri blandet med LLM-kost). */
   stt_audio_ms?: number;
   tts_chars?: number;
@@ -130,6 +132,30 @@ export interface SessionEvents {
   onToolActivity?(activity: string): void;
 }
 
+/**
+ * D-390 (Tobias: «raskeste responsen med best svar og tydelig svar som hører meg bra»): valgfrie sesjonsinnstillinger. Alle er AV
+ * uten eksplisitt verdi (identisk oppførsel med før) - `main.ts` slår dem på fra miljøet.
+ */
+export interface VoiceSessionOptions {
+  /**
+   * Lyd FØR `speech_start` (ms) som holdes i en ringbuffer og sendes til STT når turen starter - energi-VAD-en trigger først
+   * MIDT i første stavelse, så uten dette mister whisper ordets begynnelse («hei Charlie» → «ei Charlie»). 0 = av.
+   */
+  preRollMs?: number;
+  /**
+   * Går det lenger enn dette (ms) fra turstart til første modell-token/verktøystatus, tales `fillerText` kort - så Tobias hører at
+   * Charlie er i gang i stedet for stillhet. Tales kun én gang per tur og aldri etter at svaret har begynt. 0 = av.
+   */
+  fillerMs?: number;
+  fillerText?: string;
+  /** Tal verktøystatusen («Sjekker kalenderen …») i tillegg til å sende den som tekst - første verktøy per tur. */
+  speakToolActivity?: boolean;
+}
+
+const DEFAULT_FILLER_TEXT = "Et øyeblikk.";
+/** PCM16 mono 16 kHz = 32 byte per millisekund. */
+const PCM16_16K_BYTES_PER_MS = 32;
+
 /** §26: trusted mapping verktøynavn → kort brukerrettet status. Ukjente får generisk tekst. */
 const TOOL_ACTIVITY_TEXT: Record<string, string> = {
   read_calendar_today: "Sjekker kalenderen din …",
@@ -146,7 +172,16 @@ const TOOL_ACTIVITY_BY_PREFIX: ReadonlyArray<[RegExp, string]> = [
   [/^(brave_search|tavily|exa)/, "Søker på nettet …"],
   [/^(notion|drive|dropbox|onedrive|google_sheets)/, "Ser i dokumentene …"],
   [/^(todoist|trello|jira|linear)/, "Sjekker oppgavene …"],
-  [/^(slack|discord)/, "Sjekker meldingene …"]
+  [/^(slack|discord|telegram|whatsapp|twilio|telnyx)/, "Sjekker meldingene …"],
+  // D-390: resten av tjenestene Charlie faktisk kan nå fra tale (D-389), så statusen aldri blir generisk når det finnes et bedre ord.
+  [/^home-assistant/, "Sjekker hjemmet …"],
+  [/^(vercel|n8n|make)/, "Sjekker driften …"],
+  [/^(sentry|grafana|prometheus)/, "Sjekker systemene …"],
+  [/^(business|contract|support|operations|product|conversation_graph)/, "Slår opp i registeret …"],
+  [/^(hubspot|pipedrive)/, "Sjekker CRM-et …"],
+  [/^(google_maps|google_places|google_routes)/, "Sjekker kartet …"],
+  [/^spotify/, "Sjekker musikken …"],
+  [/^executive/, "Sjekker statusen min …"]
 ];
 export function toolActivityText(toolName: string): string {
   const exact = TOOL_ACTIVITY_TEXT[toolName];
@@ -188,9 +223,14 @@ export class VoiceSession {
   private turnChain: Promise<void> = Promise.resolve();
   /** §16: epoch bumpes ved barge-in - alt fra gammel epoch droppes deterministisk. */
   private epoch = 0;
-  private ttsQueue: string[] = [];
+  private ttsQueue: TtsQueueItem[] = [];
   private ttsWorker: Promise<void> = Promise.resolve();
   private activeTurnAbort: AbortController | null = null;
+  /** D-390 (JARVIS-079): etter `disconnect()` når ingen tur Core - en STT som fullfører etterpå kjører aldri verktøy for en død socket. */
+  private closed = false;
+  /** D-390: ringbuffer med lyd fra FØR turen (se `VoiceSessionOptions.preRollMs`). */
+  private preRoll: Buffer[] = [];
+  private preRollBytes = 0;
   /**
    * D-122 (UA-7 kriterium 4): rutingsporten avgjøres ÉN gang per sesjon, ved
    * konstruksjon, fra sesjonens memory space, space-verdiens TILLITSNIVÅ og
@@ -266,7 +306,9 @@ export class VoiceSession {
      * har ingen betrodd server-side space-autoritet i dag (Q-32), så
      * `server.ts` setter denne eksplisitt til `CLIENT_ASSERTED`.
      */
-    private readonly memorySpaceAuthority: MemorySpaceAuthority = "CLIENT_ASSERTED"
+    private readonly memorySpaceAuthority: MemorySpaceAuthority = "CLIENT_ASSERTED",
+    /** D-390: pre-roll, fyllord, talt verktøystatus - alle av uten eksplisitt verdi. */
+    private readonly options: VoiceSessionOptions = {}
   ) {
     // Bruker parameterne direkte (ikke `this.*`): parameter-properties og
     // felt-initialisering har subtil rekkefølge, og denne porten skal aldri
@@ -329,6 +371,19 @@ export class VoiceSession {
       console.error(JSON.stringify({ msg: "voice_vad_transition", vad_event: vadEvent }));
     }
 
+    // D-390: utenfor en tur holdes de siste `preRollMs` ms i en ringbuffer (aldri sendt noe sted før en tur faktisk starter -
+    // ingen skjult, kontinuerlig lagring; bufferen overskrives løpende og tømmes når den er brukt).
+    const preRollMs = this.options.preRollMs ?? 0;
+    if (preRollMs > 0 && !this.stt && vadEvent !== "speech_start") {
+      this.preRoll.push(frame);
+      this.preRollBytes += frame.length;
+      const maxBytes = preRollMs * PCM16_16K_BYTES_PER_MS;
+      while (this.preRollBytes > maxBytes && this.preRoll.length > 1) {
+        const dropped = this.preRoll.shift() as Buffer;
+        this.preRollBytes -= dropped.length;
+      }
+    }
+
     if (vadEvent === "speech_start") {
       if (this.state === "speaking" || this.state === "thinking") {
         this.bargeIn(atMs);
@@ -378,6 +433,12 @@ export class VoiceSession {
       t_speech_start: atMs
     };
     this.stt = this.sttAdapter.startStream();
+    // D-390: lyden rett FØR speech_start (ordets begynnelse) går først inn i turen.
+    if (this.preRoll.length > 0) {
+      for (const f of this.preRoll) this.stt.pushAudio(f);
+      this.preRoll = [];
+      this.preRollBytes = 0;
+    }
     this.stt.onPartial((text) => {
       if (this.metrics && this.metrics.t_first_partial === undefined) {
         this.metrics.t_first_partial = Date.now();
@@ -434,14 +495,39 @@ export class VoiceSession {
       this.events.onError(`utterance_already_completed:${utteranceId}`);
       return;
     }
+    // D-390 (JARVIS-079 «zombie turn executes after disconnect»): klienten er borte - turen når aldri Core, ingen verktøy kjøres
+    // for en socket som ikke lenger lytter. Logges (aldri selve teksten).
+    if (this.closed) {
+      console.error(JSON.stringify({ msg: "voice_turn_dropped_after_disconnect", utterance_id: utteranceId }));
+      return;
+    }
     const turnMetrics = metrics ?? { utterance_id: utteranceId, t_speech_start: Date.now() };
     const turnEpoch = this.epoch;
     this.setState("thinking");
     const abort = new AbortController();
     this.activeTurnAbort = abort;
+    // D-390: fyllord når modellen er treg til første token - kun før svaret har begynt, kun én gang, kun i samme epoch.
+    const fillerMs = this.options.fillerMs ?? 0;
+    let fillerTimer: ReturnType<typeof setTimeout> | undefined;
+    let progressed = false;
+    const onProgress = (): void => {
+      progressed = true;
+      if (fillerTimer !== undefined) {
+        clearTimeout(fillerTimer);
+        fillerTimer = undefined;
+      }
+    };
+    if (fillerMs > 0 && this.core.chatStream) {
+      fillerTimer = setTimeout(() => {
+        fillerTimer = undefined;
+        if (progressed || this.epoch !== turnEpoch || this.closed) return;
+        turnMetrics.filler_spoken = true;
+        this.enqueueTts(this.options.fillerText ?? DEFAULT_FILLER_TEXT, turnEpoch, turnMetrics);
+      }, fillerMs);
+    }
     try {
       const reply = this.core.chatStream
-        ? await this.streamTurn(text, turnMetrics, turnEpoch, abort.signal)
+        ? await this.streamTurn(text, turnMetrics, turnEpoch, abort.signal, onProgress)
         : await this.core.chat(this.identity, text);
       turnMetrics.t_core_reply = Date.now();
       turnMetrics.routed = reply.routed;
@@ -480,6 +566,7 @@ export class VoiceSession {
         this.events.onError("core_error");
       }
     } finally {
+      onProgress();
       if (this.activeTurnAbort === abort) {
         this.activeTurnAbort = null;
       }
@@ -499,9 +586,11 @@ export class VoiceSession {
     text: string,
     metrics: TurnMetrics,
     turnEpoch: number,
-    signal: AbortSignal
+    signal: AbortSignal,
+    onProgress: () => void = () => undefined
   ): Promise<CoreReply> {
     const chunker = new SentenceChunker((chunk) => this.enqueueTts(chunk, turnEpoch, metrics));
+    let activitySpoken = false;
     const reply = await (this.core.chatStream as NonNullable<CoreClient["chatStream"]>)(
       this.identity,
       text,
@@ -513,13 +602,21 @@ export class VoiceSession {
           if (metrics.t_model_first_token === undefined) {
             metrics.t_model_first_token = Date.now();
           }
+          onProgress();
           chunker.push(event.text);
         } else if (event.type === "tool") {
           // §26: kun kort trusted status - aldri tool-payload/intern JSON i tale.
           if (metrics.t_tool_activity === undefined) {
             metrics.t_tool_activity = Date.now();
           }
-          this.events.onToolActivity?.(toolActivityText(event.tool_name));
+          onProgress();
+          const activity = toolActivityText(event.tool_name);
+          this.events.onToolActivity?.(activity);
+          // D-390: tal statusen (første verktøy per tur) - Tobias hører at noe skjer i stedet for stillhet mens verktøyet kjører.
+          if (this.options.speakToolActivity === true && !activitySpoken) {
+            activitySpoken = true;
+            this.enqueueTts(activity, turnEpoch, metrics);
+          }
         }
       },
       signal
@@ -537,7 +634,7 @@ export class VoiceSession {
    * kalles bevisst IKKE - se begrunnelsen i `speakNext()`.
    */
   private reportTtsDenial(): void {
-    this.ttsQueue = [];
+    this.clearTtsQueue();
     if (!this.ttsDenialReported) {
       this.ttsDenialReported = true;
       this.events.onError(`speech_routing_denied_tts:${this.ttsRouting.outcome}`);
@@ -569,17 +666,23 @@ export class VoiceSession {
         metrics.t_first_tts_request = Date.now();
       }
     }
-    this.ttsQueue.push(sanitized);
+    this.ttsQueue.push({ text: sanitized });
     this.ttsWorker = this.ttsWorker.then(() => this.speakNext(turnEpoch, metrics));
+  }
+
+  /** D-390: tømmer køen OG kansellerer chunker som allerede er forhåndssyntetisert (aldri en hengende leverandørstrøm/prosess). */
+  private clearTtsQueue(): void {
+    for (const item of this.ttsQueue) item.primed?.playback.cancel();
+    this.ttsQueue = [];
   }
 
   private async speakNext(turnEpoch: number, metrics?: TurnMetrics): Promise<void> {
     if (this.epoch !== turnEpoch) {
-      this.ttsQueue = [];
+      this.clearTtsQueue();
       return;
     }
-    const chunk = this.ttsQueue.shift();
-    if (chunk === undefined) {
+    const item = this.ttsQueue.shift();
+    if (item === undefined) {
       return;
     }
     // D-122: svarteksten fra en sensitiv samtale er like avslørende som
@@ -588,24 +691,36 @@ export class VoiceSession {
     // ikke en leverandørfeil - å merke leverandøren «unhealthy» ville vært
     // direkte usant og kunne utløst feilaktig failover.
     if (!this.ttsRouting.allowed) {
-      this.ttsQueue = [];
+      this.clearTtsQueue();
       this.reportTtsDenial();
       return;
     }
     this.setState("speaking");
-    let playback: TtsPlayback;
+    let primed: PrimedPlayback;
     try {
-      playback = this.ttsAdapter.synthesize(chunk);
+      primed = item.primed ?? primePlayback(this.ttsAdapter, item.text);
     } catch (err) {
       // §36: TTS-feil forkaster ALDRI Jarvis-svaret (teksten er alt levert via onReply).
       this.health?.recordFailure("tts", (err as Error).message);
       this.events.onError("tts_error");
       return;
     }
+    // D-390: NESTE chunk syntetiseres MENS denne spilles (én foran) - nettverks-TTS (OpenAI/ElevenLabs) og piper sin
+    // prosess-/modellstart per chunk overlapper da med avspillingen i stedet for å gi en pause mellom hver setning.
+    // Kun én foran: bundet ressursbruk, og barge-in har maks én ekstra strøm å kansellere.
+    const next = this.ttsQueue[0];
+    if (next !== undefined && next.primed === undefined) {
+      try {
+        next.primed = primePlayback(this.ttsAdapter, next.text);
+      } catch {
+        // Rapporteres når chunken selv skal tales (samme feilvei som over).
+      }
+    }
+    const playback = primed.playback;
     this.playback = playback;
     let first = true;
     try {
-      for await (const frame of alignPcm16Frames(playback.frames)) {
+      for await (const frame of alignPcm16Frames(primedFrames(primed))) {
         if (this.epoch !== turnEpoch) {
           playback.cancel();
           return; // gammel lyd slippes aldri gjennom etter barge-in (§16)
@@ -648,7 +763,7 @@ export class VoiceSession {
     if (this.health) {
       this.health.bargeInSeen = true;
     }
-    this.ttsQueue = [];
+    this.clearTtsQueue();
     if (this.playback) {
       this.playback.cancel();
       this.playback = null;
@@ -675,8 +790,11 @@ export class VoiceSession {
    * upstream (P1A-kjeden) - symmetrisk med bargeIn(), men uten ny tur/state.
    */
   disconnect(): void {
+    this.closed = true;
     this.epoch += 1;
-    this.ttsQueue = [];
+    this.clearTtsQueue();
+    this.preRoll = [];
+    this.preRollBytes = 0;
     if (this.playback) {
       this.playback.cancel();
       this.playback = null;
@@ -733,6 +851,39 @@ export class VoiceSession {
  * ufullstendig siste byte ved STRØMMENS slutt (ingen mer data kommer) kan
  * strukturelt aldri bli en hel sample og forkastes bevisst der.
  */
+/** D-390: én TTS-chunk i køen - eventuelt allerede forhåndssyntetisert (`primed`). */
+interface TtsQueueItem {
+  text: string;
+  primed?: PrimedPlayback;
+}
+
+/**
+ * D-390: en TTS-avspilling der syntesen FAKTISK er startet. Adapterenes `frames` er late async-generatorer (kroppen - fetch/
+ * spawn - kjører først ved første `next()`), så «å ha kalt synthesize()» starter ingenting; første `next()` må trekkes nå.
+ */
+interface PrimedPlayback {
+  playback: TtsPlayback;
+  iterator: AsyncIterator<Buffer>;
+  first: Promise<IteratorResult<Buffer>>;
+}
+
+function primePlayback(adapter: TtsAdapter, text: string): PrimedPlayback {
+  const playback = adapter.synthesize(text);
+  const iterator = playback.frames[Symbol.asyncIterator]();
+  const first = iterator.next();
+  // Avvisningen håndteres når chunken spilles (`primedFrames` kaster den videre) - aldri en «unhandled rejection» i mellomtiden.
+  first.catch(() => undefined);
+  return { playback, iterator, first };
+}
+
+async function* primedFrames(primed: PrimedPlayback): AsyncIterable<Buffer> {
+  let result = await primed.first;
+  while (!result.done) {
+    yield result.value;
+    result = await primed.iterator.next();
+  }
+}
+
 export async function* alignPcm16Frames(frames: AsyncIterable<Buffer>): AsyncIterable<Buffer> {
   let carry: Buffer | null = null;
   for await (const chunk of frames) {

@@ -20,9 +20,17 @@ export interface TtsAdapter {
    * å beskytte kun STT ville lekket halve samtalen.
    */
   readonly processor: SpeechProcessorDeclaration;
+  /**
+   * D-390: samplerate (Hz) på PCM16-rammene adapteren leverer. Sendes til klienten i `started`-meldingen så avspillingen bruker
+   * RIKTIG rate - før dette antok `voice.html` alltid 24 kHz (OpenAI), som spilte piper (22 050 Hz) ~9 % for fort/lyst og
+   * ElevenLabs (16 kHz) 50 % for fort. Udefinert = 24 000 (bakoverkompatibelt med testadaptere uten feltet).
+   */
+  readonly sampleRate?: number;
   available(): boolean;
   synthesize(text: string): TtsPlayback;
 }
+
+export const DEFAULT_TTS_SAMPLE_RATE = 24_000;
 
 /**
  * Deterministisk testadapter: produserer 20 ms-rammer i sanntidstakt slik at
@@ -37,6 +45,8 @@ export class FakeTts implements TtsAdapter {
     processor_row_declared: true,
     processor_terms_status: "NOT_APPLICABLE_LOCAL"
   };
+  /** Rammene under er 20 ms @ 16 kHz. */
+  readonly sampleRate = 16_000;
   constructor(private readonly msPerChar = 40) {}
 
   available(): boolean {
@@ -84,6 +94,8 @@ export class OpenAiTts implements TtsAdapter {
     processor_row_declared: true,
     processor_terms_status: "VERIFIED"
   };
+  /** `response_format: "pcm"` er PCM16 mono 24 kHz. */
+  readonly sampleRate = 24_000;
   constructor(
     private readonly apiKey: string | undefined = process.env["OPENAI_API_KEY"],
     private readonly model: string = "gpt-4o-mini-tts",
@@ -181,6 +193,8 @@ export class ElevenLabsTts implements TtsAdapter {
     processor_row_declared: true,
     processor_terms_status: "NOT_VERIFIED"
   };
+  /** `output_format=pcm_16000`. */
+  readonly sampleRate = 16_000;
   constructor(
     private readonly apiKey: string | undefined = process.env["JARVIS_ELEVENLABS_API_KEY"],
     /** Påkrevd i selve URL-stien - ElevenLabs har intet "standard stemme"-endepunkt. */
@@ -261,10 +275,18 @@ export class LocalPiperTts implements TtsAdapter {
     processor_row_declared: true,
     processor_terms_status: "NOT_APPLICABLE_LOCAL"
   };
+  /**
+   * D-390: piper-stemmer er typisk 22 050 Hz (noen 16 000) - raten bestemmes av stemmemodellen Tobias installerer, og settes med
+   * `JARVIS_PIPER_SAMPLE_RATE` (standard 22 050). Adapteren re-samplerer ikke; klienten spiller av i denne raten.
+   */
+  readonly sampleRate: number;
   constructor(
     private readonly binPath: string | undefined = process.env["JARVIS_PIPER_BIN"],
-    private readonly modelPath: string | undefined = process.env["JARVIS_PIPER_MODEL"]
-  ) {}
+    private readonly modelPath: string | undefined = process.env["JARVIS_PIPER_MODEL"],
+    sampleRate: number = Number(process.env["JARVIS_PIPER_SAMPLE_RATE"] ?? "") || 22_050
+  ) {
+    this.sampleRate = sampleRate;
+  }
 
   /** Stemmemodellen er like påkrevd som binæren - piper kan strukturelt ikke kjøre uten `--model`. */
   available(): boolean {

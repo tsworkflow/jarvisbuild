@@ -44,8 +44,50 @@ export function sanitizeForSpeech(text: string): string {
   // ALDRI uttales, uansett hvilket mønster som eventuelt ikke ble fanget over.
   out = out.replace(/[*`]/g, "");
 
+  // D-390 («tydelig svar»): det TTS-en leser dårlig eller bokstavelig, normaliseres til hele norske ord FØR syntese.
+  out = normalizeForNorwegianSpeech(out);
+
   // Slå sammen whitespace som tegnfjerningen kan ha etterlatt.
   out = out.replace(/[ \t]{2,}/g, " ").trim();
 
+  return out;
+}
+
+/** Forkortelser som leses opp som bokstaver/«punktum» av TTS - utvides til hele ord (kun med ordgrense, aldri inne i ord). */
+const ABBREVIATIONS: ReadonlyArray<[RegExp, string]> = [
+  [/\bf\.eks\./gi, "for eksempel"],
+  [/\bbl\.a\./gi, "blant annet"],
+  [/\bosv\./gi, "og så videre"],
+  [/\bdvs\./gi, "det vil si"],
+  [/\bca\.\s*(?=\d)/gi, "cirka "],
+  [/\bkl\.\s*(?=\d)/gi, "klokka "],
+  [/\bnr\.\s*(?=\d)/gi, "nummer "],
+  [/\btlf\.?\s*(?=\d|:)/gi, "telefon "],
+  [/\bmill\.\s*/gi, "millioner "],
+  [/\bmrd\.\s*/gi, "milliarder "],
+  [/\bmvh\b\.?/gi, "med vennlig hilsen"]
+];
+
+/**
+ * D-390: TTS-vennlig norsk - URL-er og emoji fjernes (leses ellers tegn for tegn / som «smilende ansikt»), prosent/valuta/
+ * forkortelser blir ord, og klokkeslett med kolon får punktum («18:30» → «18.30», som piper/OpenAI leser som tid).
+ * Bevisst smalt: tall, datoer og vanlige ord røres ikke (D-353-testen «18.30 skal forbli 18.30» holder).
+ */
+export function normalizeForNorwegianSpeech(text: string): string {
+  let out = text;
+  // URL-er: en opplest adresse er støy - «se lenken» er ikke bedre, så den fjernes helt.
+  out = out.replace(/https?:\/\/\S+/gi, "");
+  out = out.replace(/\bwww\.\S+/gi, "");
+  // Emoji (inkl. modifikatorer/sammenføyere) - aldri uttalt.
+  out = out.replace(/[\p{Extended_Pictographic}\u{FE0F}\u{200D}]/gu, "");
+  // Prosent og valuta etter tall.
+  out = out.replace(/(\d)\s*%/g, "$1 prosent");
+  out = out.replace(/(\d)\s*(?:kr|NOK)\b\.?/g, "$1 kroner");
+  out = out.replace(/(\d)\s*€/g, "$1 euro");
+  out = out.replace(/€\s*(\d)/g, "$1 euro");
+  out = out.replace(/\$\s*(\d[\d\s.,]*)/g, "$1 dollar");
+  // Klokkeslett «18:30» → «18.30» (men ikke forhold/tidsangivelser som 1:2 eller mm:ss over 24 timer).
+  out = out.replace(/\b([01]?\d|2[0-3]):([0-5]\d)\b/g, "$1.$2");
+  for (const [re, word] of ABBREVIATIONS) out = out.replace(re, word);
   return out;
 }

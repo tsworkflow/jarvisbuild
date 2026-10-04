@@ -1,7 +1,7 @@
 import { spawn } from "node:child_process";
 import { randomUUID } from "node:crypto";
 import { readFile, unlink } from "node:fs/promises";
-import { tmpdir } from "node:os";
+import { cpus, tmpdir } from "node:os";
 import { join } from "node:path";
 import type { SpeechProcessorDeclaration } from "@jarvis/contracts";
 import { WebSocket as WsClient } from "ws";
@@ -494,8 +494,25 @@ export class LocalWhisperStt implements SttAdapter {
     /** PCM-samplerate for wav-innpakking - SAMME 16 kHz-forventning som resten av piloten (`pcm16ToWav`/`docs/VOICE_BENCHMARK.md`). */
     private readonly sampleRate: number = 16000,
     /** whisper.cpp sitt `-l`-språkflagg - default norsk, SAMME som `OpenAiStt`. */
-    private readonly language: string = process.env["JARVIS_WHISPER_LANG"] ?? "no"
+    private readonly language: string = process.env["JARVIS_WHISPER_LANG"] ?? "no",
+    /**
+     * D-390: `-t` tråder - whisper.cpp sin standard er 4 uansett maskin; på en NAS/PC med flere kjerner er dekodingen den største
+     * delen av svartiden (batch-STT, D-353), så alle kjerner (maks 8) brukes med mindre `JARVIS_WHISPER_THREADS` sier noe annet.
+     */
+    private readonly threads: number = Number(process.env["JARVIS_WHISPER_THREADS"] ?? "") || Math.max(1, Math.min(8, cpus().length)),
+    /**
+     * D-390: valgfri `--prompt` - whisper bruker den som stilkontekst (norsk bokmål, navnene Charlie/Tobias/Jarvis) og gjenkjenner
+     * egennavn og norsk ortografi bedre. Tom = ikke sendt.
+     */
+    private readonly prompt: string | undefined = process.env["JARVIS_WHISPER_PROMPT"]
   ) {}
+
+  /** Argumentene som sendes til whisper-cli (observerbart for tester). */
+  cliArgs(tmpOutBase: string): string[] {
+    const args = ["-m", this.modelPath ?? "", "-f", "-", "-nt", "-otxt", "-of", tmpOutBase, "-nth", "1.01", "-l", this.language, "-t", String(this.threads)];
+    if (this.prompt !== undefined && this.prompt.trim().length > 0) args.push("--prompt", this.prompt.trim());
+    return args;
+  }
 
   /** Modellen er like påkrevd som binæren - whisper.cpp kan strukturelt ikke kjøre uten `-m`. */
   available(): boolean {
@@ -506,7 +523,8 @@ export class LocalWhisperStt implements SttAdapter {
     if (!this.binPath || !this.modelPath) {
       throw new Error("local_whisper_not_configured");
     }
-    const { binPath, modelPath, sampleRate, language } = this;
+    const { binPath, sampleRate } = this;
+    const cliArgs = (tmpOutBase: string): string[] => this.cliArgs(tmpOutBase);
     const chunks: Buffer[] = [];
     return {
       pushAudio(frame: Buffer): void {
@@ -623,13 +641,10 @@ export class LocalWhisperStt implements SttAdapter {
         // fra før) - §22-invarianten (rå lyd persisteres aldri) er derfor
         // fortsatt intakt.
         const tmpOutBase = join(tmpdir(), `jarvis-whisper-${randomUUID()}`);
-        const proc = spawn(
-          binPath,
-          ["-m", modelPath, "-f", "-", "-nt", "-otxt", "-of", tmpOutBase, "-nth", "1.01", "-l", language],
-          {
-            stdio: ["pipe", "pipe", "pipe"]
-          }
-        );
+        // D-390: `-t <tråder>` (+ valgfri `--prompt`) i tillegg - se `cliArgs()`.
+        const proc = spawn(binPath, cliArgs(tmpOutBase), {
+          stdio: ["pipe", "pipe", "pipe"]
+        });
         let stdout = "";
         let stderr = "";
         let stdinError: Error | null = null;

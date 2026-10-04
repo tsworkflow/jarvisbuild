@@ -154,8 +154,11 @@ function buildSystemPrompt(personality: PersonalityConfig, context: { surface: S
     `Du er Charlie - Tobias og familien sin egen AI, kjønnsnøytral, med en ekte personlighet: ` +
     `${personality.tone_descriptors.join(", ")}. ${personality.style_notes} `;
   // D-382: tale er muntlig - kort, uten lister/markdown/lenker/ID-er (TTS leser alt høyt).
+  // D-390: det viktigste først, hele ord (TTS leser forkortelser/symboler dårlig), aldri gjenta spørsmålet.
   const voiceStyle = context.surface === "voice"
-    ? "Dette er en TALESAMTALE: svar kort (1-3 setninger), naturlig muntlig norsk, ingen lister, markdown, lenker, kodeblokker eller ID-er. "
+    ? "Dette er en TALESAMTALE: svar kort (1-3 setninger), naturlig muntlig norsk, det viktigste først, uten å gjenta spørsmålet; " +
+      "bruk hele ord i stedet for forkortelser og symboler (si «klokka halv sju», «tjue prosent», «for eksempel»); " +
+      "ingen lister, markdown, lenker, kodeblokker eller ID-er. "
     : "";
   // D-383: katalog + spilleregler for verktøy - alltid med, uavhengig av hvilke skjema som er vedlagt akkurat denne runden.
   // D-389: tydeligere spilleregler - bruk verktøy aktivt (handlinger er trygge fordi de alltid går via bekreftelse), følg opp

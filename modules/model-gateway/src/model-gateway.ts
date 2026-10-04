@@ -620,6 +620,12 @@ export class ModelGateway {
       const sizeBefore = executed.size;
       const results: ToolResultMessage[] = [];
       for (const call of calls) {
+        // D-390 (JARVIS-079 «barge-in stops streaming not tools»): et avbrudd (tale-barge-in, klient borte) stopper også
+        // verktøyløkka - ingen nye verktøykall startes etter at signalet er satt. Et kall som allerede kjører fullføres
+        // (side-effekter rulles aldri tilbake, §17), men neste kall/runde avbrytes rent som `cancelled`.
+        if (opts.signal?.aborted) {
+          throw new ProviderError(result.provider ?? "router", "cancelled", "tool_loop_cancelled");
+        }
         results.push(await this.executeToolCall(call, input, known, executed, () => {
           if (repairUsed) {
             return false;

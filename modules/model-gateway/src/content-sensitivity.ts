@@ -75,3 +75,31 @@ export function classifyContentSensitivity(input: SensitivityInput): Sensitivity
   }
   return { sensitivity: level, reasons: [...new Set(reasons)] };
 }
+
+/** D-384: så mange av de SISTE historikkmeldingene regnes som «pågående samtale» (oppfølgingsspørsmål beholder konteksten). */
+export const RECENT_HISTORY_WINDOW = 4;
+
+/**
+ * D-384: én gammel helse-/finansmelding skal ikke låse HELE resten av samtalen (opptil 20 meldinger) til lokal modell.
+ * Meldinger i det nylige vinduet beholdes alltid (og klassifiseres som før - et oppfølgingsspørsmål trenger konteksten). Eldre meldinger som
+ * ALENE er strengere enn `ceiling` (nivået turen allerede har fra meldingen og det valgte minnet) holdes UTENFOR konteksten, så de aldri
+ * sendes til en modell som ikke har lov til å se dem. Rekkefølgen på de som beholdes er uendret.
+ */
+export function partitionHistoryBySensitivity<T extends { content: string }>(
+  history: ReadonlyArray<T>,
+  ceiling: DataSensitivity,
+  recentWindow: number = RECENT_HISTORY_WINDOW
+): { kept: T[]; withheld: number } {
+  const cutoff = Math.max(0, history.length - recentWindow);
+  const kept: T[] = [];
+  let withheld = 0;
+  history.forEach((message, index) => {
+    const alone = classifyContentSensitivity({ texts: [message.content] }).sensitivity;
+    if (index < cutoff && RANK[alone] > RANK[ceiling]) {
+      withheld += 1;
+      return;
+    }
+    kept.push(message);
+  });
+  return { kept, withheld };
+}

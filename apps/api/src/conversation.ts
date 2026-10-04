@@ -3,6 +3,7 @@ import { ContextBuilder, MessageStore, describeSecretFindings, fastRoute, scanFo
 import {
   BudgetExceededError,
   classifyContentSensitivity,
+  partitionHistoryBySensitivity,
   classifyDecisionImportance,
   maxSensitivity,
   NoEligibleProviderError,
@@ -31,7 +32,7 @@ export interface ConversationDeps {
   memory?: {
     contextFor(identity: IdentityContext, userText: string): Promise<string>;
     /** Del 3: valgfri variant med metadata (minnerom/sensitivitet) så ruteren kan utlede sensitivitet fra innholdet. */
-    contextWithMeta?(identity: IdentityContext, userText: string): Promise<{ text: string; spaces: string[]; sensitivities: string[] }>;
+    contextWithMeta?(identity: IdentityContext, userText: string): Promise<{ text: string; spaces: string[]; sensitivities: string[]; withheld_restricted?: number }>;
     /**
      * D-283: valgfri skrivevei - eierens egne ord fra DENNE samtalen (rå
      * brukertekst, ALDRI assistentens genererte svar - se kallstedet i
@@ -320,7 +321,7 @@ export class ConversationEngine {
     let partial = "";
     try {
       const context = await this.deps.context.build(identity);
-      const history = context.history.slice(-20).map((m) => ({
+      const fullHistory = context.history.slice(-20).map((m) => ({
         role: (m.role === "assistant" ? "assistant" : "user") as "assistant" | "user",
         content: m.content
       }));
@@ -330,6 +331,13 @@ export class ConversationEngine {
           : { text: await this.deps.memory.contextFor(identity, text), spaces: [identity.memory_space_id], sensitivities: [] as string[] }
         : { text: "", spaces: [] as string[], sensitivities: [] as string[] };
       const memoryContext = memoryMeta.text;
+      // D-384: eldre meldinger som alene er strengere enn det denne turen ellers krever, sendes ikke med (i stedet for å låse samtalen lokalt).
+      const turnBaseline = classifyContentSensitivity({
+        texts: [text],
+        memory_spaces: memoryMeta.spaces,
+        memory_sensitivities: memoryMeta.sensitivities
+      }).sensitivity;
+      const { kept: history } = partitionHistoryBySensitivity(fullHistory, turnBaseline);
       const personality = this.loadPersonality();
       // D-383: katalogen over tjenester på denne flaten + hvordan handlinger fungerer; D-382: tale får en egen, muntlig stil.
       const catalog = this.deps.tools?.catalog?.(surface) ?? "";

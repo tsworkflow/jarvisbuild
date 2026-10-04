@@ -958,6 +958,8 @@ async function buildDeps(): Promise<ApiDeps | undefined> {
     trace,
     memory: {
       contextFor: (identity, userText) => memoryRetriever.contextFor(identity, userText),
+      // D-384: minnets rom/sensitivitet må følge med til ruteren (helse/special ⇒ kun lokal modell) - uten dette ble det aldri klassifisert.
+      contextWithMeta: (identity, userText) => memoryRetriever.contextWithMeta(identity, userText),
       // D-283: eierens EGNE ord i denne samtalen (chat OG tale - BEGGE går
       // via SAMME `/chat`, se D-30-kommentaren ved `tools` under) skrives nå
       // faktisk til minnet, IKKE lenger en ren lesestruktur. `trust:

@@ -1,6 +1,6 @@
 import { describe, expect, it } from "vitest";
 import type { ModelProfile } from "../src/capability-registry.ts";
-import { classifyContentSensitivity, isSensitivityEligible, maxSensitivity } from "@jarvis/model-gateway";
+import { classifyContentSensitivity, isSensitivityEligible, maxSensitivity, partitionHistoryBySensitivity } from "@jarvis/model-gateway";
 
 /** Del 3 (JARVIS-016/035): innholdsbasert sensitivitet. Kun TESTEDE kategorier er garantert; dette er ikke en generell DLP. */
 const freeCloud = { hosted_free_tier: true, locality: "cloud" } as unknown as ModelProfile;
@@ -51,5 +51,32 @@ describe("classifyContentSensitivity", () => {
   it("maxSensitivity", () => {
     expect(maxSensitivity("PRIVATE", "SECRET_RESTRICTED", undefined)).toBe("SECRET_RESTRICTED");
     expect(maxSensitivity()).toBe("PUBLIC_OR_LOW_SENSITIVITY");
+  });
+});
+
+describe("D-384: partitionHistoryBySensitivity", () => {
+  const msgs = (...c: string[]) => c.map((content) => ({ role: "user" as const, content }));
+
+  it("eldre helse-/finansmelding utenfor det nylige vinduet holdes utenfor når turen ellers er lav-sensitiv", () => {
+    const history = msgs("jeg fikk en ny diagnose i går", "ok", "hva er hovedstaden i Frankrike?", "Paris", "og Tyskland?", "Berlin");
+    const { kept, withheld } = partitionHistoryBySensitivity(history, "PUBLIC_OR_LOW_SENSITIVITY");
+    expect(withheld).toBe(1);
+    expect(kept.map((m) => m.content)).not.toContain("jeg fikk en ny diagnose i går");
+    expect(kept).toHaveLength(5);
+  });
+
+  it("sensitiv melding i det nylige vinduet beholdes (oppfølgingsspørsmål), så turen forblir låst lokalt", () => {
+    const history = msgs("hei", "hei!", "hva er saldoen min?", "Saldoen er ...");
+    const { kept, withheld } = partitionHistoryBySensitivity(history, "PUBLIC_OR_LOW_SENSITIVITY");
+    expect(withheld).toBe(0);
+    expect(kept).toHaveLength(4);
+    expect(classifyContentSensitivity({ texts: kept.map((m) => m.content) }).sensitivity).toBe("SECRET_RESTRICTED");
+  });
+
+  it("tak = SECRET_RESTRICTED beholder alt; hemmelighet i gammel melding holdes ute ved lavere tak; rekkefølgen bevares", () => {
+    const history = msgs("saldo 1", "a", "b", "c", "d", "e");
+    expect(partitionHistoryBySensitivity(history, "SECRET_RESTRICTED").withheld).toBe(0);
+    const out = partitionHistoryBySensitivity(history, "PRIVATE");
+    expect(out.kept.map((m) => m.content)).toEqual(["a", "b", "c", "d", "e"]);
   });
 });

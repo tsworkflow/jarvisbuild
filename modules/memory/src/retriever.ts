@@ -33,6 +33,9 @@ export interface SearchOptions {
   limit?: number;
 }
 
+/** D-384: laveste rangeringsscore for at strengt minne (helse/special) regnes som et direkte treff på eierens melding. */
+export const RESTRICTED_MEMORY_MIN_SCORE = 0.3;
+
 /**
  * Context Builder v2 / hybrid retrieval (MEMORY_ARCHITECTURE §7):
  * fulltekst + vektor + relasjonsutvidelse (1 hopp) + tid + kilde → reranking.
@@ -229,26 +232,45 @@ export class MemoryRetriever {
    * Del 3 (JARVIS-016/035): samme kontekstblokk + metadata om HVA som faktisk ble hentet (minnerom og `sensitivity`-kolonnen), slik at
    * ruteren kan utlede sensitivitet fra innholdet i stedet for å anta «public». Tom kontekst = ingen minne er med i modellkallet.
    */
-  async contextWithMeta(identity: IdentityContext, userText: string): Promise<{ text: string; spaces: string[]; sensitivities: string[] }> {
+  async contextWithMeta(
+    identity: IdentityContext,
+    userText: string,
+    options: { restrictedMinScore?: number } = {}
+  ): Promise<{ text: string; spaces: string[]; sensitivities: string[]; withheld_restricted: number }> {
     const items = await this.search(identity, {
       spaces: [identity.memory_space_id],
       query: userText,
       limit: 5
     });
     if (items.length === 0) {
-      return { text: "", spaces: [], sensitivities: [] };
+      return { text: "", spaces: [], sensitivities: [], withheld_restricted: 0 };
     }
-    const lines = items.map(
-      (item) => `- ${item.content} [kilde: ${item.source.kind}:${item.source.ref}]`
-    );
     const ids = items.map((item) => item.memory_item_id);
-    const sensitivities = await withMemoryTransaction(this.pool, identity.tenant_id, [identity.memory_space_id], async (client) =>
-      ((await client.query("SELECT DISTINCT sensitivity FROM memory_items WHERE memory_item_id = ANY($1)", [ids])).rows as Array<{ sensitivity: string }>).map((r) => r.sensitivity)
+    const sensitivityById = new Map<string, string>(
+      await withMemoryTransaction(this.pool, identity.tenant_id, [identity.memory_space_id], async (client) =>
+        ((await client.query("SELECT memory_item_id, sensitivity FROM memory_items WHERE memory_item_id = ANY($1)", [ids])).rows as Array<{
+          memory_item_id: string;
+          sensitivity: string;
+        }>).map((r) => [r.memory_item_id, r.sensitivity] as [string, string])
+      )
     );
+    // D-384: strengt (helserom / `special`) minne tas KUN med når det er et DIREKTE treff på det eieren skriver nå. Et svakt treff
+    // eller en relasjonsutvidelse holdes helt utenfor konteksten (sendes aldri til noen modell) i stedet for å låse hele turen til lokal modell.
+    const minScore = options.restrictedMinScore ?? RESTRICTED_MEMORY_MIN_SCORE;
+    const kept = items.filter((item) => {
+      const restricted = item.space === "health" || sensitivityById.get(item.memory_item_id) === "special";
+      return !restricted || (item.via !== "relation" && item.score >= minScore);
+    });
+    const withheld = items.length - kept.length;
+    if (kept.length === 0) {
+      return { text: "", spaces: [], sensitivities: [], withheld_restricted: withheld };
+    }
+    const lines = kept.map((item) => `- ${item.content} [kilde: ${item.source.kind}:${item.source.ref}]`);
     return {
       text: `Relevant minne (med kilde):\n${lines.join("\n")}`,
-      spaces: [...new Set(items.map((item) => item.space))],
-      sensitivities
+      spaces: [...new Set(kept.map((item) => item.space))],
+      sensitivities: [...new Set(kept.map((item) => sensitivityById.get(item.memory_item_id) ?? "normal"))],
+      withheld_restricted: withheld
     };
   }
 }

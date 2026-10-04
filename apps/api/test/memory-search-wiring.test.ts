@@ -30,6 +30,8 @@ describe("A: apps/api/src/main.ts registrerer memory.search i SAMME additionalTo
     // i stedet for `memoryRetriever` direkte - `contextFor` DELEGERER fortsatt
     // til DEN SAMME instansen, se egen påstand under.
     expect(mainSource).toContain("contextFor: (identity, userText) => memoryRetriever.contextFor(identity, userText),");
+    // D-384: rom/sensitivitet må nå ruteren, ellers klassifiseres aldri helse-/special-minne.
+    expect(mainSource).toContain("contextWithMeta: (identity, userText) => memoryRetriever.contextWithMeta(identity, userText),");
   });
 
   it("D-283/D-300: konstruerer memoryWriter ÉN gang, delt embedding-instans med memoryRetriever, LlmExtractionAdapter(gateway) som extractor, og kobler den inn som conversationEngine sin memory.ingest()", () => {

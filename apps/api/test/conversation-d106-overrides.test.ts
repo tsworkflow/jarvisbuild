@@ -610,3 +610,39 @@ describe("D-106 HOST-FIX: automatisk høy-innvirkning-klassifisering trigger Cou
     expect(seen?.request.max_tokens).toBe(320);
   });
 });
+
+describe("D-384: eldre sensitive meldinger låser ikke samtalen", () => {
+  function engineWithHistory(history: Array<{ role: "user" | "assistant"; content: string }>, onComplete: (i: CompleteInput) => void): ConversationEngine {
+    const pool = fakePool();
+    const gateway = {
+      complete: async (input: CompleteInput) => {
+        onComplete(input);
+        return { text: "svar", usage: { input_tokens: 1, output_tokens: 1 }, provider: "scripted", model: "m" };
+      },
+      stream: async () => { throw new Error("stream ikke forventet"); },
+      completeWithTools: async () => { throw new Error("ikke forventet"); }
+    } as unknown as ModelGateway;
+    return new ConversationEngine({
+      messages: new MessageStore(pool),
+      context: { build: async () => ({ history, open_tasks: [] }) } as unknown as ContextBuilder,
+      gateway, tasks: fakeTasks, worker: fakeWorker, trace: new MemoryTraceSink()
+    } as unknown as ConstructorParameters<typeof ConversationEngine>[0]);
+  }
+  const filler = (n: number) => Array.from({ length: n }, (_, i) => ({ role: (i % 2 === 0 ? "user" : "assistant") as "user" | "assistant", content: `smalltalk ${i}` }));
+
+  it("H1: gammel helsemelding (utenfor vinduet) sendes ikke med og låser ikke turen", async () => {
+    let captured: CompleteInput | undefined;
+    const history = [{ role: "user" as const, content: "jeg fikk en ny diagnose i går" }, ...filler(6)];
+    await engineWithHistory(history, (i) => (captured = i)).handle(identity, "fortell meg om Frankrike");
+    expect(captured?.sensitivity).not.toBe("SECRET_RESTRICTED");
+    expect(JSON.stringify(captured?.request)).not.toContain("diagnose");
+  });
+
+  it("H2: sensitiv melding i siste vindu beholdes, og turen går fortsatt kun til lokal modell", async () => {
+    let captured: CompleteInput | undefined;
+    const history = [...filler(4), { role: "user" as const, content: "hva er saldoen min?" }, { role: "assistant" as const, content: "Du har penger." }];
+    await engineWithHistory(history, (i) => (captured = i)).handle(identity, "og i går?");
+    expect(captured?.sensitivity).toBe("SECRET_RESTRICTED");
+    expect(JSON.stringify(captured?.request)).toContain("saldoen");
+  });
+});

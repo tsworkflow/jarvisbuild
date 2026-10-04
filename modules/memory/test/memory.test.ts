@@ -709,3 +709,37 @@ describe("Samtaleintegrasjon: Jarvis husker på tvers av sesjoner med kilde", ()
     expect(lastCall?.system).toContain("[kilde: manual:seed]");
   });
 });
+
+describe("D-384: strengt minne (helse/special) tas kun med ved direkte treff", () => {
+  it("direkte treff på helseminne tas med; med umulig høy terskel holdes det helt utenfor konteksten", async () => {
+    const id = identity("health");
+    await writer.apply(id, TRUSTED, candidate("health", "helse.d384", "Tobias bruker blodtrykksmedisin tangerin84 hver morgen."));
+    const direct = await retriever.contextWithMeta(id, "tangerin84 blodtrykksmedisin");
+    expect(direct.text).toContain("tangerin84");
+    expect(direct.spaces).toEqual(["health"]);
+    expect(direct.withheld_restricted).toBe(0);
+
+    const weak = await retriever.contextWithMeta(id, "tangerin84 blodtrykksmedisin", { restrictedMinScore: 1.1 });
+    expect(weak.text).toBe("");
+    expect(weak.spaces).toEqual([]);
+    expect(weak.sensitivities).toEqual([]);
+    expect(weak.withheld_restricted).toBe(1);
+  });
+
+  it("minneelement med sensitivity=special i et vanlig rom behandles likt; normale elementer påvirkes ikke", async () => {
+    const id = identity("personal");
+    const special = await writer.apply(id, TRUSTED, candidate("personal", "d384.special", "Hemmelig særlig kategori kvede84 info."));
+    await adminPool.query("UPDATE memory_items SET sensitivity = 'special' WHERE memory_item_id = $1", [special.memory_item_id]);
+    await writer.apply(id, TRUSTED, candidate("personal", "d384.normal", "Vanlig fakta kvede84 om hagen."));
+
+    const withBoth = await retriever.contextWithMeta(id, "kvede84", { restrictedMinScore: 1.1 });
+    expect(withBoth.text).toContain("hagen");
+    expect(withBoth.text).not.toContain("særlig kategori");
+    expect(withBoth.sensitivities).not.toContain("special");
+    expect(withBoth.withheld_restricted).toBe(1);
+
+    const direct = await retriever.contextWithMeta(id, "kvede84");
+    expect(direct.sensitivities).toContain("special");
+    expect(direct.text).toContain("særlig kategori");
+  });
+});

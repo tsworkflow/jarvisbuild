@@ -107,6 +107,22 @@ describe("JobContract", () => {
     expect(JobContractSchema.parse(job).task_id).toBe("task-1");
     expect(() => JobContractSchema.parse({ ...job, acceptance_criteria: [] })).toThrow();
   });
+
+  it("D-446: retry_policy har øvre grenser (verdiene leses av køens SQL og er brukerstyrt JSON)", () => {
+    const base = {
+      task_id: "task-1", owner_person_id: "person-tobias", tenant_id: "tenant-personal", goal: "Testjobb", acceptance_criteria: ["ok"],
+      input: { data: {}, trust_level: "internal", provenance: "test" }, allowed_tools: [], allowed_memory_spaces: ["project"],
+      allowed_network_targets: [], agent_profile: "verifier", model_budget_ore: 0, max_steps: 5
+    };
+    const withPolicy = (retry_policy: { max_attempts: number; backoff_seconds: number }) => ({ ...base, retry_policy });
+    expect(JobContractSchema.parse(withPolicy({ max_attempts: 1000, backoff_seconds: 86_400 })).retry_policy.max_attempts).toBe(1000);
+    for (const bad of [
+      { max_attempts: 1001, backoff_seconds: 0 }, { max_attempts: 9_007_199_254_740_991, backoff_seconds: 0 }, { max_attempts: 0, backoff_seconds: 0 },
+      { max_attempts: 1, backoff_seconds: 86_401 }, { max_attempts: 1, backoff_seconds: -1 }
+    ]) {
+      expect(() => JobContractSchema.parse(withPolicy(bad)), JSON.stringify(bad)).toThrow();
+    }
+  });
 });
 
 describe("EventEnvelope", () => {

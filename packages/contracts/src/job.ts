@@ -39,8 +39,9 @@ export const JobContractSchema = z
     deadline: z.string().datetime().optional(),
     retry_policy: z
       .object({
-        max_attempts: z.number().int().min(1),
-        backoff_seconds: z.number().int().nonnegative()
+        // D-446: øvre grenser - verdiene er brukerstyrt JSON og leses av køens SQL (`claim_next_task`) og `fail()`. En vilkårlig stor verdi har ingen reell bruk og er et driftsrisiko.
+        max_attempts: z.number().int().min(1).max(1000),
+        backoff_seconds: z.number().int().nonnegative().max(86_400)
       })
       .strict(),
     max_steps: z.number().int().min(1)
